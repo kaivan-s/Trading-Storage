@@ -1138,6 +1138,11 @@ def api_subscription_webhook():
     return jsonify({"received": True})
 
 
+@app.get("/health")
+def health():
+    return jsonify({"ok": True})
+
+
 @app.get("/")
 def index():
     if (UI_DIST / "index.html").exists():
