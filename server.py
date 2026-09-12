@@ -963,6 +963,37 @@ def api_symbols():
     return jsonify({"symbols": engine.symbols()})
 
 
+@app.get("/api/quote")
+def api_quote():
+    """One-symbol Groww price check. Public so you can curl it on the server."""
+    symbol = (request.args.get("symbol") or request.args.get("q") or "").strip().upper()
+    if not symbol:
+        return jsonify({"error": "symbol is required, e.g. /api/quote?symbol=RELIANCE"}), 400
+    try:
+        quotes = fetch.live_quotes_groww([symbol])
+    except Exception as exc:
+        return jsonify({"ok": False, "source": "groww", "symbol": symbol, "error": str(exc)}), 502
+    if quotes is None or quotes.empty:
+        return jsonify({
+            "ok": False,
+            "source": "groww",
+            "symbol": symbol,
+            "error": "Groww returned no quote for this symbol",
+        }), 404
+    row = quotes.iloc[0].to_dict()
+    return jsonify({
+        "ok": True,
+        "source": "groww",
+        "symbol": row.get("symbol") or symbol,
+        "ltp": _py(row.get("ltp")),
+        "open": _py(row.get("open")),
+        "high": _py(row.get("high")),
+        "low": _py(row.get("low")),
+        "prev_close": _py(row.get("prev_close")),
+        "pchange": _py(row.get("pchange")),
+    })
+
+
 @app.get("/api/stock")
 def api_stock():
     q = (request.args.get("q") or request.args.get("symbol") or "").strip()

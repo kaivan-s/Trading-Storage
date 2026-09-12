@@ -19,7 +19,7 @@ from flask import jsonify, request
 import db
 
 # Public: the Vite app and the authorize redirect need these.
-PUBLIC_PATHS = {"/api/auth/config"}
+PUBLIC_PATHS = {"/api/auth/config", "/api/quote"}
 
 _CACHE_TTL = 45.0
 _cache: dict[str, tuple[float, dict]] = {}
