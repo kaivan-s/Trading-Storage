@@ -855,6 +855,7 @@ def _clean(obj):
 
 engine = Engine()
 app = Flask(__name__, static_folder=None)
+application = app  # gunicorn / Elastic Beanstalk: application:application
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 app.before_request(auth.before_request)
 
