@@ -930,3 +930,197 @@ def get_sector_constituents(
     cols = [c for c in cols if c in day.columns]
     
     return [_row_dict(r) for _, r in day[cols].iterrows()]
+
+
+# ---------------------------------------------------------------------------
+# Coiled Bases (Stock-level pre-breakout candidates)
+# ---------------------------------------------------------------------------
+
+def save_coiled_bases(
+    scan_date: date | str,
+    coil_rows: pd.DataFrame,
+) -> int:
+    """
+    Save coiled base candidates to Supabase.
+    
+    `coil_rows` = output of stocks.scan() — stocks passing all coil filters,
+    ranked by coil score. Called after market close using closing prices.
+    
+    Returns number of rows saved.
+    """
+    if coil_rows is None or coil_rows.empty:
+        return 0
+    
+    scan_date = str(scan_date)[:10]
+    client = get_client()
+    
+    records = []
+    for _, r in coil_rows.iterrows():
+        rec = {
+            "scan_date": scan_date,
+            "symbol": r.get("symbol"),
+            "sector": r.get("sector"),
+            "adj": _clean(r.get("adj")),
+            "coil": _clean(r.get("coil")),
+            "pos_hi": _clean(r.get("pos_hi")),
+            "to_trigger": _clean(r.get("to_trigger")),
+            "trigger": _clean(r.get("trigger")),
+            "rsi": _clean(r.get("rsi")),
+            "vol_ratio": _clean(r.get("vol_ratio")),
+            "range20": _clean(r.get("range20")),
+            "contraction": _clean(r.get("contraction")),
+            "cmf": _clean(r.get("cmf")),
+            "deliv_quality_rel": _clean(r.get("deliv_quality_rel")),
+            "deliv_pct": _clean(r.get("deliv_pct")),
+            "base_days": _clean(r.get("base_days")),
+            "atr_pct": _clean(r.get("atr_pct")),
+            "ext_ema20": _clean(r.get("ext_ema20")),
+        }
+        records.append(rec)
+    
+    if not records:
+        return 0
+    
+    # Full replacement for the date (idempotent)
+    try:
+        client.table("coiled_bases").delete().eq("scan_date", scan_date).execute()
+    except Exception as e:
+        print(f"delete old coiled bases failed: {e}")
+    
+    try:
+        result = client.table("coiled_bases").insert(records).execute()
+        return len(result.data) if result.data else 0
+    except Exception as e:
+        print(f"save coiled bases failed: {e}")
+        return 0
+
+
+def get_coiled_bases_dates(limit: int = 60) -> list[str]:
+    """Get distinct coiled bases scan dates, newest first."""
+    client = get_client()
+    result = (client.table("coiled_bases")
+              .select("scan_date")
+              .order("scan_date", desc=True)
+              .limit(500)
+              .execute())
+    seen, out = set(), []
+    for row in (result.data or []):
+        d = str(row.get("scan_date") or "")[:10]
+        if d and d not in seen:
+            seen.add(d)
+            out.append(d)
+            if len(out) >= limit:
+                break
+    return out
+
+
+def get_coiled_bases(scan_date: date | str) -> list[dict]:
+    """Get coiled bases for a specific date."""
+    scan_date = str(scan_date)[:10]
+    client = get_client()
+    result = (client.table("coiled_bases")
+              .select("*")
+              .eq("scan_date", scan_date)
+              .order("coil", desc=True)
+              .execute())
+    return result.data or []
+
+
+# ---------------------------------------------------------------------------
+# Setups (Coiled stocks in actionable sectors)
+# ---------------------------------------------------------------------------
+
+def save_setups(
+    scan_date: date | str,
+    buys: pd.DataFrame,
+    verdict_by_sector: dict[str, str] | None = None,
+) -> int:
+    """
+    Save buy setups to Supabase.
+    
+    `buys` = coiled stocks filtered to sectors in setup patterns (CROSSING,
+    PULLBACK, CROSSING_UNVERIFIED). This is the intersection of stock-level
+    coil filters and sector-level classification.
+    
+    Called together with save_sector_scans since setups depend on sector state.
+    
+    Returns number of rows saved.
+    """
+    if buys is None or buys.empty:
+        return 0
+    
+    verdict_by_sector = verdict_by_sector or {}
+    scan_date = str(scan_date)[:10]
+    client = get_client()
+    
+    records = []
+    for _, r in buys.iterrows():
+        sector = r.get("sector")
+        rec = {
+            "scan_date": scan_date,
+            "symbol": r.get("symbol"),
+            "sector": sector,
+            "sector_klass": r.get("sector_klass"),
+            "verdict": verdict_by_sector.get(sector, ""),
+            "why": r.get("why"),
+            "adj": _clean(r.get("adj")),
+            "trigger": _clean(r.get("trigger")),
+            "coil": _clean(r.get("coil")),
+            "to_trigger": _clean(r.get("to_trigger")),
+            "pos_hi": _clean(r.get("pos_hi")),
+            "rsi": _clean(r.get("rsi")),
+            "vol_ratio": _clean(r.get("vol_ratio")),
+            "range20": _clean(r.get("range20")),
+            "cmf": _clean(r.get("cmf")),
+            "deliv_quality_rel": _clean(r.get("deliv_quality_rel")),
+            "base_days": _clean(r.get("base_days")),
+            "recommended": bool(r.get("recommended", False)),
+        }
+        records.append(rec)
+    
+    if not records:
+        return 0
+    
+    # Full replacement for the date (idempotent)
+    try:
+        client.table("setups").delete().eq("scan_date", scan_date).execute()
+    except Exception as e:
+        print(f"delete old setups failed: {e}")
+    
+    try:
+        result = client.table("setups").insert(records).execute()
+        return len(result.data) if result.data else 0
+    except Exception as e:
+        print(f"save setups failed: {e}")
+        return 0
+
+
+def get_setups_dates(limit: int = 60) -> list[str]:
+    """Get distinct setups scan dates, newest first."""
+    client = get_client()
+    result = (client.table("setups")
+              .select("scan_date")
+              .order("scan_date", desc=True)
+              .limit(500)
+              .execute())
+    seen, out = set(), []
+    for row in (result.data or []):
+        d = str(row.get("scan_date") or "")[:10]
+        if d and d not in seen:
+            seen.add(d)
+            out.append(d)
+            if len(out) >= limit:
+                break
+    return out
+
+
+def get_setups(scan_date: date | str) -> list[dict]:
+    """Get setups for a specific date."""
+    scan_date = str(scan_date)[:10]
+    client = get_client()
+    result = (client.table("setups")
+              .select("*")
+              .eq("scan_date", scan_date)
+              .order("coil", desc=True)
+              .execute())
+    return result.data or []

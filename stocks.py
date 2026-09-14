@@ -43,6 +43,13 @@ class CoilParams:
     range_max: float = 0.14         # 20-day high/low spread under 14%
     min_median_turnover_lacs: float = 30.0
     min_price: float = 20.0
+    # Sessions of the symbol's OWN history required before its gates mean
+    # anything. The 200-EMA is an ewm, so it is defined on a stock's first day;
+    # without this a recent listing clears the trend gate on a 40-day average
+    # wearing the name ema200.
+    min_sessions: int = 200
+    # Liquidity is judged on this trailing window, not the whole loaded panel.
+    liq_lookback: int = 60
 
 
 # --------------------------------------------------------------------------
@@ -87,9 +94,13 @@ def add_indicators(df: pd.DataFrame, p: CoilParams | None = None) -> pd.DataFram
     df["adj_low"] = df["low"] * scale
 
     g = df.groupby("symbol", sort=False)
+    # min_periods matters: an ewm without it returns a value on the first row,
+    # so ema200 for a 40-session listing is a 40-day average under a name that
+    # claims 200. Every downstream trend gate reads `adj > ema50 > ema200`,
+    # which is False against NaN — fail closed is the right answer here.
     for n in (10, 20, 50, 200):
         df[f"ema{n}"] = g["adj"].transform(
-            lambda s, n=n: s.ewm(span=n, adjust=False).mean()
+            lambda s, n=n: s.ewm(span=n, adjust=False, min_periods=n).mean()
         )
     df["rsi"] = g["adj"].transform(_rsi)
 
@@ -148,6 +159,37 @@ def add_indicators(df: pd.DataFrame, p: CoilParams | None = None) -> pd.DataFram
     ].transform("median")
 
     df["ext_ema20"] = df["adj"] / df["ema20"] - 1.0
+    return _add_coil_streak(df, p)
+
+
+def _add_coil_streak(df: pd.DataFrame, p: CoilParams) -> pd.DataFrame:
+    """
+    `coil_days`: consecutive sessions this row has satisfied the seven gates.
+
+    The scan only ever evaluates one cross-section, so a name coiled for six
+    weeks is indistinguishable from one that qualified this morning — even
+    though the score rewards duration through `base_days`. Counting the run
+    lets the reader tell a fresh setup from a stale one.
+
+    This applies the elementwise gates only. The eligibility restrictions in
+    `_day_frame` (own history, recent liquidity) are per-symbol rather than
+    per-row, so they cannot lengthen or shorten a streak.
+    """
+    ok = (
+        (df["adj"] >= p.min_price)
+        & (df["adj"] > df["ema50"])
+        & (df["ema50"] > df["ema200"])
+        & df["pos_hi"].between(p.near_high_min, p.near_high_max)
+        & df["rsi"].between(p.rsi_low, p.rsi_high)
+        & (df["ext_ema20"].abs() <= p.max_ext_ema20)
+        & (df["vol_ratio"] <= p.vol_dryup_max)
+        & (df["range20"] <= p.range_max)
+    ).astype(int)
+
+    # Every non-coil session opens a new block, so consecutive qualifying
+    # sessions share a block id and a cumulative sum inside it is the run.
+    blocks = (1 - ok).groupby(df["symbol"], sort=False).cumsum()
+    df["coil_days"] = ok.groupby([df["symbol"], blocks], sort=False).cumsum()
     return df
 
 
@@ -238,6 +280,53 @@ def coil_score(row) -> float | None:
     return float(np.mean(parts) * 100.0)
 
 
+FLAG_COLS = ["f_price", "f_trend", "f_pos", "f_rsi", "f_ext", "f_vol", "f_range"]
+
+
+def _day_frame(stocks: pd.DataFrame, p: CoilParams, as_of) -> pd.DataFrame:
+    """
+    The `as_of` cross-section with the seven gates evaluated, restricted to
+    names that could actually be traded on a breakout.
+
+    Two restrictions the gates themselves cannot express:
+
+      - Liquidity is the median turnover over the trailing `liq_lookback`
+        sessions. A full-history median lets a name that traded ₹80L a day
+        eight months ago and ₹5L now clear the floor while being unbuyable.
+      - A symbol needs `min_sessions` of its own history, or `hi_n`, `base_days`
+        and the EMAs are all measuring a window the stock has not lived through.
+
+    Comparisons against NaN are False, so a missing input fails its gate.
+    """
+    hist = stocks[stocks["date"] <= as_of]
+    if hist.empty:
+        return hist.copy()
+
+    sessions = hist.groupby("symbol")["date"].nunique()
+    dates = np.sort(hist["date"].unique())
+    window = dates[-p.liq_lookback:] if len(dates) > p.liq_lookback else dates
+    liq = hist[hist["date"].isin(window)].groupby("symbol")["turnover"].median()
+
+    keep = sessions.index[
+        (sessions >= p.min_sessions)
+        & (liq.reindex(sessions.index) >= p.min_median_turnover_lacs)
+    ]
+
+    d = hist[(hist["date"] == as_of) & hist["symbol"].isin(keep)].copy()
+    if d.empty:
+        return d
+
+    d["f_price"] = d["adj"] >= p.min_price
+    d["f_trend"] = (d["adj"] > d["ema50"]) & (d["ema50"] > d["ema200"])
+    d["f_pos"] = d["pos_hi"].between(p.near_high_min, p.near_high_max)
+    d["f_rsi"] = d["rsi"].between(p.rsi_low, p.rsi_high)
+    d["f_ext"] = d["ext_ema20"].abs() <= p.max_ext_ema20
+    d["f_vol"] = d["vol_ratio"] <= p.vol_dryup_max
+    d["f_range"] = d["range20"] <= p.range_max
+    d["n_fail"] = (~d[FLAG_COLS]).sum(axis=1)
+    return d
+
+
 def scan(stocks: pd.DataFrame, p: CoilParams | None = None,
          as_of=None, top: int = 40) -> pd.DataFrame:
     """
@@ -250,21 +339,9 @@ def scan(stocks: pd.DataFrame, p: CoilParams | None = None,
     p = p or CoilParams()
     as_of = pd.Timestamp(as_of) if as_of is not None else stocks["date"].max()
 
-    liq = (stocks.groupby("symbol")["turnover"].median()
-           >= p.min_median_turnover_lacs)
-    d = stocks[(stocks["date"] == as_of)
-               & stocks["symbol"].isin(liq[liq].index)].copy()
-
-    d["f_price"] = d["adj"] >= p.min_price
-    d["f_trend"] = (d["adj"] > d["ema50"]) & (d["ema50"] > d["ema200"])
-    d["f_pos"] = d["pos_hi"].between(p.near_high_min, p.near_high_max)
-    d["f_rsi"] = d["rsi"].between(p.rsi_low, p.rsi_high)
-    d["f_ext"] = d["ext_ema20"].abs() <= p.max_ext_ema20
-    d["f_vol"] = d["vol_ratio"] <= p.vol_dryup_max
-    d["f_range"] = d["range20"] <= p.range_max
-
-    flags = ["f_price", "f_trend", "f_pos", "f_rsi", "f_ext", "f_vol", "f_range"]
-    d["n_fail"] = (~d[flags]).sum(axis=1)
+    d = _day_frame(stocks, p, as_of)
+    if d.empty:
+        return d
     passed = d[d["n_fail"] == 0].copy()
 
     if passed.empty:
@@ -282,8 +359,8 @@ def scan(stocks: pd.DataFrame, p: CoilParams | None = None,
     parts = ["s_vol", "s_range", "s_contract", "s_cmf", "s_deliv", "s_base"]
     passed["coil"] = passed[parts].mean(axis=1) * 100.0
 
-    cols = ["symbol", "sector", "adj", "coil", "pos_hi", "to_trigger", "trigger",
-            "rsi", "vol_ratio", "range20", "contraction", "cmf",
+    cols = ["symbol", "sector", "adj", "coil", "coil_days", "pos_hi", "to_trigger",
+            "trigger", "rsi", "vol_ratio", "range20", "contraction", "cmf",
             "deliv_quality_rel", "deliv_pct", "base_days", "atr_pct", "ext_ema20"]
     cols = [c for c in cols if c in passed.columns]
     return (passed.sort_values("coil", ascending=False)[cols]
@@ -301,26 +378,14 @@ def near_miss(stocks: pd.DataFrame, p: CoilParams | None = None,
     """
     p = p or CoilParams()
     as_of = pd.Timestamp(as_of) if as_of is not None else stocks["date"].max()
-    liq = (stocks.groupby("symbol")["turnover"].median()
-           >= p.min_median_turnover_lacs)
-    d = stocks[(stocks["date"] == as_of)
-               & stocks["symbol"].isin(liq[liq].index)].copy()
-
-    d["f_price"] = d["adj"] >= p.min_price
-    d["f_trend"] = (d["adj"] > d["ema50"]) & (d["ema50"] > d["ema200"])
-    d["f_pos"] = d["pos_hi"].between(p.near_high_min, p.near_high_max)
-    d["f_rsi"] = d["rsi"].between(p.rsi_low, p.rsi_high)
-    d["f_ext"] = d["ext_ema20"].abs() <= p.max_ext_ema20
-    d["f_vol"] = d["vol_ratio"] <= p.vol_dryup_max
-    d["f_range"] = d["range20"] <= p.range_max
-
-    flags = ["f_price", "f_trend", "f_pos", "f_rsi", "f_ext", "f_vol", "f_range"]
-    d["n_fail"] = (~d[flags]).sum(axis=1)
+    d = _day_frame(stocks, p, as_of)
+    if d.empty:
+        return d
     one = d[d["n_fail"] == 1].copy()
     if one.empty:
         return one
-    one["missing"] = one[flags].apply(
-        lambda r: [f[2:] for f in flags if not r[f]][0], axis=1
+    one["missing"] = one[FLAG_COLS].apply(
+        lambda r: [f[2:] for f in FLAG_COLS if not r[f]][0], axis=1
     )
     cols = ["symbol", "sector", "adj", "missing", "pos_hi", "rsi",
             "vol_ratio", "range20", "cmf"]

@@ -41,7 +41,14 @@ UI_DIST = REPO / "ui" / "dist"
 
 DEFAULT_DAYS = 220
 DEFAULT_LEVEL = "basic_industry"
-COIL_TOP = 40
+
+# Two different questions, so two named sets rather than inline lists that
+# drift apart. WATCH is what the Shortlisted count reports — BASE belongs there
+# because quiet accumulation is worth following. SETUP is the narrower set a
+# coil's sector must be in to reach the Setups list, and BASE is excluded
+# because there has been no expansion yet to pull back from.
+WATCH_KLASSES = ("CROSSING", "PULLBACK", "BASE")
+SETUP_KLASSES = ("CROSSING", "PULLBACK")
 
 # Slack around the scorer's momentum zone when picking which symbols are
 # worth a live quote. Wider than tom.MOM_ZONE_* so an intraday move cannot
@@ -288,6 +295,7 @@ class Engine:
         self.smap = None
         self.sector_level = DEFAULT_LEVEL
         self.delivery = {"as_of_ok": True, "missing": 0, "missing_dates": []}
+        self.verdict_by_sector = {}
         self.tom_preview = []  # Preliminary results during scan
 
     def snapshot(self) -> dict:
@@ -296,14 +304,10 @@ class Engine:
             bullish_sectors = 0
             total_sectors = 0
             if not self.scan_rows.empty and "klass" in self.scan_rows:
-                # Include BASE in actionable — quiet accumulation is worth watching
-                actionable = int(
-                    self.scan_rows["klass"].isin(["CROSSING", "PULLBACK", "BASE"]).sum()
-                )
+                actionable = int(self.scan_rows["klass"].isin(WATCH_KLASSES).sum())
                 total_sectors = len(self.scan_rows)
-                # Bullish = CROSSING + PULLBACK (not BASE — that's still building)
                 bullish_sectors = int(
-                    self.scan_rows["klass"].isin(["CROSSING", "PULLBACK"]).sum()
+                    self.scan_rows["klass"].isin(SETUP_KLASSES).sum()
                 )
             # Market regime: bullish if > 40% of sectors are in uptrend
             regime_ok = total_sectors == 0 or (bullish_sectors / total_sectors >= 0.4)
@@ -410,14 +414,19 @@ class Engine:
             buys = coil_all
         else:
             coil_all = coil_all.copy()
+            # `recommended` = the sector's shape checks all passed, which is the
+            # funnel buytest.py measures. Kept as a column, not a filter, so the
+            # UI can rank by confidence without hiding the wider set.
             coil_all["recommended"] = coil_all["sector"].isin(ready)
             coil_all["sector_klass"] = coil_all["sector"].map(sector_klass_map).fillna("")
-            # Include all coils from actionable sectors (CROSSING + PULLBACK)
-            actionable_sectors = set(scan_rows[
-                scan_rows["klass"].isin(["CROSSING", "PULLBACK"])
-            ]["sector"])
-            buys = coil_all[coil_all["sector"].isin(actionable_sectors)].copy()
-        coil_rows = coil_all.head(COIL_TOP)
+            setup_sectors = set(
+                scan_rows[scan_rows["klass"].isin(SETUP_KLASSES)]["sector"]
+            )
+            buys = coil_all[coil_all["sector"].isin(setup_sectors)].copy()
+        # No cap: the seven gates already did the filtering, and ranking by
+        # `coil` measured no relationship with forward returns, so cutting
+        # the list at 40 by that score was discarding names arbitrarily.
+        coil_rows = coil_all
 
         as_of = panel["date"].max()
         as_of_s = pd.Timestamp(as_of).strftime("%Y-%m-%d")
@@ -468,6 +477,7 @@ class Engine:
             self.buys = buys
             self.breakouts = broke
             self.delivery = delivery
+            self.verdict_by_sector = verdict_by_sector
             self.as_of = as_of_s
             self.n_stocks = int(stocks["symbol"].nunique())
             self.n_sectors = int(panel["sector"].nunique())
@@ -718,11 +728,14 @@ class Engine:
                     coil_all = coil_all.copy()
                     coil_all["recommended"] = coil_all["sector"].isin(ready)
                     coil_all["sector_klass"] = coil_all["sector"].map(sector_klass_map).fillna("")
-                    actionable_sectors = set(scan_rows[
-                        scan_rows["klass"].isin(["CROSSING", "PULLBACK"])
-                    ]["sector"])
-                    buys = coil_all[coil_all["sector"].isin(actionable_sectors)].copy()
-                coil_rows = coil_all.head(COIL_TOP)
+                    setup_sectors = set(
+                        scan_rows[scan_rows["klass"].isin(SETUP_KLASSES)]["sector"]
+                    )
+                    buys = coil_all[coil_all["sector"].isin(setup_sectors)].copy()
+                # No cap: the seven gates already did the filtering, and ranking by
+                # `coil` measured no relationship with forward returns, so cutting
+                # the list at 40 by that score was discarding names arbitrarily.
+                coil_rows = coil_all
 
                 # Same-session close: LTP is today's adj, so tom uses prior_trigger.
                 as_of = coil_stocks["date"].max()
@@ -1105,8 +1118,12 @@ def api_sector_lookouts_constituents():
 @app.post("/api/sector-lookouts/save")
 def api_sector_lookouts_save():
     """
-    Manually trigger saving current sector scans to DB.
+    Manually trigger saving current sector scans and setups to DB.
     Normally runs automatically at 19:30 IST.
+    
+    Saves both:
+    - Sector classifications (scan_rows)
+    - Setups (buys) - coiled stocks in actionable sectors
     """
     snap = engine.snapshot()
     if snap["status"] != "ready":
@@ -1115,17 +1132,121 @@ def api_sector_lookouts_save():
     with engine._lock:
         scan_rows = engine.scan_rows
         panel = engine.panel
+        buys = engine.buys
+        verdict_by_sector = engine.verdict_by_sector
         as_of = engine.as_of
     
     if scan_rows is None or scan_rows.empty:
         return jsonify({"error": "No sector data available"}), 400
     
     try:
-        n = db.save_sector_scans(as_of, scan_rows, panel)
+        n_sectors = db.save_sector_scans(as_of, scan_rows, panel)
+        n_setups = db.save_setups(as_of, buys, verdict_by_sector)
+        return jsonify({
+            "saved_sectors": n_sectors,
+            "saved_setups": n_setups,
+            "scan_date": as_of,
+            "message": f"Saved {n_sectors} sector scans and {n_setups} setups for {as_of}",
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.post("/api/coiled-bases/save")
+def api_coiled_bases_save():
+    """
+    Save current coiled bases (stock-level pre-breakout candidates) to DB.
+    Uses closing prices — call this after market close.
+    
+    Coiled bases are stock-level only, independent of sector classifications.
+    """
+    snap = engine.snapshot()
+    if snap["status"] != "ready":
+        return jsonify(snap), 202
+    
+    with engine._lock:
+        coil_rows = engine.coil_rows
+        as_of = engine.as_of
+    
+    if coil_rows is None or coil_rows.empty:
+        return jsonify({"error": "No coiled bases data available"}), 400
+    
+    try:
+        n = db.save_coiled_bases(as_of, coil_rows)
         return jsonify({
             "saved": n,
             "scan_date": as_of,
-            "message": f"Saved {n} sector scans for {as_of}",
+            "message": f"Saved {n} coiled bases for {as_of}",
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.get("/api/coiled-bases/dates")
+def api_coiled_bases_dates():
+    """Get list of dates with saved coiled bases."""
+    try:
+        dates = db.get_coiled_bases_dates()
+        return jsonify({"dates": dates})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.get("/api/coiled-bases")
+def api_coiled_bases_get():
+    """
+    Get coiled bases for a specific date.
+    Query params: scan_date (defaults to latest available)
+    """
+    try:
+        scan_date = request.args.get("scan_date")
+        if not scan_date:
+            dates = db.get_coiled_bases_dates(limit=1)
+            if not dates:
+                return jsonify({"error": "No coiled bases data available"}), 404
+            scan_date = dates[0]
+        
+        rows = db.get_coiled_bases(scan_date)
+        return jsonify({
+            "scan_date": scan_date,
+            "count": len(rows),
+            "rows": rows,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.get("/api/setups/dates")
+def api_setups_dates():
+    """Get list of dates with saved setups."""
+    try:
+        dates = db.get_setups_dates()
+        return jsonify({"dates": dates})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.get("/api/setups")
+def api_setups_get():
+    """
+    Get setups for a specific date.
+    Query params: scan_date (defaults to latest available)
+    
+    Setups = coiled stocks in actionable sectors (CROSSING, PULLBACK, etc.)
+    """
+    try:
+        scan_date = request.args.get("scan_date")
+        if not scan_date:
+            dates = db.get_setups_dates(limit=1)
+            if not dates:
+                return jsonify({"error": "No setups data available"}), 404
+            scan_date = dates[0]
+        
+        rows = db.get_setups(scan_date)
+        return jsonify({
+            "scan_date": scan_date,
+            "count": len(rows),
+            "rows": rows,
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1135,8 +1256,10 @@ def api_sector_lookouts_save():
 @app.post("/api/cron/sector-lookouts")
 def api_cron_sector_lookouts():
     """
-    Cron trigger for sector lookouts.
+    Cron trigger for sector lookouts and setups.
     POST /api/cron/sector-lookouts
+    
+    Saves both sector classifications and setups (coiled stocks in actionable sectors).
     """
     snap = engine.snapshot()
     if snap["status"] != "ready":
@@ -1145,21 +1268,55 @@ def api_cron_sector_lookouts():
     with engine._lock:
         scan_rows = engine.scan_rows
         panel = engine.panel
+        buys = engine.buys
+        verdict_by_sector = engine.verdict_by_sector
         as_of = engine.as_of
     
     if scan_rows is None or scan_rows.empty:
         return jsonify({"error": "No sector data available"}), 400
     
     try:
-        n = db.save_sector_scans(as_of, scan_rows, panel)
-        print(f"[cron] saved {n} sector scans for {as_of}")
+        n_sectors = db.save_sector_scans(as_of, scan_rows, panel)
+        n_setups = db.save_setups(as_of, buys, verdict_by_sector)
+        print(f"[cron] saved {n_sectors} sector scans and {n_setups} setups for {as_of}")
         return jsonify({
-            "saved": n,
+            "saved_sectors": n_sectors,
+            "saved_setups": n_setups,
             "scan_date": str(as_of),
-            "message": f"Saved {n} sector scans for {as_of}",
+            "message": f"Saved {n_sectors} sector scans and {n_setups} setups for {as_of}",
         })
     except Exception as e:
         print(f"[cron] sector lookout error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.post("/api/cron/coiled-bases")
+def api_cron_coiled_bases():
+    """
+    Cron trigger for coiled bases.
+    POST /api/cron/coiled-bases
+    """
+    snap = engine.snapshot()
+    if snap["status"] != "ready":
+        return jsonify({"status": "not_ready", "message": snap.get("message", "Engine loading")}), 202
+    
+    with engine._lock:
+        coil_rows = engine.coil_rows
+        as_of = engine.as_of
+    
+    if coil_rows is None or coil_rows.empty:
+        return jsonify({"error": "No coiled bases data available"}), 400
+    
+    try:
+        n = db.save_coiled_bases(as_of, coil_rows)
+        print(f"[cron] saved {n} coiled bases for {as_of}")
+        return jsonify({
+            "saved": n,
+            "scan_date": str(as_of),
+            "message": f"Saved {n} coiled bases for {as_of}",
+        })
+    except Exception as e:
+        print(f"[cron] coiled bases error: {e}")
         return jsonify({"error": str(e)}), 500
 
 
