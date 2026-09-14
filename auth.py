@@ -19,7 +19,8 @@ from flask import jsonify, request
 import db
 
 # Public: the Vite app and the authorize redirect need these.
-PUBLIC_PATHS = {"/api/auth/config", "/api/quote"}
+# Cron endpoints use their own secret-based auth.
+PUBLIC_PATHS = {"/api/auth/config", "/api/quote", "/api/cron/sector-lookouts"}
 
 _CACHE_TTL = 45.0
 _cache: dict[str, tuple[float, dict]] = {}

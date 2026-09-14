@@ -296,11 +296,12 @@ class Engine:
             bullish_sectors = 0
             total_sectors = 0
             if not self.scan_rows.empty and "klass" in self.scan_rows:
+                # Include BASE in actionable — quiet accumulation is worth watching
                 actionable = int(
-                    self.scan_rows["klass"].isin(["CROSSING", "PULLBACK"]).sum()
+                    self.scan_rows["klass"].isin(["CROSSING", "PULLBACK", "BASE"]).sum()
                 )
                 total_sectors = len(self.scan_rows)
-                # Bullish = CROSSING + PULLBACK, Bearish = WEAK + DISTRIBUTION
+                # Bullish = CROSSING + PULLBACK (not BASE — that's still building)
                 bullish_sectors = int(
                     self.scan_rows["klass"].isin(["CROSSING", "PULLBACK"]).sum()
                 )
@@ -1127,6 +1128,38 @@ def api_sector_lookouts_save():
             "message": f"Saved {n} sector scans for {as_of}",
         })
     except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# Cron-triggered endpoint (public, no auth)
+@app.post("/api/cron/sector-lookouts")
+def api_cron_sector_lookouts():
+    """
+    Cron trigger for sector lookouts.
+    POST /api/cron/sector-lookouts
+    """
+    snap = engine.snapshot()
+    if snap["status"] != "ready":
+        return jsonify({"status": "not_ready", "message": snap.get("message", "Engine loading")}), 202
+    
+    with engine._lock:
+        scan_rows = engine.scan_rows
+        panel = engine.panel
+        as_of = engine.as_of
+    
+    if scan_rows is None or scan_rows.empty:
+        return jsonify({"error": "No sector data available"}), 400
+    
+    try:
+        n = db.save_sector_scans(as_of, scan_rows, panel)
+        print(f"[cron] saved {n} sector scans for {as_of}")
+        return jsonify({
+            "saved": n,
+            "scan_date": str(as_of),
+            "message": f"Saved {n} sector scans for {as_of}",
+        })
+    except Exception as e:
+        print(f"[cron] sector lookout error: {e}")
         return jsonify({"error": str(e)}), 500
 
 
