@@ -9,3 +9,5 @@ flask-cors>=4.0
 gunicorn>=22.0
 growwapi>=0.1
 pyotp>=2.9
+supabase>=2.0
+dodopayments>=0.1
