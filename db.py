@@ -192,6 +192,107 @@ def verify_scan_date(saved_dates: list[str], now: datetime | None = None) -> str
     return next((d for d in saved_dates if d < sess), saved_dates[0])
 
 
+def is_weekend(d: date) -> bool:
+    return d.weekday() >= 5
+
+
+def _as_date(v) -> date | None:
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    try:
+        return date.fromisoformat(str(v)[:10])
+    except ValueError:
+        return None
+
+
+def is_past_holiday(d: date, sessions: set[date] | None, today: date) -> bool:
+    """Weekend, or a past weekday that never produced a session file."""
+    if is_weekend(d):
+        return True
+    if not sessions or d >= today:
+        return False
+    return d not in sessions
+
+
+def last_trading_date(d: date, sessions: set[date] | None, limit: int = 21) -> date:
+    """Walk backward from `d` to the last real session (skip weekends/holidays)."""
+    cur = d
+    for _ in range(limit):
+        if is_weekend(cur):
+            cur -= timedelta(days=1)
+            continue
+        if sessions and cur not in sessions:
+            cur -= timedelta(days=1)
+            continue
+        return cur
+    return cur
+
+
+def next_trading_date(d: date, sessions: set[date] | None, today: date,
+                      limit: int = 21) -> date | None:
+    """First session strictly after `d`. Future weekdays are assumed to trade."""
+    cur = d + timedelta(days=1)
+    for _ in range(limit):
+        if is_past_holiday(cur, sessions, today):
+            cur += timedelta(days=1)
+            continue
+        return cur
+    return None
+
+
+def session_calendar(now: datetime | None, sessions: set[date] | None,
+                     as_of: str | date | None = None) -> dict:
+    """
+    Holiday / last-session context for Track Record.
+
+    `sessions` should be known trading days from the loaded panel. Without
+    that we only skip weekends.
+    """
+    now = now_ist(now)
+    today = now.date()
+    known = {x for x in (sessions or set()) if isinstance(x, date)}
+    as_of_d = _as_date(as_of)
+    if as_of_d:
+        known.add(as_of_d)
+
+    yesterday = today - timedelta(days=1)
+    yesterday_holiday = is_past_holiday(yesterday, known or None, today)
+
+    today_weekend = is_weekend(today)
+    today_nse_holiday = (
+        not today_weekend
+        and today not in known
+        and bool(known)
+        and max(known) < today
+        and now.time() >= SESSION_CLOSE
+    )
+    today_holiday = today_weekend or today_nse_holiday
+    today_kind = (
+        "weekend" if today_weekend
+        else "nse_holiday" if today_nse_holiday
+        else "session"
+    )
+
+    last_session = last_trading_date(
+        yesterday if today_holiday else session_date(now),
+        known or None,
+    )
+    nxt = next_trading_date(last_session, known or None, today)
+
+    return {
+        "today": today.isoformat(),
+        "today_holiday": today_holiday,
+        "today_kind": today_kind,
+        "yesterday_holiday": yesterday_holiday,
+        "last_session": last_session.isoformat(),
+        "next_session": nxt.isoformat() if nxt else None,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Tom Predictions
 # ---------------------------------------------------------------------------
@@ -647,3 +748,185 @@ def get_cached_dates(limit: int = 30) -> list[str]:
     ).limit(limit).execute()
     
     return [r["cache_date"] for r in result.data] if result.data else []
+
+
+# ---------------------------------------------------------------------------
+# Sector Scans (Section 1: Post-Market Sector Lookouts)
+# ---------------------------------------------------------------------------
+
+def save_sector_scans(
+    scan_date: date | str,
+    scan_rows: pd.DataFrame,
+    panel: pd.DataFrame | None = None,
+) -> int:
+    """
+    Save sector classifications with shape reports to Supabase.
+    
+    `scan_rows` = output of scan.classify()
+    `panel` = sector panel for computing shape_report per sector
+    
+    Returns number of rows saved.
+    """
+    if scan_rows is None or scan_rows.empty:
+        return 0
+    
+    scan_date = str(scan_date)[:10]
+    client = get_client()
+    
+    # Import here to avoid circular import
+    import scan as sc
+    
+    records = []
+    for _, r in scan_rows.iterrows():
+        sector = r.get("sector")
+        
+        # Compute shape report if panel is provided
+        shape_report = None
+        if panel is not None and sector:
+            try:
+                hist = panel[panel["sector"] == sector]
+                if not hist.empty:
+                    _, shape = sc.shape_report(hist)
+                    shape_report = shape
+            except Exception as e:
+                print(f"shape_report error for {sector}: {e}")
+        
+        rec = {
+            "scan_date": scan_date,
+            "sector": sector,
+            "klass": r.get("klass"),
+            "t_rel": _clean(r.get("T_rel")),
+            "b": _clean(r.get("B")),
+            "cmf_rel": _clean(r.get("cmf_rel")),
+            "rs": _clean(r.get("rs")),
+            "rs_chg_5": _clean(r.get("rs_chg_5")),
+            "deliv_quality_rel": _clean(r.get("deliv_quality_rel")),
+            "n_stocks": _clean(r.get("n_stocks")),
+            "n_adv": _clean(r.get("n_adv")),
+            "top_share": _clean(r.get("top_share")),
+            "cmf": _clean(r.get("cmf")),
+            "buy_ready": bool(r.get("buy_ready", False)),
+            "note": r.get("note"),
+            "shape_report": shape_report,
+        }
+        records.append(rec)
+    
+    if not records:
+        return 0
+    
+    # Full replacement for the date
+    try:
+        client.table("sector_scans").delete().eq("scan_date", scan_date).execute()
+    except Exception as e:
+        print(f"delete old sector scans failed: {e}")
+    
+    try:
+        result = client.table("sector_scans").insert(records).execute()
+        return len(result.data) if result.data else 0
+    except Exception as e:
+        print(f"save sector scans failed: {e}")
+        return 0
+
+
+def get_sector_scan_dates(limit: int = 60) -> list[str]:
+    """Get distinct sector scan dates, newest first."""
+    client = get_client()
+    result = (client.table("sector_scans")
+              .select("scan_date")
+              .order("scan_date", desc=True)
+              .limit(500)
+              .execute())
+    seen, out = set(), []
+    for row in (result.data or []):
+        d = str(row.get("scan_date") or "")[:10]
+        if d and d not in seen:
+            seen.add(d)
+            out.append(d)
+            if len(out) >= limit:
+                break
+    return out
+
+
+def get_sector_scans_on(scan_date: date | str) -> list[dict]:
+    """Get all sector classifications for a specific date."""
+    scan_date = str(scan_date)[:10]
+    client = get_client()
+    result = (client.table("sector_scans")
+              .select("*")
+              .eq("scan_date", scan_date)
+              .execute())
+    return result.data or []
+
+
+def get_sector_history(
+    sector: str,
+    days: int = 30,
+    end_date: date | str | None = None,
+) -> list[dict]:
+    """
+    Get historical scan data for a single sector (for time-series heatmap).
+    Returns rows sorted by date ascending.
+    """
+    client = get_client()
+    query = (client.table("sector_scans")
+             .select("*")
+             .eq("sector", sector)
+             .order("scan_date", desc=True)
+             .limit(days))
+    
+    if end_date:
+        query = query.lte("scan_date", str(end_date)[:10])
+    
+    result = query.execute()
+    rows = result.data or []
+    # Return sorted ascending by date for time-series display
+    return sorted(rows, key=lambda x: x.get("scan_date", ""))
+
+
+def get_all_sectors_latest(scan_date: date | str | None = None) -> list[dict]:
+    """
+    Get the latest scan for all sectors (for cross-sectional heatmap).
+    If scan_date is None, uses the most recent scan date.
+    """
+    if scan_date is None:
+        dates = get_sector_scan_dates(limit=1)
+        if not dates:
+            return []
+        scan_date = dates[0]
+    
+    return get_sector_scans_on(scan_date)
+
+
+def get_sector_constituents(
+    sector: str,
+    scan_date: date | str | None = None,
+    stocks_df: pd.DataFrame | None = None,
+    top: int = 15,
+) -> list[dict]:
+    """
+    Get top stocks by turnover for a sector on a given date.
+    Requires stocks_df (the stock-level data with sector assignments).
+    """
+    if stocks_df is None or stocks_df.empty:
+        return []
+    
+    if scan_date is None:
+        scan_date = stocks_df["date"].max()
+    
+    scan_date = pd.Timestamp(str(scan_date)[:10])
+    day = stocks_df[
+        (stocks_df["date"] == scan_date) & 
+        (stocks_df["sector"] == sector)
+    ]
+    
+    if day.empty:
+        return []
+    
+    # Sort by turnover descending
+    day = day.sort_values("turnover", ascending=False).head(top)
+    
+    cols = ["symbol", "close", "ret", "turnover", "deliv_pct", 
+            "deliv_quality", "cmf", "volume"]
+    cols = [c for c in cols if c in day.columns]
+    
+    return [_row_dict(r) for _, r in day[cols].iterrows()]

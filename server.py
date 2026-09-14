@@ -332,6 +332,8 @@ class Engine:
                 "delivery_missing": int(self.delivery.get("missing", 0)),
                 "delivery_missing_dates": list(self.delivery.get("missing_dates") or []),
                 "tom_preview": self.tom_preview,
+                "job_refresh_at": _job_state("refresh_at"),
+                "job_scan_at": _job_state("scan_at"),
                 "regime_ok": regime_ok,
                 "bullish_sectors": bullish_sectors,
                 "total_sectors": total_sectors,
@@ -857,6 +859,7 @@ engine = Engine()
 app = Flask(__name__, static_folder=None)
 application = app  # gunicorn / Elastic Beanstalk: application:application
 CORS(app, resources={r"/api/*": {"origins": "*"}})
+# Auth middleware — requires sign-in for protected routes
 app.before_request(auth.before_request)
 
 
@@ -1026,12 +1029,154 @@ def api_sector():
     return jsonify(out)
 
 
+# ---------------------------------------------------------------------------
+# Sector Lookouts (Section 1: Post-Market Sector Analysis)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/sector-lookouts")
+def api_sector_lookouts():
+    """
+    Get sector scan data for the cross-sectional heatmap.
+    Returns all sectors for a given date (default: latest available).
+    """
+    try:
+        scan_date = request.args.get("date")
+        if scan_date:
+            rows = db.get_sector_scans_on(scan_date)
+        else:
+            rows = db.get_all_sectors_latest()
+        
+        if not rows:
+            return jsonify({"rows": [], "scan_date": None, "dates": []})
+        
+        dates = db.get_sector_scan_dates(limit=30)
+        actual_date = rows[0].get("scan_date") if rows else None
+        
+        return jsonify({
+            "rows": rows,
+            "scan_date": actual_date,
+            "dates": dates,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.get("/api/sector-lookouts/history")
+def api_sector_lookouts_history():
+    """
+    Get historical scan data for a single sector (time-series heatmap).
+    """
+    sector = (request.args.get("sector") or "").strip()
+    if not sector:
+        return jsonify({"error": "sector is required"}), 400
+    
+    try:
+        days = int(request.args.get("days", 30))
+        end_date = request.args.get("end_date")
+        rows = db.get_sector_history(sector, days=days, end_date=end_date)
+        return jsonify({"sector": sector, "rows": rows})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.get("/api/sector-lookouts/constituents")
+def api_sector_lookouts_constituents():
+    """
+    Get top stocks for a sector on a given date.
+    """
+    sector = (request.args.get("sector") or "").strip()
+    if not sector:
+        return jsonify({"error": "sector is required"}), 400
+    
+    try:
+        scan_date = request.args.get("date")
+        top = int(request.args.get("top", 15))
+        
+        with engine._lock:
+            stocks_df = engine.stocks if engine.status == "ready" else None
+        
+        rows = db.get_sector_constituents(sector, scan_date, stocks_df, top)
+        return jsonify({"sector": sector, "rows": rows})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.post("/api/sector-lookouts/save")
+def api_sector_lookouts_save():
+    """
+    Manually trigger saving current sector scans to DB.
+    Normally runs automatically at 19:30 IST.
+    """
+    snap = engine.snapshot()
+    if snap["status"] != "ready":
+        return jsonify(snap), 202
+    
+    with engine._lock:
+        scan_rows = engine.scan_rows
+        panel = engine.panel
+        as_of = engine.as_of
+    
+    if scan_rows is None or scan_rows.empty:
+        return jsonify({"error": "No sector data available"}), 400
+    
+    try:
+        n = db.save_sector_scans(as_of, scan_rows, panel)
+        return jsonify({
+            "saved": n,
+            "scan_date": as_of,
+            "message": f"Saved {n} sector scans for {as_of}",
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+def _known_sessions() -> tuple[set, str | None]:
+    """Trading days from the loaded panel, plus as_of."""
+    found: set = set()
+    as_of = None
+    with engine._lock:
+        as_of = engine.as_of
+        for df in (engine.panel, engine.raw, engine.stocks, engine.coil_stocks):
+            if df is None or getattr(df, "empty", True) or "date" not in df.columns:
+                continue
+            for v in df["date"].dropna().unique():
+                d = pd.Timestamp(v).date()
+                found.add(d)
+    return found, as_of
+
+
+def _outcomes_ready(scan_date, sessions: set, calendar: dict, now) -> bool:
+    """True only after the next *trading* session after the scan has closed."""
+    scan_d = db._as_date(scan_date)
+    if not scan_d:
+        return False
+    today = db._as_date(calendar.get("today")) or db.now_ist(now).date()
+    nxt = db.next_trading_date(scan_d, sessions or None, today)
+    if nxt is None:
+        return False
+    if today < nxt:
+        return False
+    if today > nxt:
+        return True
+    if calendar.get("today_holiday"):
+        return False
+    return (not market_is_open(now)) and now.time() >= MARKET_CLOSE
+
+
 @app.get("/api/track-record")
 def api_track_record():
-    """One day's For Tom list (default: yesterday, the day Verify scores)."""
+    """One day's For Tom list (default: last session before today)."""
     try:
         kind = request.args.get("kind")
         dates = db.get_prediction_dates()
+        sessions, as_of = _known_sessions()
+        for d in dates:
+            parsed = db._as_date(d)
+            if parsed:
+                sessions.add(parsed)
+        now = db.now_ist()
+        calendar = db.session_calendar(now, sessions, as_of)
+
         requested = (request.args.get("scan_date") or "").strip()[:10]
         scan_date = requested if requested in dates else None
         if not scan_date:
@@ -1056,30 +1201,11 @@ def api_track_record():
         if stats.get("avg_gain") is not None and stats.get("base_avg_gain") is not None:
             stats["edge_gain"] = stats["avg_gain"] - stats["base_avg_gain"]
 
-        # Can we trust outcome data? Only if the next session has happened.
-        # Before market opens on day N+1, the 'high' for day N's picks is stale.
-        now = db.now_ist()
-        scan_ts = pd.Timestamp(scan_date) if scan_date else None
-        next_session_done = False
-        if scan_ts:
-            # session_date gives us the "current trading day" (before 9am = yesterday).
-            # We need at least one COMPLETE session after the scan date.
-            current_session = db.session_date(now)
-            # Is current_session strictly after scan_date?
-            if current_session > scan_ts.date():
-                # Yes — but is that session complete?
-                # If we're still in the middle of current_session (market open),
-                # we have intraday highs but not final.
-                # If market is closed (after 15:30 OR before 9:00 next day),
-                # then current_session is fully done.
-                if market_is_open(now):
-                    # Mid-session: current_session is in progress
-                    # Check if there's another completed session between scan and current
-                    # i.e., current_session > scan_date + 1 day (at least one full day gap)
-                    next_session_done = (current_session - scan_ts.date()).days >= 2
-                else:
-                    # Market closed: current_session is complete
-                    next_session_done = True
+        next_session_done = _outcomes_ready(scan_date, sessions, calendar, now)
+        nxt = db.next_trading_date(
+            db._as_date(scan_date), sessions or None,
+            db._as_date(calendar["today"]),
+        ) if scan_date else None
 
         return jsonify({
             "dates": dates,
@@ -1087,6 +1213,10 @@ def api_track_record():
             "stats": stats,
             "predictions": preds,
             "outcomes_ready": next_session_done,
+            "calendar": {
+                **calendar,
+                "verify_session": nxt.isoformat() if nxt else None,
+            },
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1199,11 +1329,24 @@ def ui_assets(path: str):
     return jsonify({"error": "not found"}), 404
 
 
+def _job_state(key: str):
+    try:
+        import jobs
+        return jobs.state.get(key)
+    except Exception:
+        return None
+
+
 def _boot():
     try:
         engine.load(DEFAULT_DAYS, date.today())
     except Exception as exc:
         engine._set(status="error", error=str(exc), message="Startup load failed.")
+    try:
+        import jobs
+        jobs.start(engine, DEFAULT_DAYS)
+    except Exception as exc:
+        print(f"[jobs] failed to start: {exc}")
 
 
 if __name__ == "__main__":
