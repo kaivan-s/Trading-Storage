@@ -291,7 +291,6 @@ class Engine:
         self.buys = pd.DataFrame()
         self.breakouts = pd.DataFrame()
         self.tom = pd.DataFrame()
-        self.position_rows = pd.DataFrame()
         self.live_at = None
         self.live_n = 0
         self.live_status = None
@@ -331,7 +330,6 @@ class Engine:
                 "n_coil": int(len(self.coil_rows)),
                 "n_buys": int(len(self.buys)),
                 "n_tom": int(len(self.tom)),
-                "n_position": int(len(self.position_rows)),
                 "live_at": self.live_at,
                 "live_n": int(self.live_n),
                 "live_status": self.live_status,
@@ -345,8 +343,6 @@ class Engine:
                 "delivery_missing": int(self.delivery.get("missing", 0)),
                 "delivery_missing_dates": list(self.delivery.get("missing_dates") or []),
                 "tom_preview": self.tom_preview,
-                "job_refresh_at": _job_state("refresh_at"),
-                "job_scan_at": _job_state("scan_at"),
                 "regime_ok": regime_ok,
                 "bullish_sectors": bullish_sectors,
                 "total_sectors": total_sectors,
@@ -784,18 +780,6 @@ class Engine:
                     coil_stocks, quotes, scan_rows=scan_rows
                 )
 
-            # Position Trades: EOD only. The 7-10 session horizon means an
-            # intraday quote adds nothing, so this always runs off closes and
-            # is unaffected by which live source the tom scan used.
-            position_rows = pd.DataFrame()
-            try:
-                if coil_stocks is not None and not coil_stocks.empty:
-                    position_rows = posscan.scan(
-                        posscan.add_position_features(coil_stocks), as_of=as_of
-                    )
-            except Exception as e:
-                print(f"position scan failed: {e}")
-
             # Save today's picks, and score yesterday's against today's high
             saved = 0
             verified = 0
@@ -832,8 +816,6 @@ class Engine:
                     if delivery is not None:
                         self.delivery = delivery
                 self.tom = tom_rows
-                if not position_rows.empty:
-                    self.position_rows = position_rows
                 self.live_n = int(len(live) if live is not None else 0)
                 self.live_at = datetime.now().isoformat(timespec="seconds")
                 self.live_status = "ready"
@@ -1216,34 +1198,6 @@ def api_coiled_bases_save():
         return jsonify({"error": str(e)}), 500
 
 
-@app.get("/api/position-trades")
-def api_position_trades_get():
-    """
-    Position Trades for a date. Query params: scan_date (default: latest).
-
-    Reads from the DB rather than the live engine so the list a user sees is
-    the one that was actually recorded at scan time.
-    """
-    try:
-        scan_date = request.args.get("scan_date")
-        if scan_date:
-            rows = db.get_position_trades(scan_date)
-        else:
-            scan_date, rows = db.latest_position_trades()
-        return jsonify({"scan_date": scan_date, "rows": rows or []})
-    except Exception as e:
-        return jsonify({"error": str(e), "rows": []}), 500
-
-
-@app.get("/api/position-trades/dates")
-def api_position_trades_dates():
-    """Dates with saved Position Trades."""
-    try:
-        return jsonify({"dates": db.get_position_trades_dates()})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
 @app.get("/api/coiled-bases/dates")
 def api_coiled_bases_dates():
     """Get list of dates with saved coiled bases."""
@@ -1314,113 +1268,89 @@ def api_setups_get():
         return jsonify({"error": str(e)}), 500
 
 
-# Cron-triggered endpoint (public, no auth)
-@app.post("/api/cron/sector-lookouts")
-def api_cron_sector_lookouts():
+def _save_post_market() -> dict:
     """
-    Cron trigger for sector lookouts and setups.
-    POST /api/cron/sector-lookouts
-    
-    Saves both sector classifications and setups (coiled stocks in actionable sectors).
+    Persist everything derived from the session now in memory.
+
+    Every save is keyed on `engine.as_of` rather than today's date, so a run
+    that happens before the new bhavcopy exists re-writes the previous
+    session's rows instead of mislabelling them as today's. One failure does
+    not abort the rest -- a sector save that fails should not cost us the
+    coil list.
     """
-    snap = engine.snapshot()
-    if snap["status"] != "ready":
-        return jsonify({"status": "not_ready", "message": snap.get("message", "Engine loading")}), 202
-    
     with engine._lock:
+        as_of = engine.as_of
         scan_rows = engine.scan_rows
         panel = engine.panel
         buys = engine.buys
-        verdict_by_sector = engine.verdict_by_sector
-        as_of = engine.as_of
-    
-    if scan_rows is None or scan_rows.empty:
-        return jsonify({"error": "No sector data available"}), 400
-    
-    try:
-        n_sectors = db.save_sector_scans(as_of, scan_rows, panel)
-        n_setups = db.save_setups(as_of, buys, verdict_by_sector)
-        print(f"[cron] saved {n_sectors} sector scans and {n_setups} setups for {as_of}")
-        return jsonify({
-            "saved_sectors": n_sectors,
-            "saved_setups": n_setups,
-            "scan_date": str(as_of),
-            "message": f"Saved {n_sectors} sector scans and {n_setups} setups for {as_of}",
-        })
-    except Exception as e:
-        print(f"[cron] sector lookout error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-
-@app.post("/api/cron/coiled-bases")
-def api_cron_coiled_bases():
-    """
-    Cron trigger for coiled bases.
-    POST /api/cron/coiled-bases
-    """
-    snap = engine.snapshot()
-    if snap["status"] != "ready":
-        return jsonify({"status": "not_ready", "message": snap.get("message", "Engine loading")}), 202
-    
-    with engine._lock:
         coil_rows = engine.coil_rows
-        as_of = engine.as_of
-    
-    if coil_rows is None or coil_rows.empty:
-        return jsonify({"error": "No coiled bases data available"}), 400
-    
-    try:
-        n = db.save_coiled_bases(as_of, coil_rows)
-        print(f"[cron] saved {n} coiled bases for {as_of}")
-        return jsonify({
-            "saved": n,
-            "scan_date": str(as_of),
-            "message": f"Saved {n} coiled bases for {as_of}",
-        })
-    except Exception as e:
-        print(f"[cron] coiled bases error: {e}")
-        return jsonify({"error": str(e)}), 500
+        verdict = engine.verdict_by_sector
+
+    out: dict = {"scan_date": str(as_of)}
+
+    def attempt(label, fn):
+        try:
+            out[label] = fn()
+        except Exception as exc:
+            out[label] = f"error: {exc}"
+            print(f"[cron] {label} save failed: {exc}")
+
+    if scan_rows is not None and not scan_rows.empty:
+        attempt("sectors", lambda: db.save_sector_scans(as_of, scan_rows, panel))
+        attempt("setups", lambda: db.save_setups(as_of, buys, verdict))
+    else:
+        out["sectors"] = out["setups"] = 0
+
+    # The coil pool carries mom12_1, so Leaders at rest is the top 20 of this
+    # table by that column rather than a second table holding the same rows.
+    if coil_rows is not None and not coil_rows.empty:
+        attempt("coiled_bases", lambda: db.save_coiled_bases(as_of, coil_rows))
+    else:
+        out["coiled_bases"] = 0
+
+    print(f"[cron] post-market saved for {as_of}: {out}")
+    return out
 
 
-@app.post("/api/cron/position-trades")
-def api_cron_position_trades():
+@app.post("/api/cron/post-market")
+def api_cron_post_market():
     """
-    Cron trigger for Position Trades.
-    POST /api/cron/position-trades
+    The one scheduled call. Run it once after the bhavcopy lands (~19:30 IST).
+    POST /api/cron/post-market
 
-    Recomputes from the loaded panel rather than reusing engine.position_rows,
-    so a cron hit is correct even if no scan has run since the last refresh.
+    Loads the latest session and then saves the sectors, the setups and the
+    coil pool derived from it. Returns 202 straight away and finishes in a
+    background thread, because a full load runs for minutes and cron services
+    time out long before that -- so a 202 here means "accepted and running",
+    not "finished". Poll /api/status to watch it.
+
+    This replaces jobs.py. Loading is the part that matters: the previous
+    per-list cron endpoints only saved whatever was already in memory, so
+    without an internal scheduler they would have re-saved the same stale
+    snapshot every night.
     """
-    snap = engine.snapshot()
-    if snap["status"] != "ready":
-        return jsonify({"status": "not_ready",
-                        "message": snap.get("message", "Engine loading")}), 202
+    if engine._busy.locked():
+        return jsonify({**engine.snapshot(),
+                        "message": "Already running."}), 409
 
-    with engine._lock:
-        coil_stocks = engine.coil_stocks
-        as_of = engine.as_of
+    def work():
+        try:
+            ok = engine.load(DEFAULT_DAYS, date.today())
+        except Exception as exc:
+            engine._set(status="error", error=str(exc), message="Cron load failed.")
+            print(f"[cron] load failed: {exc}")
+            return
+        if not ok:
+            print("[cron] load returned no data — nothing saved")
+            return
+        _save_post_market()
 
-    if coil_stocks is None or getattr(coil_stocks, "empty", True):
-        return jsonify({"error": "No stock data available"}), 400
-
-    try:
-        rows = posscan.scan(posscan.add_position_features(coil_stocks), as_of=as_of)
-        if rows.empty:
-            return jsonify({
-                "saved": 0,
-                "scan_date": str(as_of),
-                "message": "No names qualified — needs 270 sessions of history",
-            })
-        n = db.save_position_trades(as_of, rows)
-        print(f"[cron] saved {n} position trades for {as_of}")
-        return jsonify({
-            "saved": n,
-            "scan_date": str(as_of),
-            "message": f"Saved {n} position trades for {as_of}",
-        })
-    except Exception as e:
-        print(f"[cron] position trades error: {e}")
-        return jsonify({"error": str(e)}), 500
+    threading.Thread(target=work, daemon=True).start()
+    return jsonify({
+        "status": "started",
+        "message": "Loading the latest session, then saving sectors, setups "
+                   "and the coil pool. Poll /api/status for progress.",
+    }), 202
 
 
 def _known_sessions() -> tuple[set, str | None]:
@@ -1622,24 +1552,16 @@ def ui_assets(path: str):
     return jsonify({"error": "not found"}), 404
 
 
-def _job_state(key: str):
-    try:
-        import jobs
-        return jobs.state.get(key)
-    except Exception:
-        return None
-
-
 def _boot():
+    """
+    One load at startup so the app is usable immediately. Everything after
+    that is driven externally by POST /api/cron/post-market -- there is no
+    internal scheduler.
+    """
     try:
         engine.load(DEFAULT_DAYS, date.today())
     except Exception as exc:
         engine._set(status="error", error=str(exc), message="Startup load failed.")
-    try:
-        import jobs
-        jobs.start(engine, DEFAULT_DAYS)
-    except Exception as exc:
-        print(f"[jobs] failed to start: {exc}")
 
 
 if __name__ == "__main__":

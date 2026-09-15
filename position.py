@@ -1,9 +1,23 @@
 """
-Position Trades — 12-1 momentum leaders holding above their 50-EMA.
+12-1 momentum: the ranking behind Leaders at rest.
 
-Held 7 to 10 sessions, not overnight. This replaces Expected Movers, which
-forecast how far a name would travel but measured no edge on direction
-(+0.02% median excess at one session, p=0.73).
+WHAT IS LIVE HERE
+
+`add_position_features` and `leaders_at_rest` are in the daily path. They add
+a 12-1 momentum reading to every stock and use it to order the coil pool,
+which is what the Setups page shows under "Leaders at rest" -- the 20 coiled
+names with the strongest last year. See eval_listsize.py for why 20.
+
+`scan()` is DORMANT. It produced the standalone Position Trades list (top
+decile 12-1 above the 50-EMA, no coil requirement), which was removed from
+the product: ranking the coil pool by the same factor measured better
+(+1.30% at a 10-session hold against +1.15%, and steadier across sample
+halves) on a quarter of the names. It is kept because it rests on a far
+stronger prior than our own construction does -- see the note at the bottom
+-- so it is the fallback if Leaders at rest disappoints live. Reviving it
+needs a table; the DDL was removed from db.py along with it.
+
+Everything below documents the factor itself, which both paths depend on.
 
 WHY THIS SPECIFICATION
 
