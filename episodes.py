@@ -219,12 +219,18 @@ def _step(ep, row, as_of) -> dict:
     return ep
 
 
-def advance(eps: list[dict], day: pd.DataFrame, as_of) -> list[dict]:
+def advance(eps: list[dict], day: pd.DataFrame, as_of,
+            eligible: set[str] | None = None) -> list[dict]:
     """
     Carry every episode forward one session and open one for each new base.
 
     `eps` is the full set so far; live ones are stepped, resolved ones are
     left untouched. Returns the same list, mutated.
+
+    `eligible` restricts which symbols may START an episode -- normally the
+    symbols on the published list for `as_of`. Existing episodes are always
+    advanced regardless, because the whole point is to follow a base after it
+    leaves the list, and that needs prices for names no longer on it.
     """
     as_of = pd.Timestamp(as_of)
     rows = {} if day is None or day.empty else {
@@ -240,6 +246,19 @@ def advance(eps: list[dict], day: pd.DataFrame, as_of) -> list[dict]:
             if ep["resolved_on"] is None and ep["state"] != "dropped":
                 holding.add(ep["symbol"])
 
+    if eligible is not None:
+        # The published list is the authority on what was shown, so it is not
+        # re-checked against the gates here. Re-deriving membership would
+        # silently drop any name whose gate result no longer reproduces --
+        # a slightly different panel depth is enough to do that -- and the
+        # base would vanish from tracking having been on the list.
+        for sym in eligible:
+            row = rows.get(sym)
+            if sym in holding or row is None:
+                continue
+            eps.append(_open(sym, row, as_of))
+        return eps
+
     for sym, row in rows.items():
         if sym in holding or int(row.get("n_fail", 1)) != 0:
             continue
@@ -249,27 +268,53 @@ def advance(eps: list[dict], day: pd.DataFrame, as_of) -> list[dict]:
 
 
 def build(stocks: pd.DataFrame, p: stk.CoilParams | None = None,
+          published: dict | None = None,
           dates=None, warmup: int | None = None) -> pd.DataFrame:
     """
-    Replay the gates session by session and return every episode.
+    Replay session by session and return every episode.
 
-    This is the one code path: tonight's update is `advance` called once with
-    today's cross-section, and the backfill is the same call in a loop. There
-    is no separate incremental branch that can drift from the reconstruction.
+    Always a replay, never an incremental step, so this is the one code path
+    and there is no second branch whose counters can drift out of agreement
+    with a reconstruction. Re-running it is free and repairs itself.
 
-    `warmup` skips the leading sessions where the indicators are still filling
-    in; without it every name looks like it starts a base on day one.
+    `published` maps each scan date to the symbols on the published list that
+    day, and is how this should normally be called. It makes the tracked set
+    exactly the names that were actually shown: an episode can only begin on
+    a date the symbol appeared on the list, and the replay starts at the
+    earliest published date rather than at the start of the price panel.
+
+    Without it, the fallback replays the raw gates over the whole panel, which
+    tracks every base the gates would have found whether or not anyone saw it
+    -- useful for research, far too broad for the app. `warmup` then skips the
+    leading sessions where indicators are still filling in, or every name
+    looks like it starts a base on day one.
     """
     p = p or stk.CoilParams()
+    pub = None
+
+    if published:
+        pub = {pd.Timestamp(k): set(v) for k, v in published.items() if v}
+
     if dates is None:
-        dates = np.sort(stocks["date"].unique())
-        if warmup is None:
-            warmup = p.min_sessions
-        dates = dates[warmup:]
+        all_dates = np.sort(stocks["date"].unique())
+        if pub:
+            # Start where publishing started. Sessions after the last
+            # published date are still replayed so open episodes can resolve.
+            start = min(pub)
+            dates = [d for d in all_dates if pd.Timestamp(d) >= start]
+        else:
+            if warmup is None:
+                warmup = p.min_sessions
+            dates = all_dates[warmup:]
 
     eps: list[dict] = []
     for d in dates:
-        advance(eps, stk.gate_flags(stocks, p, d), d)
+        # An empty set, not None: a session with no saved list published
+        # nothing, so nothing may start. None means "unrestricted" and would
+        # quietly reopen the raw-gate behaviour on every unpublished date,
+        # including the sessions after the last save while episodes resolve.
+        eligible = pub.get(pd.Timestamp(d), set()) if pub is not None else None
+        advance(eps, stk.gate_flags(stocks, p, d), d, eligible)
     return frame(eps)
 
 

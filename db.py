@@ -1355,3 +1355,81 @@ def get_open_episodes(retain_sessions: int = 5, limit: int = 400) -> list[dict]:
     except Exception as e:
         print(f"get open episodes failed: {e}")
         return []
+
+
+def latest_saved_session() -> str | None:
+    """
+    The most recent session both core tables already hold.
+
+    Used to decide whether a post-market run has anything to write. `setups`
+    is deliberately excluded: a session with no qualifying setups saves zero
+    rows, so its latest date legitimately lags and would make every evening
+    look outstanding forever.
+    """
+    dates = [_latest_date("sector_scans"), _latest_date("coiled_bases")]
+    if any(d is None for d in dates):
+        return None
+    return min(dates)
+
+
+def delete_session(scan_date: date | str) -> dict[str, int]:
+    """
+    Remove every saved row for one date.
+
+    For clearing a date the market never traded. NSE serves the previous
+    session's bhavcopy on a holiday rather than returning nothing, so before
+    fetch.py learned to check the file's own trade date it was possible to
+    publish a full scan under a non-session.
+    """
+    scan_date = str(scan_date)[:10]
+    client = get_client()
+    out = {}
+    for t in ("sector_scans", "setups", "coiled_bases"):
+        try:
+            before = (client.table(t).select("*", count="exact")
+                      .eq("scan_date", scan_date).execute()).count or 0
+            client.table(t).delete().eq("scan_date", scan_date).execute()
+            out[t] = before
+        except Exception as e:
+            print(f"delete {t} for {scan_date} failed: {e}")
+            out[t] = -1
+    for t, col in (("base_episodes", "started_on"),):
+        try:
+            before = (client.table(t).select("*", count="exact")
+                      .eq(col, scan_date).execute()).count or 0
+            client.table(t).delete().eq(col, scan_date).execute()
+            out[t] = before
+        except Exception as e:
+            print(f"delete {t} for {scan_date} failed: {e}")
+            out[t] = -1
+    return out
+
+
+def get_published_coils(limit: int = 20000) -> dict[str, list[str]]:
+    """
+    Every coil list ever published, as {scan_date: [symbols]}.
+
+    This is what seeds episode tracking. Using the saved lists rather than
+    re-running the gates over the price panel keeps the tracked set to names
+    that were actually put in front of someone: on the first run that is one
+    day and ~80 names, and it grows by the new entrants each evening instead
+    of arriving as several hundred rows of history nobody ever saw.
+    """
+    client = get_client()
+    try:
+        r = (client.table("coiled_bases")
+             .select("scan_date,symbol")
+             .order("scan_date", desc=True)
+             .limit(limit)
+             .execute())
+    except Exception as e:
+        print(f"get published coils failed: {e}")
+        return {}
+
+    out: dict[str, list[str]] = {}
+    for row in (r.data or []):
+        d = str(row.get("scan_date") or "")[:10]
+        s = row.get("symbol")
+        if d and s:
+            out.setdefault(d, []).append(s)
+    return out

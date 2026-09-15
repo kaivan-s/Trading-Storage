@@ -189,10 +189,45 @@ def _write_cache(df: pd.DataFrame, path: Path) -> None:
         df.to_csv(path, index=False, compression="gzip")
 
 
+class StaleBhavcopy(RuntimeError):
+    """
+    The file NSE returned is for a different session than the one requested.
+
+    Asking for a holiday does not 404 -- NSE serves the previous session's
+    file. Accepting it stamps a duplicate session into the panel under the
+    wrong date: every return on that day is exactly zero, which drags down
+    realised range and volatility, corrupts every session-counting indicator,
+    and publishes a scan under a date the market never traded.
+
+    A subclass of RuntimeError so the existing fallback chain in
+    fetch_bhavcopy handles it like any other failed source.
+    """
+
+    def __init__(self, asked: date, got) -> None:
+        super().__init__(f"asked for {asked}, file is dated {got}")
+        self.asked = asked
+        self.got = got
+
+
+def _check_date(stamped: pd.Series, d: date) -> None:
+    """Reject a file whose own trade date is not `d`."""
+    real = pd.to_datetime(stamped, errors="coerce").dropna().unique()
+    if len(real) == 0:
+        return  # nothing to check against; the caller's other guards apply
+    got = pd.Timestamp(real[0]).date()
+    if len(real) == 1 and got != d:
+        raise StaleBhavcopy(d, got)
+
+
 def _parse_sec_bhav(text: str, d: date) -> pd.DataFrame:
     df = pd.read_csv(io.StringIO(text))
     df.columns = [c.strip() for c in df.columns]
     df = df.rename(columns=SEC_BHAV_RENAME)
+
+    # DATE1 carries the session the file is actually for. Checked before the
+    # blind restamp below, which would otherwise hide a holiday's stale file.
+    if "date" in df:
+        _check_date(df["date"].astype(str).str.strip(), d)
 
     for col in ("symbol", "series"):
         if col in df:
@@ -217,6 +252,12 @@ def _parse_udiff(content: bytes, d: date) -> pd.DataFrame:
         name = z.namelist()[0]
         df = pd.read_csv(z.open(name))
     df.columns = [c.strip() for c in df.columns]
+
+    # Same holiday trap as sec_bhavdata: TradDt is the session the file is
+    # really for, so it is checked before the requested date is stamped on.
+    if "TradDt" in df.columns:
+        _check_date(df["TradDt"], d)
+
     out = pd.DataFrame({
         "symbol": df["TckrSymb"].astype(str).str.strip(),
         "series": df["SctySrs"].astype(str).str.strip(),
@@ -273,6 +314,13 @@ def fetch_bhavcopy(d: date, sess: NSESession | None = None,
                      referer=f"{BASE}/all-reports")
         df = _parse_sec_bhav(r.text, d)
         df["source"] = "sec_bhav"
+    except StaleBhavcopy as exc:
+        # Not a trading session. Any cache entry for this date was written
+        # before the check existed and holds the wrong session, so it is
+        # removed rather than served for the rest of the install's life.
+        print(f"  {d}: no session — {exc}")
+        path.unlink(missing_ok=True)
+        return None
     except RuntimeError:
         if cached is not None and not cached.empty:
             return cached
@@ -337,7 +385,57 @@ def load_history(end: date, n_sessions: int, sess: NSESession | None = None,
     # (ns vs us). Normalise so groupby/merge on date behaves consistently.
     out["date"] = pd.to_datetime(out["date"])
     out = _ensure_source(out)
+    out = drop_repeat_sessions(out, verbose=verbose)
     return out.sort_values(["symbol", "date"])
+
+
+def drop_repeat_sessions(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
+    """
+    Remove a session that is an exact copy of the session before it.
+
+    The date check in the parsers stops new stale files getting in, but a
+    cache written before that check holds the wrong session already stamped
+    with the requested date, and nothing inside the row can reveal it. What
+    does reveal it is the copy itself: two sessions where every symbol closed
+    at exactly the same price cannot both be real, and the later one is the
+    holiday that served the earlier one's file.
+
+    Compared on the full (symbol, close) vector rather than a sample, so a
+    genuine session that merely resembles its predecessor is never dropped.
+    """
+    if df.empty or "close" not in df.columns:
+        return df
+
+    sig = {
+        d: tuple(g.sort_values("symbol")[["symbol", "close"]]
+                 .itertuples(index=False, name=None))
+        for d, g in df.groupby("date", sort=True)
+    }
+
+    drop, prev_date, prev = [], None, None
+    for d in sorted(sig):
+        if prev is not None and sig[d] == prev:
+            drop.append(d)
+            if verbose:
+                print(f"  dropping {pd.Timestamp(d).date()}: identical to "
+                      f"{pd.Timestamp(prev_date).date()} — not a session")
+            continue
+        prev_date, prev = d, sig[d]
+
+    if not drop:
+        return df
+    kept = df[~df["date"].isin(drop)]
+    _purge_cache(drop)
+    return kept
+
+
+def _purge_cache(dates) -> None:
+    """Delete cache files for dates that turned out not to be sessions."""
+    for d in dates:
+        p = _cache_path(pd.Timestamp(d).date())
+        if p.exists():
+            p.unlink(missing_ok=True)
+            print(f"  removed poisoned cache {p.name}")
 
 
 def delivery_coverage(df: pd.DataFrame, threshold: float = 0.5) -> dict:

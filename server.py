@@ -475,14 +475,27 @@ class Engine:
         except Exception as exc:
             print(f"breakout scan failed: {exc}")
 
-        # Episode state is recomputed from the panel rather than stepped
-        # forward from yesterday's row. A full replay costs ~15s once a day
-        # and cannot drift: age, gap and the bridged streak are derived, so a
-        # missed run or a restarted process repairs itself on the next load.
+        # Episodes track the names that were actually published, so they are
+        # seeded from the saved coil lists rather than from a replay of the
+        # raw gates -- the gates would open an episode for every base they
+        # would have found over the whole panel, which is history nobody saw.
+        #
+        # Today's list is passed in from memory because it is not saved until
+        # _save_post_market runs, which is after this. The state is a full
+        # replay rather than a step forward from yesterday, so age, gap and
+        # the bridged streak are all derived and a missed or repeated run
+        # repairs itself instead of drifting.
         self._set(message="Tracking base episodes…")
         episode_rows = pd.DataFrame()
         try:
-            episode_rows = eps.build(coil_stocks)
+            published = {}
+            try:
+                published = db.get_published_coils()
+            except Exception as exc:
+                print(f"published coil history unavailable: {exc}")
+            if not coil_rows.empty:
+                published[as_of_s] = list(coil_rows["symbol"])
+            episode_rows = eps.build(coil_stocks, published=published)
             # The shown lists carry the bridged age instead of `coil_days`,
             # which resets on a single missed session.
             coil_rows = eps.tag(coil_rows, episode_rows, as_of)
@@ -1362,15 +1375,19 @@ def api_setups_get():
         return jsonify({"error": str(e)}), 500
 
 
-def _save_post_market() -> dict:
+def _save_post_market(force: bool = False) -> dict:
     """
     Persist everything derived from the session now in memory.
 
-    Every save is keyed on `engine.as_of` rather than today's date, so a run
-    that happens before the new bhavcopy exists re-writes the previous
-    session's rows instead of mislabelling them as today's. One failure does
-    not abort the rest -- a sector save that fails should not cost us the
-    coil list.
+    Every save is keyed on `engine.as_of` -- the newest session actually in
+    the panel -- and never on today's date. On a holiday the panel does not
+    advance, so the run finds nothing new and writes nothing, rather than
+    publishing the previous session's numbers under a date the market never
+    traded. `force` re-writes the current session anyway, for backfilling a
+    table after a failure.
+
+    One failure does not abort the rest: a sector save that fails should not
+    cost us the coil list.
     """
     with engine._lock:
         as_of = engine.as_of
@@ -1382,6 +1399,20 @@ def _save_post_market() -> dict:
         verdict = engine.verdict_by_sector
 
     out: dict = {"scan_date": str(as_of)}
+
+    # Nothing new to publish. Reached on a holiday, on a weekend, and on any
+    # evening the bhavcopy has not landed yet -- in all three the panel still
+    # ends at the last real session, which is already stored.
+    saved = None
+    try:
+        saved = db.latest_saved_session()
+    except Exception as exc:
+        print(f"[cron] could not read the last saved session: {exc}")
+    if not force and saved and as_of and str(as_of) <= saved:
+        out.update(skipped="no new session", latest_saved=saved)
+        print(f"[cron] nothing to do: panel ends {as_of}, "
+              f"already saved through {saved}")
+        return out
 
     def attempt(label, fn):
         try:
@@ -1420,11 +1451,16 @@ def api_cron_post_market():
     The one scheduled call. Run it once after the bhavcopy lands (~19:30 IST).
     POST /api/cron/post-market
 
-    Loads the latest session and then saves the sectors, the setups and the
-    coil pool derived from it. Returns 202 straight away and finishes in a
-    background thread, because a full load runs for minutes and cron services
-    time out long before that -- so a 202 here means "accepted and running",
-    not "finished". Poll /api/status to watch it.
+    Loads the latest session and then saves the sectors, the setups, the coil
+    pool and the base episodes derived from it. Returns 202 straight away and
+    finishes in a background thread, because a full load runs for minutes and
+    cron services time out long before that -- so a 202 here means "accepted
+    and running", not "finished". Poll /api/status to watch it.
+
+    Safe to call every day including holidays. The save is keyed on the newest
+    session in the panel, so a day the market was shut writes nothing instead
+    of republishing yesterday's numbers under today's date. Pass `?force=1`
+    to re-write the current session, for filling a table in after a failure.
 
     This replaces jobs.py. Loading is the part that matters: the previous
     per-list cron endpoints only saved whatever was already in memory, so
@@ -1434,6 +1470,8 @@ def api_cron_post_market():
     if engine._busy.locked():
         return jsonify({**engine.snapshot(),
                         "message": "Already running."}), 409
+
+    force = str(request.args.get("force") or "").lower() in ("1", "true", "yes")
 
     def work():
         try:
@@ -1445,13 +1483,14 @@ def api_cron_post_market():
         if not ok:
             print("[cron] load returned no data — nothing saved")
             return
-        _save_post_market()
+        _save_post_market(force=force)
 
     threading.Thread(target=work, daemon=True).start()
     return jsonify({
         "status": "started",
-        "message": "Loading the latest session, then saving sectors, setups "
-                   "and the coil pool. Poll /api/status for progress.",
+        "message": "Loading the latest session, then saving sectors, setups, "
+                   "the coil pool and base episodes. Poll /api/status for "
+                   "progress.",
     }), 202
 
 
