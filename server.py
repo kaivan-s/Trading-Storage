@@ -556,8 +556,6 @@ class Engine:
             self.message = f"Ready · {as_of_s}"
             self.error = None
 
-        self._restore_tom()
-
         # Persist today's setups outside the lock (file IO). Idempotent per
         # as_of, so a repeated Refresh does not duplicate rows.
         try:
@@ -565,29 +563,12 @@ class Engine:
         except Exception as exc:  # logging must never break a load
             print(f"flags log append failed: {exc}")
 
-    def _restore_tom(self):
-        """Load the last saved For Tom list so a restart does not require a rescan."""
-        try:
-            scan_d = db.latest_tom_scan_date()
-            if not scan_d:
-                return
-            preds = db.get_predictions_on(scan_d)
-            rows = db.tom_frame_from_predictions(preds)
-            if rows.empty:
-                return
-            created = [p.get("created_at") for p in preds if p.get("created_at")]
-            live_at = max(created) if created else f"{scan_d}T00:00:00"
-            with self._lock:
-                if self.live_status == "loading":
-                    return
-                self.tom = rows
-                self.live_at = str(live_at)[:19]
-                self.live_n = int(len(rows))
-                self.live_status = "ready"
-                if not self.live_source:
-                    self.live_source = "saved"
-        except Exception as exc:
-            print(f"restore tom failed: {exc}")
+    # Restoring the saved For Tom list used to happen here. It read
+    # tom_predictions, which no longer exists in this project, to populate
+    # state no screen reads -- Expected Movers was removed once its score
+    # measured no return edge. So it logged a failure on every load and
+    # bought nothing. The live scan path still fills self.tom for the
+    # intraday endpoints.
 
     def dashboard(self) -> dict:
         snap = self.snapshot()

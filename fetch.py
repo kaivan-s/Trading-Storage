@@ -189,6 +189,50 @@ def _write_cache(df: pd.DataFrame, path: Path) -> None:
         df.to_csv(path, index=False, compression="gzip")
 
 
+_NO_SESSION_FILE = CACHE_DIR / "no_session.json"
+_no_session: set[str] | None = None
+
+# A date is only recorded as a non-session once it is old enough that "the
+# file has not landed yet" is off the table. Asking for today's bhavcopy
+# before it publishes is answered with yesterday's, which is indistinguishable
+# from a holiday -- recording that would permanently blind us to a real
+# session.
+NO_SESSION_MIN_AGE = timedelta(days=3)
+
+
+def _no_session_set() -> set[str]:
+    """Dates known to have no bhavcopy of their own, remembered across runs."""
+    global _no_session
+    if _no_session is None:
+        try:
+            _no_session = {str(x) for x in json.loads(_NO_SESSION_FILE.read_text())}
+        except Exception:
+            _no_session = set()
+    return _no_session
+
+
+def _mark_no_session(d: date) -> None:
+    """
+    Remember that `d` is not a trading session.
+
+    Holidays are otherwise re-requested on every single load, forever: a
+    rejection caches nothing, so the fourteen holidays in a year of history
+    cost fourteen round trips plus rate-limit pauses every time the panel is
+    rebuilt. Recording them turns that into a dictionary lookup.
+    """
+    if date.today() - d < NO_SESSION_MIN_AGE:
+        return
+    known = _no_session_set()
+    if d.isoformat() in known:
+        return
+    known.add(d.isoformat())
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        _NO_SESSION_FILE.write_text(json.dumps(sorted(known)))
+    except Exception as exc:
+        print(f"  could not record non-session {d}: {exc}")
+
+
 class StaleBhavcopy(RuntimeError):
     """
     The file NSE returned is for a different session than the one requested.
@@ -301,6 +345,12 @@ def fetch_bhavcopy(d: date, sess: NSESession | None = None,
     """
     RAW_DIR.mkdir(parents=True, exist_ok=True)
     path = _cache_path(d)
+
+    # Known holiday. Checked before the cache read and before any request,
+    # because this is the only one of the three that costs nothing.
+    if use_cache and d.isoformat() in _no_session_set():
+        return None
+
     cached = None
     if use_cache and path.exists():
         cached = _read_cache(path)
@@ -320,6 +370,7 @@ def fetch_bhavcopy(d: date, sess: NSESession | None = None,
         # removed rather than served for the rest of the install's life.
         print(f"  {d}: no session — {exc}")
         path.unlink(missing_ok=True)
+        _mark_no_session(d)
         return None
     except RuntimeError:
         if cached is not None and not cached.empty:
@@ -432,10 +483,12 @@ def drop_repeat_sessions(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame
 def _purge_cache(dates) -> None:
     """Delete cache files for dates that turned out not to be sessions."""
     for d in dates:
-        p = _cache_path(pd.Timestamp(d).date())
+        day = pd.Timestamp(d).date()
+        p = _cache_path(day)
         if p.exists():
             p.unlink(missing_ok=True)
             print(f"  removed poisoned cache {p.name}")
+        _mark_no_session(day)
 
 
 def delivery_coverage(df: pd.DataFrame, threshold: float = 0.5) -> dict:
