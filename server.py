@@ -1664,6 +1664,27 @@ def api_subscription_webhook():
     return jsonify({"received": True})
 
 
+@app.post("/api/subscription/cancel")
+def api_subscription_cancel():
+    """Cancel the current user's subscription."""
+    user = request.environ.get("auth_user") or {}
+    email = user.get("email") or ""
+    if not email:
+        return jsonify({"error": "Sign in required"}), 401
+    
+    body = request.get_json(silent=True) or {}
+    subscription_id = body.get("subscription_id")  # Optional, will look up from DB if not provided
+    
+    try:
+        from subscription import cancel_subscription
+        result = cancel_subscription(email, subscription_id)
+        if result.get("success"):
+            return jsonify({"success": True, "message": "Subscription cancelled"})
+        return jsonify({"success": False, "error": result.get("error", "Cancel failed")}), 400
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @app.get("/health")
 def health():
     return jsonify({"ok": True})

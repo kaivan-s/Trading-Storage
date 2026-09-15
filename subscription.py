@@ -213,7 +213,7 @@ def create_checkout_url(customer_email: str, plan: str = "monthly", customer_nam
                 "email": customer_email,
                 "name": customer_name or customer_email.split("@")[0],
             },
-            return_url=f"{app_url}/?subscription=success",
+            return_url=f"{app_url}/pricing?success=true",
             metadata={
                 "plan": plan,
                 "source": "morrow_desk",
@@ -234,6 +234,63 @@ def clear_cache(customer_email: str = None):
         _subscription_cache.pop(customer_email.lower(), None)
     else:
         _subscription_cache = {}
+
+
+def cancel_subscription(customer_email: str, subscription_id: str = None) -> dict:
+    """
+    Cancel a user's subscription.
+    
+    1. Cancel in Dodo Payments
+    2. Update Supabase to mark as cancelled
+    3. Clear cache
+    
+    Returns:
+        {"success": bool, "error": str | None}
+    """
+    if not customer_email:
+        return {"success": False, "error": "Email required"}
+    
+    # Get subscription_id from DB if not provided
+    if not subscription_id:
+        db_result = _get_subscription_from_db(customer_email)
+        if db_result:
+            subscription_id = db_result.get("subscription_id")
+    
+    if not subscription_id:
+        return {"success": False, "error": "No active subscription found"}
+    
+    # 1. Cancel in Dodo Payments
+    if DODO_API_KEY:
+        try:
+            client = _get_dodo_client()
+            # Cancel the subscription - this ends it at current period
+            client.subscriptions.update(
+                subscription_id=subscription_id,
+                status="cancelled",
+            )
+            print(f"[subscription] Cancelled in Dodo: {subscription_id}")
+        except Exception as e:
+            print(f"[subscription] Dodo cancel error: {e}")
+            # Continue anyway - we'll update DB
+    
+    # 2. Update Supabase
+    try:
+        _save_subscription_to_db(
+            email=customer_email,
+            is_premium=False,
+            plan=None,
+            subscription_id=subscription_id,
+            expires_at=None,
+        )
+        print(f"[subscription] Marked cancelled in DB: {customer_email}")
+    except Exception as e:
+        print(f"[subscription] DB update error during cancel: {e}")
+        return {"success": False, "error": "Database update failed"}
+    
+    # 3. Clear cache
+    clear_cache(customer_email)
+    
+    return {"success": True, "error": None}
 
 
 def verify_webhook_signature(payload: bytes, signature: str) -> bool:
