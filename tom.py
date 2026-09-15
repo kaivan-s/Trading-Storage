@@ -1,12 +1,14 @@
 """
-Live overlay at Refresh: potential breakouts for tomorrow.
+Live overlay at Refresh: uptrend names near their 20-day high.
 
 Last complete bhavcopy is usually yesterday. This joins last prices from
 the moment of Refresh onto those EOD indicators and asks which names are
-close enough to (or already through) the 20-day high that today's close
-— or tomorrow's open — can complete a break.
+close enough to (or already through) the 20-day high to be in play.
 
-This is not the EOD Setups list. Delivery is unknown until the bhavcopy.
+This is not the EOD Setups list, and it is not a return forecast — the
+shipped ranking predicts how far a name travels, not which way. See the
+block comment above `for_tomorrow_momentum` for the measurements.
+Delivery is unknown until the bhavcopy.
 """
 
 from __future__ import annotations
@@ -251,13 +253,31 @@ def for_tomorrow(coil_stocks: pd.DataFrame, live: pd.DataFrame,
 
 
 # ==========================================================================
-# Momentum-tilted variant
+# Energy-scored variant — what it does and does not predict
 # --------------------------------------------------------------------------
-# Backtest finding: next-day winners run HIGHER on energy (vol_ratio, RSI,
-# range, extension, ATR) and LOWER on base_days — i.e. the quiet dry-up coil
-# is anti-predictive for a next-day pop. This variant keeps the uptrend gate
-# (downtrends are a different strategy) but SCORES by energy and takes the
-# top N, instead of rewarding quiet contraction.
+# Measured over 324 cached sessions (114 usable scan days), three independent
+# ways, at 1 / 5 / 20-session horizons:
+#
+#   The score does NOT rank return. Median excess return of the top 40 came
+#   in BELOW the median of its own gated pool at every horizon (+0.02% vs
+#   +0.06% at 1 session, +0.26% vs +0.37% at 5, +1.09% vs +1.49% at 20), so
+#   ranking by it is worse than taking every name that clears the gates.
+#   Against the market the next-day edge is +0.02%, p=0.73.
+#
+#   The score DOES rank intraday range, very reliably. The top 40 reached
+#   +3% above the close on the next session 9-11pp more often than the rest
+#   of the gated pool, t=13, holding on 87-92% of sessions. Its next-day
+#   return dispersion is 3.18% against 2.51% for the pool — it selects
+#   movement in both directions, at the same return per unit of risk.
+#
+# Hence the UI presents this as expected range, not as picks. Two dead ends
+# recorded so they are not retried: reweighting the score from the features
+# with the strongest cross-sectional ICs scored WORSE than the current
+# weights, and the single best 1-day feature (low ATR) was significantly
+# negative inside this gate set — broad-universe ICs do not survive being
+# conditioned on "uptrend, near the 20-day high". Filtering on sector state
+# also hurts (-0.97pp at 20 sessions, t=-4.68), which is why scan_rows is
+# used only to label rows and never to select them.
 # ==========================================================================
 
 # Momentum zone: how far below / above the trigger a name may sit.
@@ -284,9 +304,12 @@ def for_tomorrow_momentum(coil_stocks: pd.DataFrame, live: pd.DataFrame,
                           scan_rows: pd.DataFrame | None = None,
                           top_n: int = 100) -> pd.DataFrame:
     """
-    Energy-scored variant of `for_tomorrow`. Same inputs, but selects the
-    top `top_n` uptrend names ranked by a momentum score rather than by
-    coil quietness. Returns a frame with a `score` column.
+    Energy-scored variant of `for_tomorrow`. Same inputs, but ranks uptrend
+    names by expected intraday range rather than by coil quietness. Returns
+    a frame with a `score` column.
+
+    `score` is a validated range forecast and not a return forecast — see
+    the block comment above before treating the order as a preference.
     """
     empty_cols = [
         "symbol", "sector", "ltp", "trigger", "to_trigger", "vol_expand",
@@ -379,10 +402,10 @@ def for_tomorrow_momentum(coil_stocks: pd.DataFrame, live: pd.DataFrame,
 
     def why(r):
         return (
-            f"Momentum score {r['score']:.2f}: RSI {float(r.get('rsi') or 0):.0f}, "
+            f"Expected range {r['score']:.2f}: RSI {float(r.get('rsi') or 0):.0f}, "
             f"vol {float(r.get('vol_ratio') or 0):.1f}×, "
-            f"{float(r['to_trigger'])*100:+.1f}% to trigger. "
-            "Selected for energy, not quietness."
+            f"{float(r['to_trigger'])*100:+.1f}% to the 20-day high. "
+            "Ranked for how far it is likely to travel, in either direction."
         )
     m["why"] = m.apply(why, axis=1)
 
