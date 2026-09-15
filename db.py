@@ -66,6 +66,16 @@ CREATE TABLE daily_cache (
 -- rows. Run this once on an existing install:
 -- ALTER TABLE coiled_bases ADD COLUMN IF NOT EXISTS mom12_1 NUMERIC;
 
+-- The UI reads these tables directly and renders them as-is, so anything it
+-- displays has to be stored rather than recomputed on the way out. Run once:
+-- ALTER TABLE coiled_bases ADD COLUMN IF NOT EXISTS rest_rank INT;
+-- ALTER TABLE coiled_bases ADD COLUMN IF NOT EXISTS coil_days INT;
+-- ALTER TABLE coiled_bases ADD COLUMN IF NOT EXISTS recommended BOOLEAN;
+-- ALTER TABLE coiled_bases ADD COLUMN IF NOT EXISTS episode_days INT;
+-- ALTER TABLE coiled_bases ADD COLUMN IF NOT EXISTS episode_new BOOLEAN;
+-- ALTER TABLE setups ADD COLUMN IF NOT EXISTS episode_days INT;
+-- ALTER TABLE setups ADD COLUMN IF NOT EXISTS episode_new BOOLEAN;
+
 -- One row per basing episode: a base keeps its identity from the session it
 -- first qualifies to the session it resolves, which is what lets the app say
 -- "this broke out" instead of silently dropping the row. Keyed on the start
@@ -1017,6 +1027,16 @@ def save_coiled_bases(
             # Leaders at rest is the top 20 of this table by mom12_1, so the
             # ranked list needs no table of its own.
             "mom12_1": _clean(r.get("mom12_1")),
+            # Everything below is stored so a read is a plain SELECT. The UI
+            # renders these and must not re-derive them: rest_rank in
+            # particular is assigned by position.leaders_at_rest, and
+            # re-sorting by mom12_1 on read would silently disagree with it
+            # whenever a name has no 12-1 reading (those rank last, not out).
+            "rest_rank": _clean(r.get("rest_rank")),
+            "coil_days": _clean(r.get("coil_days")),
+            "recommended": bool(r.get("recommended", False)),
+            "episode_days": _clean(r.get("episode_days")),
+            "episode_new": bool(r.get("episode_new", False)),
         }
         records.append(rec)
     
@@ -1117,6 +1137,10 @@ def save_setups(
             "deliv_quality_rel": _clean(r.get("deliv_quality_rel")),
             "base_days": _clean(r.get("base_days")),
             "recommended": bool(r.get("recommended", False)),
+            # Bridged episode age, so the UI does not need the panel to tell
+            # a genuinely new setup from one that wobbled for a session.
+            "episode_days": _clean(r.get("episode_days")),
+            "episode_new": bool(r.get("episode_new", False)),
         }
         records.append(rec)
     
@@ -1242,21 +1266,92 @@ def save_episodes(eps: pd.DataFrame) -> int:
     return saved
 
 
-def get_episodes(limit: int = 600) -> list[dict]:
-    """
-    Episodes worth showing: everything still live, newest activity first.
+# ------------------------------------------------------- the whole read path
 
-    Resolved rows are included so the view can answer "what happened to the
-    name I saw last week"; the caller trims them by age.
-    """
+# Leaders at rest is the top of the coil pool by 12-1 momentum. Kept here so
+# the compatibility path below cannot drift from position.REST_TOP_N.
+REST_TOP_N = 20
+
+
+def _latest_date(table: str, col: str = "scan_date") -> str | None:
+    """Most recent date present in `table`, or None if it is empty."""
     client = get_client()
     try:
-        result = (client.table("base_episodes")
-                  .select("*")
-                  .order("state_since", desc=True)
-                  .limit(limit)
-                  .execute())
-        return result.data or []
+        r = (client.table(table).select(col)
+             .order(col, desc=True).limit(1).execute())
+        rows = r.data or []
+        return str(rows[0][col])[:10] if rows else None
     except Exception as e:
-        print(f"get episodes failed: {e}")
+        print(f"latest date for {table} failed: {e}")
+        return None
+
+
+def get_lists() -> dict:
+    """
+    Everything the dashboard shows, read straight out of Supabase.
+
+    This is the whole read path. The scans are computed once by the
+    post-market cron and written here, so serving the UI is a SELECT and
+    nothing in the request path depends on the in-memory panel — which means
+    a restarted process serves the same data immediately instead of showing
+    an empty app until it has re-fetched a year of bhavcopies.
+
+    Each table is read at its own latest date rather than one shared date.
+    They are written together so those normally agree, but if a sector save
+    fails the coil list should still render rather than the whole page
+    blanking out on a date that one table happens to be missing.
+    """
+    scan_date = _latest_date("sector_scans")
+    setup_date = _latest_date("setups")
+    coil_date = _latest_date("coiled_bases")
+
+    scan = get_all_sectors_latest(scan_date) if scan_date else []
+    setups = get_setups(setup_date) if setup_date else []
+    coils = get_coiled_bases(coil_date) if coil_date else []
+
+    ranked = [r for r in coils if r.get("rest_rank") is not None]
+    if ranked:
+        ranked.sort(key=lambda r: r["rest_rank"])
+    else:
+        # Compatibility path for rows written before rest_rank existed. Same
+        # rule position.leaders_at_rest applies: order by 12-1 momentum and
+        # keep the top N, with no reading sorting last rather than dropping
+        # out. Rows saved by any current run carry rest_rank and skip this.
+        ranked = sorted(
+            coils,
+            key=lambda r: (r.get("mom12_1") is None, -(r.get("mom12_1") or 0.0)),
+        )[:REST_TOP_N]
+
+    return {
+        "as_of": coil_date or scan_date or setup_date,
+        "scan_date": scan_date,
+        "scan": scan,
+        "buys": setups,
+        "coil": coils,
+        "rest": ranked,
+    }
+
+
+def get_open_episodes(retain_sessions: int = 5, limit: int = 400) -> list[dict]:
+    """
+    Episodes worth putting in front of someone tonight.
+
+    Open bases plus anything that resolved in the last few sessions. The full
+    table keeps every episode ever tracked, which is the right thing for a
+    record but the wrong thing for a screen: reading twenty sessions of
+    resolved history back meant several hundred rows, almost all of them
+    closed and none of them news.
+    """
+    client = get_client()
+    cutoff = (session_date() - timedelta(days=int(retain_sessions * 1.6))).isoformat()
+    try:
+        r = (client.table("base_episodes")
+             .select("*")
+             .or_(f"resolved_on.is.null,resolved_on.gte.{cutoff}")
+             .order("state_since", desc=True)
+             .limit(limit)
+             .execute())
+        return r.data or []
+    except Exception as e:
+        print(f"get open episodes failed: {e}")
         return []

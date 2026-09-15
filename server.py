@@ -485,10 +485,20 @@ class Engine:
             episode_rows = eps.build(coil_stocks)
             # The shown lists carry the bridged age instead of `coil_days`,
             # which resets on a single missed session.
+            coil_rows = eps.tag(coil_rows, episode_rows, as_of)
             rest_rows = eps.tag(rest_rows, episode_rows, as_of)
             buys = eps.tag(buys, episode_rows, as_of)
         except Exception as exc:
             print(f"episode tracking failed: {exc}")
+
+        # The Leaders at rest ordering is stamped onto the pool so it can be
+        # stored. The UI reads this table back and renders rest_rank as given
+        # rather than re-sorting by momentum, which would disagree with
+        # leaders_at_rest for any name missing a 12-1 reading.
+        if not coil_rows.empty and not rest_rows.empty:
+            order = {s: i + 1 for i, s in enumerate(rest_rows["symbol"])}
+            coil_rows = coil_rows.copy()
+            coil_rows["rest_rank"] = coil_rows["symbol"].map(order)
 
         with self._lock:
             self.raw = raw
@@ -935,10 +945,43 @@ def api_status():
 
 @app.get("/api/dashboard")
 def api_dashboard():
+    """
+    The lists, read from Supabase rather than from the in-memory panel.
+
+    The post-market cron is the only writer, so this is a SELECT of what it
+    last stored. Nothing here depends on the engine having loaded, which is
+    what lets a cold process serve the current lists immediately instead of
+    showing an empty app until it has re-fetched a year of bhavcopies.
+
+    `snapshot` is still merged in for the status fields the header reads, but
+    the rows themselves come from the database.
+    """
     snap = engine.snapshot()
-    if snap["status"] != "ready":
-        return jsonify(snap), 202
-    return jsonify(engine.dashboard())
+    try:
+        lists = db.get_lists()
+    except Exception as exc:
+        print(f"dashboard read failed: {exc}")
+        return jsonify({**snap, "error": f"Could not read saved lists: {exc}"}), 503
+
+    if not (lists.get("scan") or lists.get("coil") or lists.get("buys")):
+        return jsonify({
+            **snap,
+            "status": "empty",
+            "message": "No saved scan yet. The post-market job writes one "
+                       "after the close.",
+        }), 202
+
+    return jsonify({
+        **snap,
+        "status": "ready",
+        "as_of": lists["as_of"] or snap.get("as_of"),
+        "scan": lists["scan"],
+        "coil": lists["coil"],
+        "rest": lists["rest"],
+        "buys": lists["buys"],
+        "n_coil": len(lists["coil"]),
+        "n_buys": len(lists["buys"]),
+    })
 
 
 @app.post("/api/refresh")
@@ -1255,31 +1298,27 @@ def api_episodes():
     """
     Base episodes: what happened to each base since it appeared.
 
-    Served from the in-memory replay, which is rebuilt on every EOD load and
-    is therefore never staler than the lists themselves. Falls back to the
-    saved rows when the process has not loaded a session yet, so a cold start
-    shows history instead of an empty table.
+    Read from Supabase like every other list, and scoped to open bases plus
+    the last few sessions of resolutions. The table itself keeps every
+    episode ever tracked, but almost all of them are closed and old: serving
+    the full retention window put several hundred rows on screen, none of
+    them news. The digest is computed from the returned rows rather than
+    stored, since it is just a count of what changed on the latest date.
     """
     try:
-        with engine._lock:
-            df = engine.episodes
-            as_of = engine.as_of
-
-        if df is not None and not df.empty:
-            shown = eps.worth_showing(df, as_of)
+        rows = db.get_open_episodes()
+        if not rows:
             return jsonify({
-                "as_of": as_of,
-                "source": "live",
-                "digest": eps.digest(df, as_of),
-                "count": int(len(shown)),
-                "rows": records(shown),
+                "as_of": None, "digest": None, "count": 0, "rows": [],
+                "message": "No episodes saved yet. The post-market job writes "
+                           "them after the close.",
             })
 
-        rows = db.get_episodes()
+        df = pd.DataFrame(rows)
+        as_of = max(str(r.get("state_since") or "") for r in rows) or None
         return jsonify({
             "as_of": as_of,
-            "source": "saved",
-            "digest": None,
+            "digest": eps.digest(df, as_of) if as_of else None,
             "count": len(rows),
             "rows": rows,
         })
@@ -1617,9 +1656,16 @@ def ui_assets(path: str):
 
 def _boot():
     """
-    One load at startup so the app is usable immediately. Everything after
-    that is driven externally by POST /api/cron/post-market -- there is no
-    internal scheduler.
+    One load at startup, now only for the things that genuinely need a panel.
+
+    The lists no longer depend on this: /api/dashboard and /api/episodes read
+    Supabase, so the app is usable the moment the process is up, whether or
+    not this has finished. What still needs the in-memory panel is the sector
+    and stock drawers, the symbol list behind the header lookup, and the
+    post-market cron itself, which has to compute before it can save.
+
+    Everything after this is driven externally by POST
+    /api/cron/post-market -- there is no internal scheduler.
     """
     try:
         engine.load(DEFAULT_DAYS, date.today())

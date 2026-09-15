@@ -43,7 +43,6 @@ BREAK_DOWN = -0.07          # close this far under entry, thesis is dead
 HEAVY_VOL = 1.5             # vol_ratio at which a breakout counts as convicted
 TRACK_AFTER_TRIGGER = 10    # keep watching a fired base this long for a failure
 FAIL_CLOSES = 2             # closes back inside the base before calling it dead
-RETAIN = 20                 # sessions a resolved episode stays worth showing
 
 # `dropped` is watched, not finished. A base that leaves the gates and then
 # closes through its trigger a week later did break out, and that case is a
@@ -280,15 +279,20 @@ def tag(rows: pd.DataFrame, df: pd.DataFrame, as_of) -> pd.DataFrame:
 
     `coil_days` resets to 1 on any single missed session, so a base that has
     been building for six weeks and wobbled once reads as brand new -- that
-    was wrong on about a quarter of rows. `base_days` is the bridged streak
-    and `base_new` means the episode genuinely started today.
+    was true of 88% of the rows showing `coil_days == 1`. `episode_days` is
+    the bridged streak and `episode_new` means the episode really did start
+    today.
+
+    Named `episode_*` and not `base_*` because `base_days` is already taken:
+    it is the coil base-length indicator, it feeds the coil score, and it is
+    stored on both tables. Writing this into that column would corrupt it.
     """
     if rows is None or rows.empty:
         return rows
     out = rows.copy()
     if df is None or df.empty:
-        out["base_days"] = out.get("coil_days")
-        out["base_new"] = False
+        out["episode_days"] = out.get("coil_days")
+        out["episode_new"] = False
         return out
 
     as_of = pd.Timestamp(as_of)
@@ -296,10 +300,10 @@ def tag(rows: pd.DataFrame, df: pd.DataFrame, as_of) -> pd.DataFrame:
     live = live.sort_values("started_on").drop_duplicates("symbol", keep="last")
     by_sym = live.set_index("symbol")
 
-    out["base_days"] = out["symbol"].map(by_sym["coil_sessions"])
-    out["base_days"] = out["base_days"].fillna(out.get("coil_days"))
+    out["episode_days"] = out["symbol"].map(by_sym["coil_sessions"])
+    out["episode_days"] = out["episode_days"].fillna(out.get("coil_days"))
     started = out["symbol"].map(by_sym["started_on"])
-    out["base_new"] = pd.to_datetime(started, errors="coerce") == as_of
+    out["episode_new"] = pd.to_datetime(started, errors="coerce") == as_of
     return out
 
 
@@ -338,19 +342,3 @@ def digest(df: pd.DataFrame, as_of) -> dict:
         "new": int((pd.to_datetime(df["started_on"]) == as_of).sum()),
         "live": int(len(live)),
     }
-
-
-def worth_showing(df: pd.DataFrame, as_of, retain: int = RETAIN) -> pd.DataFrame:
-    """
-    Live episodes plus anything resolved recently enough to still matter.
-
-    Resolved rows are the point of the view — dropping them the moment they
-    close would recreate the vanishing act this is meant to fix — but they
-    stop being news, so they age out after `retain` sessions.
-    """
-    if df.empty:
-        return df
-    as_of = pd.Timestamp(as_of)
-    cutoff = as_of - pd.Timedelta(days=int(retain * 1.6))  # sessions -> calendar
-    resolved = pd.to_datetime(df["resolved_on"], errors="coerce")
-    return df[resolved.isna() | (resolved >= cutoff)].reset_index(drop=True)
