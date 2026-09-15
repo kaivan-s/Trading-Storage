@@ -138,6 +138,32 @@ def _live_candidates(stocks: pd.DataFrame) -> list[str]:
     return eod.loc[keep.fillna(False), "symbol"].astype(str).unique().tolist()
 
 
+def _rank_at_rest(coil_rows: pd.DataFrame, coil_stocks: pd.DataFrame):
+    """
+    `(pool carrying mom12_1 and rest_rank, the cut-to-20 list)`.
+
+    Ranked once and stamped back onto the pool, because both columns are
+    stored and the UI renders them as given. Doing it the other way round --
+    letting leaders_at_rest keep the reading on its own 20 rows -- leaves
+    mom12_1 null on every row of the saved pool, which is what made Leaders
+    at rest carry a rank with nothing behind it.
+
+    Ranked over the whole pool rather than the top 20, so the momentum shown
+    against a coil is present whether or not it made the cut.
+    """
+    ranked = posscan.leaders_at_rest(coil_rows, coil_stocks, top_n=None)
+    if ranked is None or ranked.empty:
+        return coil_rows, pd.DataFrame()
+
+    rest = ranked.head(posscan.REST_TOP_N).reset_index(drop=True)
+    order = {s: i + 1 for i, s in enumerate(rest["symbol"])}
+    out = coil_rows.copy()
+    if "mom12_1" in ranked.columns:
+        out["mom12_1"] = out["symbol"].map(ranked.set_index("symbol")["mom12_1"])
+    out["rest_rank"] = out["symbol"].map(order)
+    return out, rest
+
+
 def _quote_universe(coil_stocks: pd.DataFrame, raw: pd.DataFrame) -> list[str]:
     """Names worth a live quote: For Tom candidates plus yesterday's list."""
     want = _live_candidates(coil_stocks)
@@ -435,11 +461,10 @@ class Engine:
         # No cap: the seven gates already did the filtering, and ranking by
         # `coil` measured no relationship with forward returns, so cutting
         # the list at 40 by that score was discarding names arbitrarily.
-        coil_rows = coil_all
         # The shown list: same pool, ordered by 12-1 momentum and cut to 20.
         # See eval_listsize.py for why 20 rather than the full 63 or a
         # single-digit shortlist.
-        rest_rows = posscan.leaders_at_rest(coil_rows, coil_stocks)
+        coil_rows, rest_rows = _rank_at_rest(coil_all, coil_stocks)
 
         as_of = panel["date"].max()
         as_of_s = pd.Timestamp(as_of).strftime("%Y-%m-%d")
@@ -503,15 +528,6 @@ class Engine:
             buys = eps.tag(buys, episode_rows, as_of)
         except Exception as exc:
             print(f"episode tracking failed: {exc}")
-
-        # The Leaders at rest ordering is stamped onto the pool so it can be
-        # stored. The UI reads this table back and renders rest_rank as given
-        # rather than re-sorting by momentum, which would disagree with
-        # leaders_at_rest for any name missing a 12-1 reading.
-        if not coil_rows.empty and not rest_rows.empty:
-            order = {s: i + 1 for i, s in enumerate(rest_rows["symbol"])}
-            coil_rows = coil_rows.copy()
-            coil_rows["rest_rank"] = coil_rows["symbol"].map(order)
 
         with self._lock:
             self.raw = raw
@@ -764,6 +780,10 @@ class Engine:
 
                 self._set(message="Computing coil indicators…")
                 coil_stocks = stk.add_indicators(stocks)
+                # Same 12-1 pass as the EOD load. Without it leaders_at_rest
+                # has no momentum to sort on and returns the pool in coil
+                # order, which looks ranked but is not.
+                coil_stocks = posscan.add_position_features(coil_stocks)
                 coil_all = stk.scan(coil_stocks, top=10_000)
                 miss = stk.near_miss(coil_stocks)
 
@@ -789,8 +809,7 @@ class Engine:
                 # No cap: the seven gates already did the filtering, and ranking by
                 # `coil` measured no relationship with forward returns, so cutting
                 # the list at 40 by that score was discarding names arbitrarily.
-                coil_rows = coil_all
-                rest_rows = posscan.leaders_at_rest(coil_rows, coil_stocks)
+                coil_rows, rest_rows = _rank_at_rest(coil_all, coil_stocks)
 
                 # Same-session close: LTP is today's adj, so tom uses prior_trigger.
                 as_of = coil_stocks["date"].max()

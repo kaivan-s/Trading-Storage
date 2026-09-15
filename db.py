@@ -154,6 +154,25 @@ def get_client():
     return _client
 
 
+def _int(v):
+    """
+    Coerce to a Python int, for the columns declared INT.
+
+    A pandas column of counts holding a single NaN is float64, so a count of
+    17 arrives here as 17.0 and Postgres rejects the whole insert with
+    "invalid input syntax for type integer: 17.0". `_clean` cannot prevent
+    it, having no way to know which columns are integral -- so the integer
+    columns say so explicitly at the call site.
+    """
+    v = _clean(v)
+    if v is None:
+        return None
+    try:
+        return int(round(float(v)))
+    except (TypeError, ValueError):
+        return None
+
+
 def _clean(v):
     """Convert pandas/numpy types to JSON-safe Python types."""
     import numpy as np
@@ -850,7 +869,7 @@ def save_sector_scans(
             "rs": _clean(r.get("rs")),
             "rs_chg_5": _clean(r.get("rs_chg_5")),
             "deliv_quality_rel": _clean(r.get("deliv_quality_rel")),
-            "n_stocks": _clean(r.get("n_stocks")),
+            "n_stocks": _int(r.get("n_stocks")),
             "n_adv": _clean(r.get("n_adv")),
             "top_share": _clean(r.get("top_share")),
             "cmf": _clean(r.get("cmf")),
@@ -1032,10 +1051,10 @@ def save_coiled_bases(
             # particular is assigned by position.leaders_at_rest, and
             # re-sorting by mom12_1 on read would silently disagree with it
             # whenever a name has no 12-1 reading (those rank last, not out).
-            "rest_rank": _clean(r.get("rest_rank")),
-            "coil_days": _clean(r.get("coil_days")),
+            "rest_rank": _int(r.get("rest_rank")),
+            "coil_days": _int(r.get("coil_days")),
             "recommended": bool(r.get("recommended", False)),
-            "episode_days": _clean(r.get("episode_days")),
+            "episode_days": _int(r.get("episode_days")),
             "episode_new": bool(r.get("episode_new", False)),
         }
         records.append(rec)
@@ -1139,7 +1158,7 @@ def save_setups(
             "recommended": bool(r.get("recommended", False)),
             # Bridged episode age, so the UI does not need the panel to tell
             # a genuinely new setup from one that wobbled for a session.
-            "episode_days": _clean(r.get("episode_days")),
+            "episode_days": _int(r.get("episode_days")),
             "episode_new": bool(r.get("episode_new", False)),
         }
         records.append(rec)
@@ -1238,13 +1257,13 @@ def save_episodes(eps: pd.DataFrame) -> int:
             "last_seen_on": _date_or_none(r.get("last_seen_on")),
             "last_close": _clean(r.get("last_close")),
             "peak_close": _clean(r.get("peak_close")),
-            "coil_sessions": _clean(r.get("coil_sessions")),
-            "age": _clean(r.get("age")),
-            "gap": _clean(r.get("gap")),
-            "below": _clean(r.get("below")),
+            "coil_sessions": _int(r.get("coil_sessions")),
+            "age": _int(r.get("age")),
+            "gap": _int(r.get("gap")),
+            "below": _int(r.get("below")),
             "mom12_1": _clean(r.get("mom12_1")),
             "triggered_on": _date_or_none(r.get("triggered_on")),
-            "trigger_age": _clean(r.get("trigger_age")),
+            "trigger_age": _int(r.get("trigger_age")),
             "trigger_vol": (None if r.get("trigger_vol") is None
                             else bool(r.get("trigger_vol"))),
             "resolved_on": _date_or_none(r.get("resolved_on")),
@@ -1300,6 +1319,13 @@ def get_lists() -> dict:
     They are written together so those normally agree, but if a sector save
     fails the coil list should still render rather than the whole page
     blanking out on a date that one table happens to be missing.
+
+    Which means a list can legitimately lag the session being shown: a night
+    with no qualifying setups saves no setup rows, so the newest ones are
+    from an earlier session. Their date is returned alongside them so that
+    reads as "none tonight" rather than as tonight's list -- acting on a
+    four-day-old setup believing it is current is the one failure here that
+    costs money.
     """
     scan_date = _latest_date("sector_scans")
     setup_date = _latest_date("setups")
@@ -1322,6 +1348,8 @@ def get_lists() -> dict:
             key=lambda r: (r.get("mom12_1") is None, -(r.get("mom12_1") or 0.0)),
         )[:REST_TOP_N]
 
+    session = max([d for d in (coil_date, scan_date, setup_date) if d],
+                  default=None)
     return {
         "as_of": coil_date or scan_date or setup_date,
         "scan_date": scan_date,
@@ -1329,6 +1357,13 @@ def get_lists() -> dict:
         "buys": setups,
         "coil": coils,
         "rest": ranked,
+        # Per-list dates, so a list that lags the session can say so.
+        "dates": {"scan": scan_date, "setups": setup_date, "coil": coil_date},
+        "session": session,
+        "stale": [name for name, d in (("scan", scan_date),
+                                       ("setups", setup_date),
+                                       ("coil", coil_date))
+                  if d and session and d < session],
     }
 
 
