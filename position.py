@@ -66,6 +66,15 @@ import pandas as pd
 FORMATION = 250   # sessions in the trailing window
 SKIP = 20         # most recent sessions excluded (the reversal month)
 
+# Why 20 and not 10 or 5 -- see eval_listsize.py. Ranking the coil pool by
+# 12-1 momentum and keeping 20 measured +0.78% at a 7-session hold (NW t=3.37)
+# and +1.30% at 10 (t=4.21, 84% of days positive), roughly double the
+# unfiltered pool's +0.47%/+0.83%, on a third of the names. Cutting further
+# breaks it: top 10 runs +1.98% then +0.12% across sample halves and top 5
+# flips sign. 20 is where the list is short enough to act on and still long
+# enough for the daily median to mean something.
+REST_TOP_N = 20
+
 
 @dataclass(frozen=True)
 class PositionParams:
@@ -171,3 +180,44 @@ def scan(stocks: pd.DataFrame, as_of=None, top_n: int | None = 40,
     if top_n is not None:
         out = out.head(top_n)
     return out[[c for c in cols if c in out.columns]].reset_index(drop=True)
+
+
+def leaders_at_rest(coil_rows: pd.DataFrame, stocks: pd.DataFrame,
+                    as_of=None, top_n: int | None = REST_TOP_N) -> pd.DataFrame:
+    """
+    The coil pool ranked by 12-1 momentum, strongest year first.
+
+    A name qualifies on the coil gates -- quiet, tight, near its highs -- and
+    is then ORDERED by how strong its last year was. So this is a proven
+    leader taking a rest, which is why it reads better than either parent
+    list: the coil gates time the entry and momentum picks which bases are
+    worth waiting on.
+
+    This is the one list in the app where sort order carries information. The
+    coil score does not rank outcomes at all and the Expected Movers score
+    ranked them backwards, but 12-1 momentum orders them monotonically (top 5%
+    +0.73% at 7 sessions down to -0.85% for the bottom half).
+
+    `coil_rows` = stocks.scan() output. `stocks` needs `mom12_1`, so pass an
+    add_position_features() frame. Names without a 12-1 reading -- anything
+    under 270 sessions of history -- rank last rather than being dropped, so a
+    thin cache degrades to the unranked pool instead of an empty list.
+    """
+    if coil_rows is None or coil_rows.empty:
+        return coil_rows if coil_rows is not None else pd.DataFrame()
+
+    out = coil_rows.copy()
+    if stocks is not None and not stocks.empty and "mom12_1" in stocks.columns:
+        as_of = stocks["date"].max() if as_of is None else pd.Timestamp(as_of)
+        day = stocks[stocks["date"] == as_of]
+        mom = day.set_index("symbol")["mom12_1"]
+        out["mom12_1"] = out["symbol"].map(mom)
+    elif "mom12_1" not in out.columns:
+        out["mom12_1"] = np.nan
+
+    # na_position="last" is the degradation path: no reading means unranked,
+    # not excluded.
+    out = out.sort_values("mom12_1", ascending=False, na_position="last")
+    if top_n is not None:
+        out = out.head(top_n)
+    return out.reset_index(drop=True)

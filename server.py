@@ -286,6 +286,7 @@ class Engine:
         self.coil_stocks = None
         self.scan_rows = pd.DataFrame()
         self.coil_rows = pd.DataFrame()
+        self.rest_rows = pd.DataFrame()
         self.near_miss = pd.DataFrame()
         self.buys = pd.DataFrame()
         self.breakouts = pd.DataFrame()
@@ -403,6 +404,9 @@ class Engine:
 
         self._set(message="Computing coil indicators…")
         coil_stocks = stk.add_indicators(stocks)
+        # 12-1 momentum lands here once so both the ranked coil list and the
+        # position scan read it off the same frame.
+        coil_stocks = posscan.add_position_features(coil_stocks)
         coil_all = stk.scan(coil_stocks, top=10_000)
         miss = stk.near_miss(coil_stocks)
 
@@ -434,6 +438,10 @@ class Engine:
         # `coil` measured no relationship with forward returns, so cutting
         # the list at 40 by that score was discarding names arbitrarily.
         coil_rows = coil_all
+        # The shown list: same pool, ordered by 12-1 momentum and cut to 20.
+        # See eval_listsize.py for why 20 rather than the full 63 or a
+        # single-digit shortlist.
+        rest_rows = posscan.leaders_at_rest(coil_rows, coil_stocks)
 
         as_of = panel["date"].max()
         as_of_s = pd.Timestamp(as_of).strftime("%Y-%m-%d")
@@ -480,6 +488,7 @@ class Engine:
             self.live_sectors = pd.DataFrame()
             self.sectors_live = False
             self.coil_rows = coil_rows
+            self.rest_rows = rest_rows
             self.near_miss = miss
             self.buys = buys
             self.breakouts = broke
@@ -541,6 +550,7 @@ class Engine:
                 **snap,
                 "scan": records(self.scan_rows[scan_cols] if scan_cols else self.scan_rows),
                 "coil": records(self.coil_rows),
+                "rest": records(self.rest_rows),
                 "near_miss": records(self.near_miss),
                 "buys": records(self.buys),
                 "tom": records(self.tom),
@@ -743,6 +753,7 @@ class Engine:
                 # `coil` measured no relationship with forward returns, so cutting
                 # the list at 40 by that score was discarding names arbitrarily.
                 coil_rows = coil_all
+                rest_rows = posscan.leaders_at_rest(coil_rows, coil_stocks)
 
                 # Same-session close: LTP is today's adj, so tom uses prior_trigger.
                 as_of = coil_stocks["date"].max()
@@ -764,6 +775,7 @@ class Engine:
                 stocks = None
                 panel = None
                 coil_rows = None
+                rest_rows = None
                 miss = None
                 buys = None
                 as_of = coil_stocks["date"].max()
@@ -809,6 +821,7 @@ class Engine:
                     self.coil_stocks = coil_stocks
                     self.scan_rows = scan_rows
                     self.coil_rows = coil_rows
+                    self.rest_rows = rest_rows
                     self.near_miss = miss
                     self.buys = buys
                     self.as_of = as_of_s
