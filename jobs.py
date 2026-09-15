@@ -14,6 +14,7 @@ from datetime import date, time as dtime
 import pandas as pd
 
 import db
+import position as posscan
 
 # IST weekday slots. Latest due slot runs once if the process starts late.
 SCAN_SLOTS = [(12, 0), (14, 30), (15, 35)]
@@ -116,14 +117,32 @@ def _try_sector_lookout(engine) -> bool:
         return False
     
     print("[jobs] saving sector lookouts")
+    ok = False
     try:
         n = db.save_sector_scans(as_of, scan_rows, panel)
         print(f"[jobs] saved {n} sector scans")
         state["sector_lookout_at"] = db.now_ist().isoformat(timespec="seconds")
-        return n > 0
+        ok = n > 0
     except Exception as e:
         print(f"[jobs] sector lookout error: {e}")
-        return False
+
+    # Position Trades rides the same post-market slot: it is an EOD scan on a
+    # 7-10 session horizon, so it wants closing prices, not the 15:35 quotes.
+    try:
+        with engine._lock:
+            coil_stocks = engine.coil_stocks
+        if coil_stocks is not None and not getattr(coil_stocks, "empty", True):
+            rows = posscan.scan(
+                posscan.add_position_features(coil_stocks), as_of=as_of
+            )
+            if not rows.empty:
+                print(f"[jobs] saved {db.save_position_trades(as_of, rows)} "
+                      "position trades")
+            else:
+                print("[jobs] no position trades — needs 270 sessions of history")
+    except Exception as e:
+        print(f"[jobs] position trades error: {e}")
+    return ok
 
 
 def _loop(engine, days: int) -> None:

@@ -61,9 +61,32 @@ CREATE TABLE daily_cache (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- Position Trades: 12-1 momentum leaders above their 50-EMA, held 7-10
+-- sessions. Replaces the next-day Expected Movers list, so there is no
+-- outcomes table paired with it -- a 7-to-10 session horizon cannot be
+-- verified by the next session's high the way tom_outcomes does.
+CREATE TABLE position_trades (
+    id BIGSERIAL PRIMARY KEY,
+    scan_date DATE NOT NULL,
+    symbol TEXT NOT NULL,
+    sector TEXT,
+    adj NUMERIC,
+    mom12_1 NUMERIC,
+    mom20 NUMERIC,
+    ext_ema50 NUMERIC,
+    rsi NUMERIC,
+    atr_pct NUMERIC,
+    med_turn60 NUMERIC,
+    mom_rank NUMERIC,
+    why TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(scan_date, symbol)
+);
+
 CREATE INDEX idx_tom_predictions_date ON tom_predictions(scan_date);
 CREATE INDEX idx_tom_outcomes_date ON tom_outcomes(scan_date);
 CREATE INDEX idx_daily_cache_date ON daily_cache(cache_date);
+CREATE INDEX idx_position_trades_date ON position_trades(scan_date);
 """
 
 from __future__ import annotations
@@ -993,6 +1016,103 @@ def save_coiled_bases(
     except Exception as e:
         print(f"save coiled bases failed: {e}")
         return 0
+
+
+# ---------------------------------------------------------------------------
+# Position Trades (12-1 momentum leaders above the 50-EMA)
+# ---------------------------------------------------------------------------
+
+def save_position_trades(
+    scan_date: date | str,
+    rows: pd.DataFrame,
+) -> int:
+    """
+    Save Position Trade candidates to Supabase.
+
+    `rows` = output of position.scan() — top-decile 12-1 momentum names still
+    above their 50-EMA, best first. Called after market close on closing
+    prices; the horizon is 7-10 sessions, so unlike tom_predictions there is
+    no next-session verification pass.
+
+    Returns number of rows saved.
+    """
+    if rows is None or rows.empty:
+        return 0
+
+    scan_date = str(scan_date)[:10]
+    client = get_client()
+
+    records = []
+    for _, r in rows.iterrows():
+        records.append({
+            "scan_date": scan_date,
+            "symbol": r.get("symbol"),
+            "sector": r.get("sector"),
+            "adj": _clean(r.get("adj")),
+            "mom12_1": _clean(r.get("mom12_1")),
+            "mom20": _clean(r.get("mom20")),
+            "ext_ema50": _clean(r.get("ext_ema50")),
+            "rsi": _clean(r.get("rsi")),
+            "atr_pct": _clean(r.get("atr_pct")),
+            "med_turn60": _clean(r.get("med_turn60")),
+            "mom_rank": _clean(r.get("mom_rank")),
+            "why": r.get("why"),
+        })
+
+    if not records:
+        return 0
+
+    # Full replacement for the date (idempotent)
+    try:
+        client.table("position_trades").delete().eq("scan_date", scan_date).execute()
+    except Exception as e:
+        print(f"delete old position trades failed: {e}")
+
+    try:
+        result = client.table("position_trades").insert(records).execute()
+        return len(result.data) if result.data else 0
+    except Exception as e:
+        print(f"save position trades failed: {e}")
+        return 0
+
+
+def get_position_trades_dates(limit: int = 60) -> list[str]:
+    """Get distinct Position Trade scan dates, newest first."""
+    client = get_client()
+    result = (client.table("position_trades")
+              .select("scan_date")
+              .order("scan_date", desc=True)
+              .limit(500)
+              .execute())
+    seen, out = set(), []
+    for row in (result.data or []):
+        d = str(row.get("scan_date") or "")[:10]
+        if d and d not in seen:
+            seen.add(d)
+            out.append(d)
+            if len(out) >= limit:
+                break
+    return out
+
+
+def get_position_trades(scan_date: date | str) -> list[dict]:
+    """Get Position Trades for a specific date, strongest momentum first."""
+    scan_date = str(scan_date)[:10]
+    client = get_client()
+    result = (client.table("position_trades")
+              .select("*")
+              .eq("scan_date", scan_date)
+              .order("mom12_1", desc=True)
+              .execute())
+    return result.data or []
+
+
+def latest_position_trades() -> tuple[str | None, list[dict]]:
+    """Most recent Position Trade scan: (date, rows). ('', []) if none yet."""
+    dates = get_position_trades_dates(limit=1)
+    if not dates:
+        return None, []
+    return dates[0], get_position_trades(dates[0])
 
 
 def get_coiled_bases_dates(limit: int = 60) -> list[str]:

@@ -302,7 +302,7 @@ def _clip01(s: pd.Series, lo: float, hi: float) -> pd.Series:
 
 def for_tomorrow_momentum(coil_stocks: pd.DataFrame, live: pd.DataFrame,
                           scan_rows: pd.DataFrame | None = None,
-                          top_n: int = 100) -> pd.DataFrame:
+                          top_n: int | None = None) -> pd.DataFrame:
     """
     Energy-scored variant of `for_tomorrow`. Same inputs, but ranks uptrend
     names by expected intraday range rather than by coil quietness. Returns
@@ -310,6 +310,11 @@ def for_tomorrow_momentum(coil_stocks: pd.DataFrame, live: pd.DataFrame,
 
     `score` is a validated range forecast and not a return forecast — see
     the block comment above before treating the order as a preference.
+
+    `top_n=None` keeps every name that cleared the gates. A cut was measured
+    to cost coverage without buying return: the top 40's median excess sat
+    below its own gated pool's at 1, 5 and 20 sessions, and capping there
+    caught only 3.3% of the next session's winners against 17% uncapped.
     """
     empty_cols = [
         "symbol", "sector", "ltp", "trigger", "to_trigger", "vol_expand",
@@ -410,8 +415,10 @@ def for_tomorrow_momentum(coil_stocks: pd.DataFrame, live: pd.DataFrame,
     m["why"] = m.apply(why, axis=1)
 
     cols = [c for c in empty_cols if c in m.columns]
-    return (m.sort_values("score", ascending=False)[cols]
-            .head(top_n).reset_index(drop=True))
+    ranked = m.sort_values("score", ascending=False)[cols]
+    if top_n is not None:
+        ranked = ranked.head(top_n)
+    return ranked.reset_index(drop=True)
 
 
 def _gate_mask(day: pd.DataFrame) -> pd.Series:

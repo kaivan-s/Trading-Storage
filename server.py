@@ -33,13 +33,18 @@ import flagslog
 import panel as pnl
 import scan as sc
 import stocks as stk
+import position as posscan
 import tom as tomscan
 
 BACKEND = Path(__file__).resolve().parent
 REPO = BACKEND.parent
 UI_DIST = REPO / "ui" / "dist"
 
-DEFAULT_DAYS = 220
+# 290, not 220: Position Trades needs a 12-1 momentum reading, which is a
+# 250-session window ending 20 sessions ago = 270 sessions of a symbol's own
+# history before it exists at all. 290 leaves a small margin. Everything else
+# in the pipeline needs at most 210, so this is the binding constraint.
+DEFAULT_DAYS = 290
 DEFAULT_LEVEL = "basic_industry"
 
 # Two different questions, so two named sets rather than inline lists that
@@ -285,6 +290,7 @@ class Engine:
         self.buys = pd.DataFrame()
         self.breakouts = pd.DataFrame()
         self.tom = pd.DataFrame()
+        self.position_rows = pd.DataFrame()
         self.live_at = None
         self.live_n = 0
         self.live_status = None
@@ -324,6 +330,7 @@ class Engine:
                 "n_coil": int(len(self.coil_rows)),
                 "n_buys": int(len(self.buys)),
                 "n_tom": int(len(self.tom)),
+                "n_position": int(len(self.position_rows)),
                 "live_at": self.live_at,
                 "live_n": int(self.live_n),
                 "live_status": self.live_status,
@@ -748,7 +755,7 @@ class Engine:
 
                 self._set(message="Scoring For Tom…")
                 tom_rows = tomscan.for_tomorrow_momentum(
-                    coil_stocks, live, scan_rows=scan_rows, top_n=40
+                    coil_stocks, live, scan_rows=scan_rows
                 )
             else:
                 self._set(message="[2/2] Scoring For Tom…")
@@ -762,8 +769,20 @@ class Engine:
                 as_of = coil_stocks["date"].max()
                 live = quotes
                 tom_rows = tomscan.for_tomorrow_momentum(
-                    coil_stocks, quotes, scan_rows=scan_rows, top_n=40
+                    coil_stocks, quotes, scan_rows=scan_rows
                 )
+
+            # Position Trades: EOD only. The 7-10 session horizon means an
+            # intraday quote adds nothing, so this always runs off closes and
+            # is unaffected by which live source the tom scan used.
+            position_rows = pd.DataFrame()
+            try:
+                if coil_stocks is not None and not coil_stocks.empty:
+                    position_rows = posscan.scan(
+                        posscan.add_position_features(coil_stocks), as_of=as_of
+                    )
+            except Exception as e:
+                print(f"position scan failed: {e}")
 
             # Save today's picks, and score yesterday's against today's high
             saved = 0
@@ -800,6 +819,8 @@ class Engine:
                     if delivery is not None:
                         self.delivery = delivery
                 self.tom = tom_rows
+                if not position_rows.empty:
+                    self.position_rows = position_rows
                 self.live_n = int(len(live) if live is not None else 0)
                 self.live_at = datetime.now().isoformat(timespec="seconds")
                 self.live_status = "ready"
@@ -1182,6 +1203,34 @@ def api_coiled_bases_save():
         return jsonify({"error": str(e)}), 500
 
 
+@app.get("/api/position-trades")
+def api_position_trades_get():
+    """
+    Position Trades for a date. Query params: scan_date (default: latest).
+
+    Reads from the DB rather than the live engine so the list a user sees is
+    the one that was actually recorded at scan time.
+    """
+    try:
+        scan_date = request.args.get("scan_date")
+        if scan_date:
+            rows = db.get_position_trades(scan_date)
+        else:
+            scan_date, rows = db.latest_position_trades()
+        return jsonify({"scan_date": scan_date, "rows": rows or []})
+    except Exception as e:
+        return jsonify({"error": str(e), "rows": []}), 500
+
+
+@app.get("/api/position-trades/dates")
+def api_position_trades_dates():
+    """Dates with saved Position Trades."""
+    try:
+        return jsonify({"dates": db.get_position_trades_dates()})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.get("/api/coiled-bases/dates")
 def api_coiled_bases_dates():
     """Get list of dates with saved coiled bases."""
@@ -1317,6 +1366,47 @@ def api_cron_coiled_bases():
         })
     except Exception as e:
         print(f"[cron] coiled bases error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.post("/api/cron/position-trades")
+def api_cron_position_trades():
+    """
+    Cron trigger for Position Trades.
+    POST /api/cron/position-trades
+
+    Recomputes from the loaded panel rather than reusing engine.position_rows,
+    so a cron hit is correct even if no scan has run since the last refresh.
+    """
+    snap = engine.snapshot()
+    if snap["status"] != "ready":
+        return jsonify({"status": "not_ready",
+                        "message": snap.get("message", "Engine loading")}), 202
+
+    with engine._lock:
+        coil_stocks = engine.coil_stocks
+        as_of = engine.as_of
+
+    if coil_stocks is None or getattr(coil_stocks, "empty", True):
+        return jsonify({"error": "No stock data available"}), 400
+
+    try:
+        rows = posscan.scan(posscan.add_position_features(coil_stocks), as_of=as_of)
+        if rows.empty:
+            return jsonify({
+                "saved": 0,
+                "scan_date": str(as_of),
+                "message": "No names qualified — needs 270 sessions of history",
+            })
+        n = db.save_position_trades(as_of, rows)
+        print(f"[cron] saved {n} position trades for {as_of}")
+        return jsonify({
+            "saved": n,
+            "scan_date": str(as_of),
+            "message": f"Saved {n} position trades for {as_of}",
+        })
+    except Exception as e:
+        print(f"[cron] position trades error: {e}")
         return jsonify({"error": str(e)}), 500
 
 

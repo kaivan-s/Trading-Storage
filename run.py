@@ -210,7 +210,7 @@ def cmd_tom(args):
     import tom as tomscan
     live = fetch.live_snapshot()
     print(f"  {len(live):,} live prints")
-    rows = tomscan.for_tomorrow_momentum(stocks, live, top_n=40)
+    rows = tomscan.for_tomorrow_momentum(stocks, live)
     print(f"\n=== for tomorrow  ({len(rows)} names) ===\n")
     if rows.empty:
         print("Nothing near or through a trigger on this snapshot.")
