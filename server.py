@@ -28,6 +28,7 @@ import analyze
 import auth
 import breakouts as bo
 import db
+import episodes as eps
 import fetch
 import flagslog
 import panel as pnl
@@ -287,6 +288,7 @@ class Engine:
         self.scan_rows = pd.DataFrame()
         self.coil_rows = pd.DataFrame()
         self.rest_rows = pd.DataFrame()
+        self.episodes = pd.DataFrame()
         self.near_miss = pd.DataFrame()
         self.buys = pd.DataFrame()
         self.breakouts = pd.DataFrame()
@@ -473,6 +475,21 @@ class Engine:
         except Exception as exc:
             print(f"breakout scan failed: {exc}")
 
+        # Episode state is recomputed from the panel rather than stepped
+        # forward from yesterday's row. A full replay costs ~15s once a day
+        # and cannot drift: age, gap and the bridged streak are derived, so a
+        # missed run or a restarted process repairs itself on the next load.
+        self._set(message="Tracking base episodes…")
+        episode_rows = pd.DataFrame()
+        try:
+            episode_rows = eps.build(coil_stocks)
+            # The shown lists carry the bridged age instead of `coil_days`,
+            # which resets on a single missed session.
+            rest_rows = eps.tag(rest_rows, episode_rows, as_of)
+            buys = eps.tag(buys, episode_rows, as_of)
+        except Exception as exc:
+            print(f"episode tracking failed: {exc}")
+
         with self._lock:
             self.raw = raw
             self.smap = smap
@@ -485,6 +502,7 @@ class Engine:
             self.sectors_live = False
             self.coil_rows = coil_rows
             self.rest_rows = rest_rows
+            self.episodes = episode_rows
             self.near_miss = miss
             self.buys = buys
             self.breakouts = broke
@@ -1232,6 +1250,43 @@ def api_coiled_bases_get():
         return jsonify({"error": str(e)}), 500
 
 
+@app.get("/api/episodes")
+def api_episodes():
+    """
+    Base episodes: what happened to each base since it appeared.
+
+    Served from the in-memory replay, which is rebuilt on every EOD load and
+    is therefore never staler than the lists themselves. Falls back to the
+    saved rows when the process has not loaded a session yet, so a cold start
+    shows history instead of an empty table.
+    """
+    try:
+        with engine._lock:
+            df = engine.episodes
+            as_of = engine.as_of
+
+        if df is not None and not df.empty:
+            shown = eps.worth_showing(df, as_of)
+            return jsonify({
+                "as_of": as_of,
+                "source": "live",
+                "digest": eps.digest(df, as_of),
+                "count": int(len(shown)),
+                "rows": records(shown),
+            })
+
+        rows = db.get_episodes()
+        return jsonify({
+            "as_of": as_of,
+            "source": "saved",
+            "digest": None,
+            "count": len(rows),
+            "rows": rows,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.get("/api/setups/dates")
 def api_setups_dates():
     """Get list of dates with saved setups."""
@@ -1284,6 +1339,7 @@ def _save_post_market() -> dict:
         panel = engine.panel
         buys = engine.buys
         coil_rows = engine.coil_rows
+        episode_rows = engine.episodes
         verdict = engine.verdict_by_sector
 
     out: dict = {"scan_date": str(as_of)}
@@ -1307,6 +1363,13 @@ def _save_post_market() -> dict:
         attempt("coiled_bases", lambda: db.save_coiled_bases(as_of, coil_rows))
     else:
         out["coiled_bases"] = 0
+
+    # Upsert, not replace: episodes are spans that outlive the panel window,
+    # so the rows that have aged out of the replay must survive untouched.
+    if episode_rows is not None and not episode_rows.empty:
+        attempt("episodes", lambda: db.save_episodes(episode_rows))
+    else:
+        out["episodes"] = 0
 
     print(f"[cron] post-market saved for {as_of}: {out}")
     return out

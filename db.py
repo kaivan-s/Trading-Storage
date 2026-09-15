@@ -66,6 +66,40 @@ CREATE TABLE daily_cache (
 -- rows. Run this once on an existing install:
 -- ALTER TABLE coiled_bases ADD COLUMN IF NOT EXISTS mom12_1 NUMERIC;
 
+-- One row per basing episode: a base keeps its identity from the session it
+-- first qualifies to the session it resolves, which is what lets the app say
+-- "this broke out" instead of silently dropping the row. Keyed on the start
+-- date rather than the symbol alone, because a stock bases more than once.
+CREATE TABLE base_episodes (
+    id BIGSERIAL PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    sector TEXT,
+    started_on DATE NOT NULL,
+    entry_price NUMERIC,
+    entry_trigger NUMERIC,
+    state TEXT NOT NULL,
+    state_since DATE,
+    reason TEXT,
+    lost_gates TEXT,
+    last_seen_on DATE,
+    last_close NUMERIC,
+    peak_close NUMERIC,
+    coil_sessions INT,
+    age INT,
+    gap INT,
+    below INT,
+    mom12_1 NUMERIC,
+    triggered_on DATE,
+    trigger_age INT,
+    trigger_vol BOOLEAN,
+    resolved_on DATE,
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(symbol, started_on)
+);
+
+CREATE INDEX idx_base_episodes_state ON base_episodes(state, resolved_on);
+CREATE INDEX idx_base_episodes_since ON base_episodes(state_since);
+
 CREATE INDEX idx_tom_predictions_date ON tom_predictions(scan_date);
 CREATE INDEX idx_tom_outcomes_date ON tom_outcomes(scan_date);
 CREATE INDEX idx_daily_cache_date ON daily_cache(cache_date);
@@ -1132,3 +1166,97 @@ def get_setups(scan_date: date | str) -> list[dict]:
               .order("coil", desc=True)
               .execute())
     return result.data or []
+
+
+# ---------------------------------------------------------------- episodes
+
+def _date_or_none(v):
+    """Supabase wants an ISO date string or a real NULL, never 'NaT'."""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return None
+    try:
+        t = pd.Timestamp(v)
+    except (TypeError, ValueError):
+        return None
+    return None if pd.isna(t) else str(t.date())
+
+
+def save_episodes(eps: pd.DataFrame) -> int:
+    """
+    Upsert base episodes on (symbol, started_on).
+
+    Upsert rather than replace-by-date: an episode is a span, not a snapshot,
+    and the nightly recompute only sees the sessions still inside the panel
+    window. Deleting first would drop every episode that has aged out of the
+    window but is still worth showing.
+
+    Returns number of rows written.
+    """
+    if eps is None or eps.empty:
+        return 0
+
+    client = get_client()
+    records = []
+    for _, r in eps.iterrows():
+        started = _date_or_none(r.get("started_on"))
+        if not r.get("symbol") or not started:
+            continue
+        records.append({
+            "symbol": r.get("symbol"),
+            "sector": r.get("sector"),
+            "started_on": started,
+            "entry_price": _clean(r.get("entry_price")),
+            "entry_trigger": _clean(r.get("entry_trigger")),
+            "state": r.get("state"),
+            "state_since": _date_or_none(r.get("state_since")),
+            "reason": r.get("reason"),
+            "lost_gates": r.get("lost_gates"),
+            "last_seen_on": _date_or_none(r.get("last_seen_on")),
+            "last_close": _clean(r.get("last_close")),
+            "peak_close": _clean(r.get("peak_close")),
+            "coil_sessions": _clean(r.get("coil_sessions")),
+            "age": _clean(r.get("age")),
+            "gap": _clean(r.get("gap")),
+            "below": _clean(r.get("below")),
+            "mom12_1": _clean(r.get("mom12_1")),
+            "triggered_on": _date_or_none(r.get("triggered_on")),
+            "trigger_age": _clean(r.get("trigger_age")),
+            "trigger_vol": (None if r.get("trigger_vol") is None
+                            else bool(r.get("trigger_vol"))),
+            "resolved_on": _date_or_none(r.get("resolved_on")),
+        })
+
+    if not records:
+        return 0
+
+    saved = 0
+    for i in range(0, len(records), 500):
+        chunk = records[i:i + 500]
+        try:
+            result = (client.table("base_episodes")
+                      .upsert(chunk, on_conflict="symbol,started_on")
+                      .execute())
+            saved += len(result.data) if result.data else 0
+        except Exception as e:
+            print(f"save episodes failed: {e}")
+    return saved
+
+
+def get_episodes(limit: int = 600) -> list[dict]:
+    """
+    Episodes worth showing: everything still live, newest activity first.
+
+    Resolved rows are included so the view can answer "what happened to the
+    name I saw last week"; the caller trims them by age.
+    """
+    client = get_client()
+    try:
+        result = (client.table("base_episodes")
+                  .select("*")
+                  .order("state_since", desc=True)
+                  .limit(limit)
+                  .execute())
+        return result.data or []
+    except Exception as e:
+        print(f"get episodes failed: {e}")
+        return []

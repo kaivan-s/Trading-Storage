@@ -327,6 +327,21 @@ def _day_frame(stocks: pd.DataFrame, p: CoilParams, as_of) -> pd.DataFrame:
     return d
 
 
+def gate_flags(stocks: pd.DataFrame, p: CoilParams | None = None,
+               as_of=None) -> pd.DataFrame:
+    """
+    The `as_of` cross-section with the seven gates evaluated, passing or not.
+
+    `scan` keeps only `n_fail == 0` and ranks it. Episode tracking needs the
+    rows that fail too, so a base leaving the list can name the condition it
+    lost instead of just vanishing. Same `_day_frame`, so membership here is
+    the same membership the published list is drawn from.
+    """
+    p = p or CoilParams()
+    as_of = pd.Timestamp(as_of) if as_of is not None else stocks["date"].max()
+    return _day_frame(stocks, p, as_of)
+
+
 def scan(stocks: pd.DataFrame, p: CoilParams | None = None,
          as_of=None, top: int = 40) -> pd.DataFrame:
     """
