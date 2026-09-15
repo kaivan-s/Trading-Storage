@@ -45,11 +45,29 @@ def _get_subscription_from_db(email: str) -> dict | None:
         result = client.table("subscriptions").select("*").eq("email", email.lower()).execute()
         if result.data:
             row = result.data[0]
+            expires_at = row.get("expires_at")
+            cancelled_at = row.get("cancelled_at")
+            
+            # Check if subscription is still valid based on expiry date
+            is_premium = row.get("is_premium", False)
+            if expires_at:
+                try:
+                    # Parse expiry date and check if still valid
+                    exp_str = str(expires_at)[:10]  # Get YYYY-MM-DD
+                    from datetime import date
+                    exp_date = date.fromisoformat(exp_str)
+                    today = date.today()
+                    # Premium if not expired yet
+                    is_premium = exp_date >= today
+                except (ValueError, TypeError):
+                    pass
+            
             return {
-                "is_premium": row.get("is_premium", False),
-                "plan": row.get("plan"),
-                "expires_at": row.get("expires_at"),
+                "is_premium": is_premium,
+                "plan": row.get("plan") if is_premium else None,
+                "expires_at": expires_at if is_premium else None,
                 "subscription_id": row.get("subscription_id"),
+                "cancelled": bool(cancelled_at),
             }
         return None
     except Exception as e:
@@ -58,19 +76,23 @@ def _get_subscription_from_db(email: str) -> dict | None:
 
 
 def _save_subscription_to_db(email: str, is_premium: bool, plan: str | None, 
-                              subscription_id: str | None, expires_at: str | None):
+                              subscription_id: str | None, expires_at: str | None,
+                              cancelled_at: str | None = None):
     """Save subscription status to Supabase."""
     try:
         client = _get_supabase()
-        client.table("subscriptions").upsert({
+        data = {
             "email": email.lower(),
             "is_premium": is_premium,
             "plan": plan,
             "subscription_id": subscription_id,
             "expires_at": expires_at,
             "updated_at": datetime.now().isoformat(),
-        }, on_conflict="email").execute()
-        print(f"[subscription] Saved: {email} is_premium={is_premium} plan={plan}")
+        }
+        if cancelled_at is not None:
+            data["cancelled_at"] = cancelled_at
+        client.table("subscriptions").upsert(data, on_conflict="email").execute()
+        print(f"[subscription] Saved: {email} is_premium={is_premium} plan={plan} cancelled={cancelled_at is not None}")
     except Exception as e:
         print(f"[subscription] DB write error: {e}")
 
@@ -240,26 +262,33 @@ def cancel_subscription(customer_email: str, subscription_id: str = None) -> dic
     """
     Cancel a user's subscription.
     
-    1. Cancel in Dodo Payments
-    2. Update Supabase to mark as cancelled
+    User retains premium access until their current billing period ends.
+    
+    1. Cancel in Dodo Payments (stops future billing)
+    2. Update Supabase to mark as cancelled but keep expires_at
     3. Clear cache
     
     Returns:
-        {"success": bool, "error": str | None}
+        {"success": bool, "error": str | None, "expires_at": str | None}
     """
     if not customer_email:
-        return {"success": False, "error": "Email required"}
+        return {"success": False, "error": "Email required", "expires_at": None}
     
-    # Get subscription_id from DB if not provided
+    # Get current subscription info from DB
+    db_result = _get_subscription_from_db(customer_email)
+    if not db_result:
+        return {"success": False, "error": "No active subscription found", "expires_at": None}
+    
     if not subscription_id:
-        db_result = _get_subscription_from_db(customer_email)
-        if db_result:
-            subscription_id = db_result.get("subscription_id")
+        subscription_id = db_result.get("subscription_id")
+    
+    expires_at = db_result.get("expires_at")
+    plan = db_result.get("plan")
     
     if not subscription_id:
-        return {"success": False, "error": "No active subscription found"}
+        return {"success": False, "error": "No active subscription found", "expires_at": None}
     
-    # 1. Cancel in Dodo Payments
+    # 1. Cancel in Dodo Payments (stops future billing)
     if DODO_API_KEY:
         try:
             client = _get_dodo_client()
@@ -273,24 +302,26 @@ def cancel_subscription(customer_email: str, subscription_id: str = None) -> dic
             print(f"[subscription] Dodo cancel error: {e}")
             # Continue anyway - we'll update DB
     
-    # 2. Update Supabase
+    # 2. Update Supabase - keep is_premium=True and expires_at, just mark cancelled_at
+    # User keeps access until expires_at
     try:
         _save_subscription_to_db(
             email=customer_email,
-            is_premium=False,
-            plan=None,
+            is_premium=True,  # Keep premium until expires_at
+            plan=plan,
             subscription_id=subscription_id,
-            expires_at=None,
+            expires_at=expires_at,  # Keep the original expiry date
+            cancelled_at=datetime.now().isoformat(),  # Mark when cancelled
         )
-        print(f"[subscription] Marked cancelled in DB: {customer_email}")
+        print(f"[subscription] Marked cancelled in DB: {customer_email}, access until {expires_at}")
     except Exception as e:
         print(f"[subscription] DB update error during cancel: {e}")
-        return {"success": False, "error": "Database update failed"}
+        return {"success": False, "error": "Database update failed", "expires_at": None}
     
     # 3. Clear cache
     clear_cache(customer_email)
     
-    return {"success": True, "error": None}
+    return {"success": True, "error": None, "expires_at": expires_at}
 
 
 def verify_webhook_signature(payload: bytes, signature: str) -> bool:
@@ -353,7 +384,17 @@ def handle_webhook(event_type: str, data: dict) -> bool:
         # Handle based on event type
         if event_type in ("subscription.active", "subscription.renewed"):
             expires_at = data.get("current_period_end") or data.get("next_billing_date")
-            _save_subscription_to_db(email, True, plan, subscription_id, str(expires_at) if expires_at else None)
+            # Clear cancelled_at when subscription is renewed/activated
+            client = _get_supabase()
+            client.table("subscriptions").upsert({
+                "email": email.lower(),
+                "is_premium": True,
+                "plan": plan,
+                "subscription_id": subscription_id,
+                "expires_at": str(expires_at) if expires_at else None,
+                "cancelled_at": None,  # Clear cancellation
+                "updated_at": datetime.now().isoformat(),
+            }, on_conflict="email").execute()
             clear_cache(email)
             print(f"[subscription] Activated: {email}")
             return True

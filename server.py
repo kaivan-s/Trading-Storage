@@ -1666,7 +1666,7 @@ def api_subscription_webhook():
 
 @app.post("/api/subscription/cancel")
 def api_subscription_cancel():
-    """Cancel the current user's subscription."""
+    """Cancel the current user's subscription. User keeps access until period ends."""
     user = request.environ.get("auth_user") or {}
     email = user.get("email") or ""
     if not email:
@@ -1679,7 +1679,11 @@ def api_subscription_cancel():
         from subscription import cancel_subscription
         result = cancel_subscription(email, subscription_id)
         if result.get("success"):
-            return jsonify({"success": True, "message": "Subscription cancelled"})
+            return jsonify({
+                "success": True, 
+                "message": "Subscription cancelled",
+                "expires_at": result.get("expires_at"),  # When access ends
+            })
         return jsonify({"success": False, "error": result.get("error", "Cancel failed")}), 400
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500

@@ -147,4 +147,5 @@ def me_payload() -> dict:
         "plan": sub.get("plan"),
         "subscription_expires": sub.get("expires_at"),
         "subscription_id": sub.get("subscription_id"),
+        "subscription_cancelled": sub.get("cancelled", False),
     }
