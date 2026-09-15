@@ -58,7 +58,7 @@ GATE_ORDER = ["trend", "pos", "price", "range", "ext", "rsi", "vol"]
 FIELDS = [
     "symbol", "sector", "started_on", "entry_price", "entry_trigger",
     "state", "state_since", "reason", "lost_gates", "last_seen_on",
-    "last_close", "peak_close", "coil_sessions", "age", "gap", "below",
+    "last_close", "peak_close", "peak_high", "coil_sessions", "age", "gap", "below",
     "mom12_1", "triggered_on", "trigger_age", "trigger_vol", "resolved_on",
 ]
 
@@ -127,6 +127,10 @@ def _open(symbol, row, as_of) -> dict:
         "last_seen_on": as_of,
         "last_close": px,
         "peak_close": px,
+        # Seeded at the entry close, not the found day's own high: the list
+        # publishes after the close, so that day's intraday high was already
+        # gone before anyone could see the name.
+        "peak_high": px,
         "coil_sessions": 1,
         "age": 0,
         "gap": 0,
@@ -153,6 +157,11 @@ def _step(ep, row, as_of) -> dict:
     if px is not None:
         ep["last_close"] = px
         ep["peak_close"] = max(ep["peak_close"] or px, px)
+        # `adj_high` is the intraday high on the same split-adjusted scale as
+        # `adj`, so it is comparable to the entry close. Circuit-locked and
+        # bad-print days can leave it missing, and the close is the floor.
+        hi = _num(row.get("adj_high")) or px
+        ep["peak_high"] = max(ep["peak_high"] or hi, hi, px)
 
     trig, entry = ep["entry_trigger"], ep["entry_price"]
 
