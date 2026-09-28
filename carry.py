@@ -34,7 +34,7 @@ same source.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -143,7 +143,7 @@ def _depth_one(groww, symbol: str) -> dict | None:
 
 def snapshot(on_progress=None) -> pd.DataFrame:
     """Today's at-circuit candidates with the order book behind them."""
-    today = date.today()
+    today = db.now_ist().date()
     uni = universe(today - timedelta(days=1))
     print(f"  universe: {len(uni):,} liquid names")
     live = fetch.live_quotes_groww(uni["symbol"].tolist(), on_progress=on_progress)
@@ -170,7 +170,7 @@ def snapshot(on_progress=None) -> pd.DataFrame:
 
     pre["as_of"] = today.isoformat()
     pre["source"] = "live"
-    pre["logged_at"] = datetime.now().isoformat(timespec="seconds")
+    pre["logged_at"] = db.now_ist().isoformat(timespec="seconds")
     return pre.reindex(columns=COLUMNS)
 
 
@@ -195,7 +195,7 @@ def from_bhavcopy(d: date) -> pd.DataFrame:
     m["at_circuit"] = True
     m["as_of"] = d.isoformat()
     m["source"] = "eod"
-    m["logged_at"] = datetime.now().isoformat(timespec="seconds")
+    m["logged_at"] = db.now_ist().isoformat(timespec="seconds")
     return m.reindex(columns=COLUMNS)
 
 
@@ -287,6 +287,74 @@ def score() -> tuple[int, int]:
     return len(scored), int(log["btst"].isna().sum())
 
 
+def _dedupe(log: pd.DataFrame) -> pd.DataFrame:
+    """One row per (as_of, symbol): the live snapshot wins over the eod rebuild."""
+    if log.empty:
+        return log
+    order = log["source"].map({"live": 0, "eod": 1}).fillna(2)
+    return (log.assign(_o=order).sort_values(["as_of", "symbol", "_o"])
+               .drop_duplicates(["as_of", "symbol"]).drop(columns="_o"))
+
+
+def ensure_session(d: date) -> int:
+    """
+    Rebuild session `d` from its bhavcopy when no live snapshot was taken.
+
+    Called by the post-market cron, so the list for the day exists even if the
+    15:22 snapshot was missed. A day that has live rows is left alone.
+    """
+    log = load_log()
+    if not log.empty and ((log["as_of"].astype(str) == d.isoformat())
+                          & (log["source"] == "live")).any():
+        return 0
+    return append(from_bhavcopy(d))
+
+
+def _records(df: pd.DataFrame) -> list[dict]:
+    import json
+    return json.loads(df.to_json(orient="records", date_format="iso"))
+
+
+def payload(history_sessions: int = 60) -> dict:
+    """Everything the Circuit carry screen shows, in one response."""
+    log = load_log()
+    if log.empty:
+        return {"as_of": None, "latest": [], "summary": [], "daily": [], "history": []}
+    for c in ("at_circuit", "fillable", "hit4"):
+        log[c] = log[c].astype(str).str.lower().map(
+            {"true": True, "1": True, "1.0": True, "false": False, "0": False, "0.0": False})
+    log = _dedupe(log[log["at_circuit"] != False])  # noqa: E712  (None = unknown, keep)
+    log["as_of"] = log["as_of"].astype(str)
+
+    as_of = log["as_of"].max()
+    latest = log[log["as_of"] == as_of].sort_values(
+        ["band", "pchange"], ascending=[False, False])
+
+    scored = log[log["btst"].notna()]
+    daily = (scored.groupby("as_of")
+             .agg(n=("symbol", "size"), hits=("hit4", "sum"),
+                  mean_btst=("btst", "mean"), best=("btst", "max"), worst=("btst", "min"),
+                  source=("source", lambda s: "live" if (s == "live").any() else "eod"))
+             .reset_index().sort_values("as_of", ascending=False)
+             .head(history_sessions))
+    daily["hit4"] = daily["hits"] / daily["n"]
+    keep = set(daily["as_of"])
+    history = scored[scored["as_of"].isin(keep)].sort_values(
+        ["as_of", "btst"], ascending=[False, False])
+
+    rep = report()
+    return {
+        "as_of": as_of,
+        "source": "live" if (latest["source"] == "live").any() else "eod",
+        "logged_at": latest["logged_at"].dropna().max() if len(latest) else None,
+        "latest": _records(latest),
+        "summary": _records(rep) if not rep.empty else [],
+        "daily": _records(daily),
+        "history": _records(history),
+        "pending": int(log["btst"].isna().sum()),
+    }
+
+
 def report(log: pd.DataFrame | None = None) -> pd.DataFrame:
     """Per-bucket results. Only at-circuit rows count; live rows split by fill."""
     log = load_log() if log is None else log
@@ -311,7 +379,8 @@ def report(log: pd.DataFrame | None = None) -> pd.DataFrame:
     band = pd.to_numeric(s["band"], errors="coerce").round(2)
     s["band_bucket"] = "band " + (band * 100).round().astype("Int64").astype(str) + "%"
     rows = []
-    groups = (list(s.groupby("bucket")) + [("all live", s[s["source"] == "live"])]
+    groups = ([("all", _dedupe(s))] + list(s.groupby("bucket"))
+              + [("all live", s[s["source"] == "live"])]
               + list(s.groupby("band_bucket")))
     for name, g in groups:
         if g.empty:

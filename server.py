@@ -1490,6 +1490,10 @@ def api_cron_post_market():
         _save_post_market(force=force)
         try:
             import carry
+            if engine.as_of:
+                n = carry.ensure_session(pd.Timestamp(engine.as_of).date())
+                if n:
+                    print(f"[cron] carry: no live snapshot, rebuilt {n} rows from bhavcopy")
             filled, pending = carry.score()
             print(f"[cron] carry scored {filled}, {pending} pending")
         except Exception as exc:
@@ -1537,18 +1541,18 @@ def api_cron_carry_snap():
                     "message": "Reading at-circuit names and order books."}), 202
 
 
+@app.get("/api/carry")
 @app.get("/api/carry/report")
-def api_carry_report():
-    """Paper results of the upper-circuit carry tracker, plus recent rows."""
+def api_carry():
+    """
+    The Circuit carry screen: the latest session's list, the track record
+    summary, a per-session history and the scored rows behind it.
+    """
     import carry
-    rep = carry.report()
-    log = carry.load_log()
-    recent = log.sort_values(["as_of", "symbol"]).tail(50)
-    return jsonify({
-        "report": json.loads(rep.to_json(orient="records")) if not rep.empty else [],
-        "rows": int(len(log)),
-        "recent": json.loads(recent.to_json(orient="records")),
-    })
+    try:
+        return jsonify(carry.payload())
+    except Exception as exc:
+        return jsonify({"error": f"Could not read carry log: {exc}"}), 500
 
 
 def _known_sessions() -> tuple[set, str | None]:
