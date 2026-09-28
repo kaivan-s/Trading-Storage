@@ -17,10 +17,13 @@ import pandas as pd
 
 def clean(df: pd.DataFrame, sector_map: pd.DataFrame,
           sector_level: str = "basic_industry",
-          min_median_turnover_lacs: float = 20.0,
-          min_sector_stocks: int = 4) -> pd.DataFrame:
+          min_median_turnover_lacs: float = 20.0) -> pd.DataFrame:
     """
     Filter to real equities, attach sector, drop illiquid noise.
+
+    Sector size is NOT filtered here: this frame also feeds the stock-level
+    scans, and a stock is not less tradable for sitting in a small industry.
+    `build` applies the sector minimum to the panel only.
 
     The liquidity floor is not cosmetic. A microcap that traded once at its
     circuit price produces a valid-looking money-flow multiplier of +/-1 and,
@@ -42,9 +45,6 @@ def clean(df: pd.DataFrame, sector_map: pd.DataFrame,
     med = df.groupby("symbol")["turnover"].median()
     keep = med[med >= min_median_turnover_lacs].index
     df = df[df["symbol"].isin(keep)]
-
-    counts = df.groupby("sector")["symbol"].nunique()
-    df = df[df["sector"].isin(counts[counts >= min_sector_stocks].index)]
 
     return df.sort_values(["symbol", "date"]).reset_index(drop=True)
 
@@ -231,14 +231,23 @@ def sector_panel(df: pd.DataFrame, turnover_window: int = 9) -> pd.DataFrame:
 
 
 def build(raw: pd.DataFrame, sector_map: pd.DataFrame, **kw) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """raw bhavcopy + sector map -> (stock frame, sector panel)."""
+    """
+    raw bhavcopy + sector map -> (stock frame, sector panel).
+
+    Only sectors with at least `min_sector_stocks` liquid names get a panel
+    row. Below that the width gates stop measuring width: 3 advancing is 75%
+    of a 4-name sector, top_share fails almost by construction, and one stock
+    swings the RS mean. Their stocks stay in the stock frame.
+    """
     cleaned = clean(raw, sector_map,
                     sector_level=kw.get("sector_level", "basic_industry"),
-                    min_median_turnover_lacs=kw.get("min_median_turnover_lacs", 20.0),
-                    min_sector_stocks=kw.get("min_sector_stocks", 4))
+                    min_median_turnover_lacs=kw.get("min_median_turnover_lacs", 20.0))
     stocks = stock_metrics(cleaned,
                            cmf_window=kw.get("cmf_window", 20),
                            rs_lookback=kw.get("rs_lookback", 55),
                            deliv_baseline=kw.get("deliv_baseline", 60))
-    panel = sector_panel(stocks, turnover_window=kw.get("turnover_window", 9))
+    counts = stocks.groupby("sector")["symbol"].nunique()
+    big = counts.index[counts >= kw.get("min_sector_stocks", 8)]
+    panel = sector_panel(stocks[stocks["sector"].isin(big)],
+                         turnover_window=kw.get("turnover_window", 9))
     return stocks, panel

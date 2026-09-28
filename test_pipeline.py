@@ -20,13 +20,19 @@ import stocks as stk
 rng = np.random.default_rng(7)
 
 SECTORS = {
-    "Paper & Paper Products": 6,
-    "Refineries & Marketing": 6,
-    "Commodity Chemicals": 7,
-    "Pharmaceuticals": 8,
-    "Private Sector Bank": 6,
+    "Paper & Paper Products": 8,
+    "Refineries & Marketing": 9,
+    "Commodity Chemicals": 10,
+    "Pharmaceuticals": 12,
+    "Private Sector Bank": 8,
+    # Under the 8-name floor: must not survive cleaning.
+    "Thin Sector": 5,
 }
-N_DAYS = 120
+# Long enough that the 200-EMA is actually defined: the coil gates read
+# `adj > ema50 > ema200`, and ema200 now needs 200 observations before it
+# returns anything, so a shorter panel can only ever test that the scan
+# correctly refuses to flag.
+N_DAYS = 260
 
 
 def make_data():
@@ -114,6 +120,9 @@ def main():
     print("\n--- cleaning ---")
     check("SME series dropped", "SMEJUNK" not in set(stocks["symbol"]))
     check("illiquid dropped", "TINYCAP" not in set(stocks["symbol"]))
+    check("sector under 8 names has no panel row", "Thin Sector" not in set(p["sector"]))
+    check("its stocks stay in the stock frame",
+          "Thin Sector" in set(stocks["sector"]))
 
     print("\n--- per-stock metrics ---")
     check("MFM finite everywhere", np.isfinite(stocks["mfm"]).all(),
@@ -158,6 +167,8 @@ def main():
 
     ok &= test_coil()
     ok &= test_robustness()
+    ok &= test_episodes()
+    ok &= test_fetch_guards()
 
     print("\n" + ("ALL CHECKS PASSED" if ok else "SOME CHECKS FAILED"))
     return 0 if ok else 1
@@ -290,7 +301,8 @@ def test_robustness():
         else:
             T, T_rel, B, q = 0.7, 0.8, 0.1, 4
         rows.append({"date": d, "sector": "Test", "T": T, "T_rel": T_rel, "B": B,
-                     "T_quiet_prior_5": q})
+                     "T_quiet_prior_5": q, "rs_chg_5": 1.0,
+                     "deliv_quality_rel": 1.1, "n_adv": 5, "top_share": 0.3})
     _, rep = sc.shape_report(pd.DataFrame(rows))
     check("orderly pullback from quiet is buy_ready",
           rep["verdict"] == "orderly" and rep["buy_ready"] is True,
@@ -309,6 +321,65 @@ def test_robustness():
     check("explain_setup names the sector and the trigger",
           "Test woke up" in why and "20-day high" in why and "FOO is coiled" in why,
           f"({why[:80]}…)")
+
+    print("\n--- pullback needs a verified crossing ---")
+
+    def sector_hist(cross_top_share):
+        out = []
+        for i, d in enumerate(pd.bdate_range("2026-08-01", periods=20)):
+            base = {"date": d, "sector": "Test", "B_deliv": 0.0, "cmf": 0.05,
+                    "cmf_rel": 0.02, "cmf_rel_chg_5": 0.01, "rs": 60.0,
+                    "rs_chg_5": 1.0, "deliv_quality": 1.0, "n_stocks": 10,
+                    "B_green_10": 5, "T_quiet_10": 4}
+            if i == 16:
+                base.update(T=2.0, T_rel=1.6, B=0.4, T_quiet_prior_5=4,
+                            deliv_quality_rel=1.1, n_adv=6,
+                            top_share=cross_top_share)
+            elif i > 16:
+                base.update(T=1.2, T_rel=0.9, B=-0.1, T_quiet_prior_5=2,
+                            deliv_quality_rel=1.05, n_adv=4, top_share=0.3)
+            else:
+                base.update(T=0.8, T_rel=0.9, B=0.1, T_quiet_prior_5=4,
+                            deliv_quality_rel=1.0, n_adv=5, top_share=0.3)
+            out.append(base)
+        return pd.DataFrame(out)
+
+    good = sc.classify_one(sector_hist(0.30), sc.Thresholds())
+    check("lighter red after a verified crossing is PULLBACK",
+          good["klass"] == "PULLBACK", f"(got {good['klass']})")
+    narrow = sc.classify_one(sector_hist(0.70), sc.Thresholds())
+    check("lighter red after a one-stock expansion is not PULLBACK",
+          narrow["klass"] != "PULLBACK", f"(got {narrow['klass']})")
+    _, rep3 = sc.shape_report(sector_hist(0.70))
+    check("shape report ignores the unverified expansion",
+          rep3["verdict"] == "no_crossing", f"(verdict={rep3['verdict']})")
+
+    print("\n--- leaders at rest entry test ---")
+    import position as pos
+    as_of = pd.Timestamp("2026-09-01")
+    universe = pd.DataFrame({
+        "symbol": [f"U{i:02d}" for i in range(10)] + ["LEAD", "STEADY", "LAGGARD", "THIN", "DQ"],
+        "date": as_of,
+        "adj": 100.0,
+        "med_turn60": [500.0] * 13 + [50.0, 500.0],
+        "own_sessions": 300,
+        "mom12_1": [0.05 * i for i in range(10)] + [0.90, 0.70, 0.01, 0.95, 0.85],
+        "mom_vadj": [0.1 * i for i in range(10)] + [1.5, 2.5, 0.02, 3.0, 2.0],
+    })
+    coils = pd.DataFrame({
+        "symbol": ["LEAD", "STEADY", "LAGGARD", "THIN", "DQ"],
+        "sector_klass": ["PULLBACK", "NONE", "NONE", "BASE", "DISQUALIFIED"],
+    })
+    rest = pos.leaders_at_rest(coils, universe, as_of=as_of)
+    names = list(rest["symbol"])
+    check("bottom-of-market momentum excluded", "LAGGARD" not in names, f"({names})")
+    check("sub-₹100L turnover excluded", "THIN" not in names, f"({names})")
+    check("disqualified sector excluded", "DQ" not in names, f"({names})")
+    check("ordered by risk-adjusted momentum",
+          names == ["STEADY", "LEAD"], f"({names})")
+    ann = pos.annotate_momentum(coils, universe, as_of=as_of)
+    check("pool rows keep their momentum reading",
+          ann["mom12_1"].notna().all() and ann["mom_pct"].notna().sum() == 4)
 
     print("\n--- breakout confirmation ---")
     import breakouts as bo
@@ -482,6 +553,302 @@ def test_robustness():
     check("live through trigger is tagged through",
           not th.empty and th.iloc[0]["kind"] == "through")
     return ok
+
+
+def test_episodes():
+    """
+    Drive the episode state machine through every transition by hand.
+
+    Synthetic rather than measured on purpose: the replay over real data tells
+    us the distribution of outcomes, but only a scripted sequence proves that
+    a three-session gap is bridged, that a one-day dip is not a failed
+    breakout, and that a breakout on the same day a base leaves the filters is
+    still reported as a breakout.
+    """
+    import episodes as eps
+
+    print("\n--- base episodes ---")
+    ok = True
+
+    def check(label, cond, detail=""):
+        nonlocal ok
+        print(f"  [{'PASS' if cond else 'FAIL'}] {label} {detail}")
+        ok &= bool(cond)
+
+    def day(qualifies, price, vol=1.0, trigger=110.0, **flags):
+        """One symbol's cross-section row, as gate_flags would produce it."""
+        row = {
+            "symbol": "AAA", "sector": "Banks", "adj": float(price),
+            "trigger": trigger, "vol_ratio": vol, "mom12_1": 0.3,
+            "n_fail": 0 if qualifies else 1,
+        }
+        for c in stk.FLAG_COLS:
+            row[c] = True
+        if not qualifies:
+            row[flags.get("lost", "f_vol")] = False
+        return pd.DataFrame([row])
+
+    dates = pd.bdate_range("2025-01-01", periods=40)
+
+    # --- a base that breaks out on heavy volume ---
+    e = []
+    eps.advance(e, day(True, 100.0), dates[0])
+    check("episode opens on first qualifying session",
+          len(e) == 1 and e[0]["state"] == "basing", f"(n={len(e)})")
+    check("trigger frozen at entry", e[0]["entry_trigger"] == 110.0)
+    eps.advance(e, day(True, 101.0), dates[1])
+    eps.advance(e, day(True, 112.0, vol=2.0), dates[2])
+    check("close through the level triggers",
+          e[0]["state"] == "triggered", f"(state={e[0]['state']})")
+    check("heavy volume flagged", e[0]["trigger_vol"] is True)
+
+    # --- the frozen level is what matters, not the rolling one ---
+    e = []
+    eps.advance(e, day(True, 100.0, trigger=110.0), dates[0])
+    eps.advance(e, day(True, 112.0, trigger=125.0), dates[1])
+    check("a rising rolling high cannot move the target",
+          e[0]["state"] == "triggered", f"(state={e[0]['state']})")
+
+    # --- one dip back inside is a retest, two closes is a failure ---
+    e = []
+    eps.advance(e, day(True, 100.0), dates[0])
+    eps.advance(e, day(True, 112.0), dates[1])
+    eps.advance(e, day(False, 108.0), dates[2])
+    check("one close back inside is not a failure",
+          e[0]["state"] == "triggered", f"(state={e[0]['state']})")
+    eps.advance(e, day(False, 107.0), dates[3])
+    check("two straight closes inside is a failure",
+          e[0]["state"] == "failed", f"(state={e[0]['state']})")
+    check("failure resolves the episode", e[0]["resolved_on"] is not None)
+
+    # --- a three-session gap is bridged, a four-session gap is not ---
+    e = []
+    eps.advance(e, day(True, 100.0), dates[0])
+    for i in (1, 2, 3):
+        eps.advance(e, day(False, 100.0), dates[i])
+    check("still basing through a three-session gap",
+          e[0]["state"] == "basing" and len(e) == 1,
+          f"(state={e[0]['state']} gap={e[0]['gap']})")
+    eps.advance(e, day(True, 100.0), dates[4])
+    check("bridged gap keeps one episode, streak continues",
+          len(e) == 1 and e[0]["coil_sessions"] == 2,
+          f"(n={len(e)} sessions={e[0]['coil_sessions']})")
+
+    e = []
+    eps.advance(e, day(True, 100.0), dates[0])
+    for i in (1, 2, 3, 4):
+        eps.advance(e, day(False, 100.0, lost="f_trend"), dates[i])
+    check("a four-session gap drops the base",
+          e[0]["state"] == "dropped", f"(state={e[0]['state']})")
+    check("the lost filter is recorded",
+          e[0]["lost_gates"] == "trend" and "uptrend" in e[0]["reason"].lower(),
+          f"(lost={e[0]['lost_gates']!r} reason={e[0]['reason']!r})")
+    eps.advance(e, day(True, 100.0), dates[5])
+    check("requalifying after a real gap starts a new episode",
+          len(e) == 2 and e[1]["state"] == "basing", f"(n={len(e)})")
+
+    # --- a dropped base still gets credit for a late breakout ---
+    e = []
+    eps.advance(e, day(True, 100.0), dates[0])
+    for i in range(1, 5):
+        eps.advance(e, day(False, 100.0), dates[i])
+    check("dropped before the late move", e[0]["state"] == "dropped")
+    eps.advance(e, day(False, 115.0), dates[5])
+    check("a breakout after dropping off is still a breakout",
+          e[0]["state"] == "triggered", f"(state={e[0]['state']})")
+
+    # --- price events beat list membership on the same session ---
+    e = []
+    eps.advance(e, day(True, 100.0), dates[0])
+    for i in (1, 2, 3):
+        eps.advance(e, day(False, 100.0), dates[i])
+    eps.advance(e, day(False, 118.0, lost="f_vol"), dates[4])
+    check("breaking out on the session it leaves is not a drop-off",
+          e[0]["state"] == "triggered", f"(state={e[0]['state']})")
+
+    # --- breakdown ---
+    e = []
+    eps.advance(e, day(True, 100.0), dates[0])
+    eps.advance(e, day(True, 92.0), dates[1])
+    check("an 8% fall from entry breaks down",
+          e[0]["state"] == "broke_down", f"(state={e[0]['state']})")
+    e = []
+    eps.advance(e, day(True, 100.0), dates[0])
+    eps.advance(e, day(True, 95.0), dates[1])
+    check("a 5% fall does not break down",
+          e[0]["state"] == "basing", f"(state={e[0]['state']})")
+
+    # --- nothing happens for the whole horizon ---
+    e = []
+    for i in range(eps.HORIZON + 2):
+        eps.advance(e, day(True, 100.0), dates[i])
+    check("a base that never resolves goes stale",
+          e[0]["state"] == "stale" and e[0]["resolved_on"] is not None,
+          f"(state={e[0]['state']} age={e[0]['age']})")
+
+    # --- tagging a displayed list ---
+    e = []
+    eps.advance(e, day(True, 100.0), dates[0])
+    eps.advance(e, day(False, 100.0), dates[1])
+    eps.advance(e, day(True, 100.0), dates[2])
+    df = eps.frame(e)
+    rows = pd.DataFrame([{"symbol": "AAA", "coil_days": 1}])
+    tagged = eps.tag(rows, df, dates[2])
+    check("bridged age overrides a reset coil_days",
+          int(tagged.iloc[0]["episode_days"]) == 2,
+          f"(coil_days=1 episode_days={tagged.iloc[0]['episode_days']})")
+    check("an older base is not labelled new",
+          not bool(tagged.iloc[0]["episode_new"]))
+
+    # --- seeding from the published list, which is the live path ---
+    def two(qualifies_b):
+        """Cross-section with AAA qualifying and BBB optionally qualifying."""
+        d = pd.concat([day(True, 100.0), day(qualifies_b, 100.0)],
+                      ignore_index=True)
+        d.loc[1, "symbol"] = "BBB"
+        return d
+
+    e = []
+    eps.advance(e, two(True), dates[0], eligible={"AAA"})
+    check("eligible restricts which names may open",
+          len(e) == 1 and e[0]["symbol"] == "AAA",
+          f"({[x['symbol'] for x in e]})")
+
+    e = []
+    eps.advance(e, two(False), dates[0], eligible={"AAA", "BBB"})
+    check("a published name opens even if it fails the gates",
+          len(e) == 2,
+          "(the list is the authority on what was shown)")
+
+    e = []
+    eps.advance(e, two(True), dates[0], eligible=set())
+    check("an empty published list opens nothing",
+          len(e) == 0,
+          "(None would mean unrestricted -- a real bug once)")
+
+    e = []
+    eps.advance(e, two(True), dates[0], eligible={"AAA"})
+    eps.advance(e, two(True), dates[1], eligible={"AAA", "BBB"})
+    check("a later list adds only the new entrant",
+          len(e) == 2 and e[1]["symbol"] == "BBB" and e[1]["age"] == 0,
+          f"(n={len(e)})")
+    check("the carried-forward episode advanced, not restarted",
+          e[0]["age"] == 1 and e[0]["coil_sessions"] == 2,
+          f"(age={e[0]['age']} sessions={e[0]['coil_sessions']})")
+
+    # --- the digest counts today, not the backlog ---
+    dg = eps.digest(df, dates[2])
+    check("digest reports a quiet session as quiet",
+          dg["new"] == 0 and dg["triggered"] == 0 and dg["live"] == 1,
+          f"({dg})")
+    check("digest counts a new base on the day it appears",
+          eps.digest(df, dates[0])["new"] == 1)
+
+    return ok
+
+
+
+def test_fetch_guards():
+    """
+    A holiday must not become a session.
+
+    NSE answers a request for a non-trading date with the PREVIOUS session's
+    bhavcopy rather than an error, so the only things standing between that
+    and a duplicated day in the panel are the date check in the parsers and
+    the repeat-session guard that repairs caches written before it existed.
+    Both are checked here because the failure is silent: a duplicated session
+    has zero returns everywhere and quietly distorts every range, volatility
+    and session-counting indicator downstream.
+    """
+    from datetime import date as _date
+    import fetch
+
+    print("\n--- fetch guards ---")
+    ok = True
+
+    def check(label, cond, detail=""):
+        nonlocal ok
+        print(f"  [{'PASS' if cond else 'FAIL'}] {label} {detail}")
+        ok &= bool(cond)
+
+    header = ("SYMBOL, SERIES, DATE1, PREV_CLOSE, OPEN_PRICE, HIGH_PRICE,"
+              " LOW_PRICE, LAST_PRICE, CLOSE_PRICE, AVG_PRICE, TTL_TRD_QNTY,"
+              " TURNOVER_LACS, NO_OF_TRADES, DELIV_QTY, DELIV_PER")
+
+    def csv_for(stamp):
+        rows = [header]
+        for sym in ("AAA", "BBB"):
+            rows.append(f"{sym}, EQ, {stamp}, 100, 100, 101, 99, 100, 100,"
+                        f" 100, 1000, 10, 50, 500, 50.0")
+        return "\n".join(rows) + "\n"
+
+    # The file agrees with the request: accepted.
+    got = fetch._parse_sec_bhav(csv_for("11-Sep-2026"), _date(2026, 9, 11))
+    check("a file dated as requested parses", len(got) == 2, f"({len(got)} rows)")
+
+    # The file is the previous session's: rejected, which is what a holiday
+    # request actually returns from NSE.
+    try:
+        fetch._parse_sec_bhav(csv_for("11-Sep-2026"), _date(2026, 9, 14))
+        check("a stale file is rejected", False, "(it was accepted)")
+    except fetch.StaleBhavcopy as exc:
+        check("a stale file is rejected", True, f"({exc})")
+
+    # StaleBhavcopy has to stay catchable by the existing fallback chain.
+    check("StaleBhavcopy is a RuntimeError",
+          issubclass(fetch.StaleBhavcopy, RuntimeError))
+
+    # Repeat-session guard. Dates far in the past so no cache file exists and
+    # the purge step is a no-op.
+    base = pd.DataFrame({
+        "symbol": ["AAA", "BBB"] * 3,
+        "close": [10.0, 20.0, 10.0, 20.0, 11.0, 21.0],
+        "date": pd.to_datetime(
+            ["1999-01-04", "1999-01-04", "1999-01-05", "1999-01-05",
+             "1999-01-06", "1999-01-06"]),
+    })
+    kept = fetch.drop_repeat_sessions(base, verbose=False)
+    check("a session identical to the one before it is dropped",
+          sorted(str(d.date()) for d in kept["date"].unique())
+          == ["1999-01-04", "1999-01-06"],
+          f"({[str(d.date()) for d in sorted(kept['date'].unique())]})")
+
+    # Two genuinely different sessions must both survive, even when close.
+    near = pd.DataFrame({
+        "symbol": ["AAA", "BBB"] * 2,
+        "close": [10.0, 20.0, 10.0, 20.01],
+        "date": pd.to_datetime(
+            ["1999-02-01", "1999-02-01", "1999-02-02", "1999-02-02"]),
+    })
+    check("a nearly-identical but real session is kept",
+          fetch.drop_repeat_sessions(near, verbose=False)["date"].nunique() == 2)
+
+    # Only the copy goes, never the original.
+    check("the earlier session is the one retained",
+          str(pd.Timestamp(kept["date"].min()).date()) == "1999-01-04")
+
+    # Negative cache. The age guard is the subtle half: a request for a
+    # session whose file has not published yet is answered with the previous
+    # one, which is indistinguishable from a holiday. Recording that would
+    # blind the loader to a real session permanently.
+    from datetime import date as _d, timedelta as _td
+    saved = fetch._no_session
+    try:
+        fetch._no_session = set()
+        recent = _d.today() - _td(days=1)
+        fetch._mark_no_session(recent)
+        check("a date younger than the guard is not recorded",
+              recent.isoformat() not in fetch._no_session_set())
+
+        old_holiday = _d(2026, 1, 26)
+        fetch._mark_no_session(old_holiday)
+        check("a long-past holiday is recorded",
+              old_holiday.isoformat() in fetch._no_session_set())
+    finally:
+        fetch._no_session = saved
+
+    return ok
+
 
 
 if __name__ == "__main__":

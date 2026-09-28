@@ -11,6 +11,9 @@ Sector accumulation scan.
     python run.py coiltest --days 320     # forward-test vs all-stock base rate
     python run.py buytest --days 320      # forward-test the buy funnel (shape ∩ coil)
     python run.py tom --days 220          # live overlay at run time → for-tomorrow list
+    python run.py carry snap              # 15:20-15:28 IST: upper-circuit candidates + order book
+    python run.py carry score             # after ~18:30 IST: fill next-session outcomes, report
+    python run.py carry eod --backfill 20 # rebuild past candidates from bhavcopy (no order book)
 
 The sector map is a separate step because it takes ~12 minutes and only needs
 doing once (re-run it monthly; NSE reviews the classification annually but
@@ -21,7 +24,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -257,6 +260,57 @@ def cmd_buytest(args):
         print(f"\nPer-date log written to {args.csv}")
 
 
+def cmd_carry(args):
+    import carry
+    if args.action == "snap":
+        print("Upper-circuit snapshot (run 15:20-15:28 IST) …")
+        rows = carry.snapshot()
+        n = carry.append(rows)
+        at = rows[rows["at_circuit"].astype(bool)] if n else rows
+        print(f"\n=== carry candidates {date.today():%d-%m-%Y}: {len(at)} at circuit "
+              f"({n} logged) ===\n")
+        if len(at):
+            cols = ["symbol", "sector", "ltp", "pchange", "band", "total_buy_qty",
+                    "total_sell_qty", "fillable", "med_turn20"]
+            print(at[cols].sort_values("total_sell_qty", ascending=False)
+                  .round(2).to_string(index=False))
+        return
+
+    if args.action == "eod":
+        d = args.end
+        days = []
+        while len(days) < args.backfill:
+            if d.weekday() < 5:
+                days.append(d)
+            d -= timedelta(days=1)
+        total = 0
+        for d in sorted(days):
+            n = carry.append(carry.from_bhavcopy(d))
+            total += n
+            print(f"  {d}: {n} at-circuit closes")
+        print(f"\n{total} eod rows logged to {carry.LOG_PATH}")
+        return
+
+    if args.action == "score":
+        filled, pending = carry.score()
+        print(f"Scored {filled} rows; {pending} still waiting for their next session.")
+
+    rep = carry.report()
+    if rep.empty:
+        print("Nothing scored yet.")
+        return
+    pct = ["hit4", "gap4", "mean_btst", "median_btst", "net_mean", "win_rate", "worst"]
+    show = rep.copy()
+    for c in pct:
+        show[c] = (show[c] * 100).round(1)
+    print(f"\n=== upper-circuit carry, paper results (% ; net = mean - "
+          f"{carry.COST:.2%} cost) ===\n")
+    print(show.to_string(index=False))
+    print("\nThe study expects ~74% hit4 and ~+2.4% to +3.6% mean btst. The number "
+          "that decides this horizon is `live: sellers present` — the only trades "
+          "that could actually have filled. Judge it after ~100 rows, not before.")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -292,10 +346,16 @@ def main():
     sub.add_parser("tom", parents=[common],
                    help="live overlay at run time: potential breakouts for tomorrow")
 
+    kp = sub.add_parser("carry", parents=[common],
+                        help="upper-circuit carry paper tracker (snap / eod / score / report)")
+    kp.add_argument("action", choices=["snap", "eod", "score", "report"])
+    kp.add_argument("--backfill", type=int, default=1,
+                    help="eod: weekdays to rebuild, ending at --end (default 1)")
+
     args = ap.parse_args()
     {"sectors": cmd_sectors, "scan": cmd_scan, "backtest": cmd_backtest,
      "sector": cmd_sector, "coil": cmd_coil, "coiltest": cmd_coiltest,
-     "buytest": cmd_buytest, "tom": cmd_tom}[args.cmd](args)
+     "buytest": cmd_buytest, "tom": cmd_tom, "carry": cmd_carry}[args.cmd](args)
 
 
 if __name__ == "__main__":

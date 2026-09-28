@@ -1289,11 +1289,6 @@ def save_episodes(eps: pd.DataFrame) -> int:
 
 # ------------------------------------------------------- the whole read path
 
-# Leaders at rest is the top of the coil pool by 12-1 momentum. Kept here so
-# the compatibility path below cannot drift from position.REST_TOP_N.
-REST_TOP_N = 20
-
-
 def _latest_date(table: str, col: str = "scan_date") -> str | None:
     """Most recent date present in `table`, or None if it is empty."""
     client = get_client()
@@ -1337,18 +1332,13 @@ def get_lists() -> dict:
     setups = get_setups(setup_date) if setup_date else []
     coils = get_coiled_bases(coil_date) if coil_date else []
 
-    ranked = [r for r in coils if r.get("rest_rank") is not None]
-    if ranked:
-        ranked.sort(key=lambda r: r["rest_rank"])
-    else:
-        # Compatibility path for rows written before rest_rank existed. Same
-        # rule position.leaders_at_rest applies: order by 12-1 momentum and
-        # keep the top N, with no reading sorting last rather than dropping
-        # out. Rows saved by any current run carry rest_rank and skip this.
-        ranked = sorted(
-            coils,
-            key=lambda r: (r.get("mom12_1") is None, -(r.get("mom12_1") or 0.0)),
-        )[:REST_TOP_N]
+    # rest_rank is the only source of the list. No rank on any row means no
+    # coil passed position.leaders_at_rest's entry test that night; re-sorting
+    # the pool by mom12_1 here would resurrect the names the test excluded.
+    ranked = sorted(
+        (r for r in coils if r.get("rest_rank") is not None),
+        key=lambda r: r["rest_rank"],
+    )
 
     session = max([d for d in (coil_date, scan_date, setup_date) if d],
                   default=None)

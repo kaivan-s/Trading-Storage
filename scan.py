@@ -89,16 +89,23 @@ def _gate3(r: pd.Series, th: Thresholds) -> bool:
     )
 
 
+def _is_crossing(row: pd.Series, th: Thresholds) -> bool:
+    """
+    A full CROSSING day: expansion from quiet (gate 2) that is broad and
+    delivered (gate 3). Turnover and breadth alone are not enough -- an
+    unverified expansion followed by a lighter red day would otherwise pass
+    as a PULLBACK and feed Setups.
+    """
+    return _gate2(row, th) and _gate3(row, th)
+
+
 def _recent_crossing(hist: pd.DataFrame, th: Thresholds, window: int = 5):
-    """The most recent crossing day in the trailing window, if there was one."""
+    """The most recent full crossing day in the trailing window, if there was one."""
     tail = hist.iloc[-(window + 1):-1]
-    hits = tail[(tail["T_rel"] >= th.cross_t_rel) & (tail["B"] >= th.cross_b)]
+    if tail.empty:
+        return None
+    hits = tail[tail.apply(lambda r: _is_crossing(r, th), axis=1)]
     return None if hits.empty else hits.iloc[-1]
-
-
-def _is_expand(row: pd.Series, th: Thresholds) -> bool:
-    return bool(pd.notna(row.get("T_rel")) and row["T_rel"] >= th.cross_t_rel
-                and pd.notna(row.get("B")) and row["B"] >= th.cross_b)
 
 
 def _quiet_prior(row: pd.Series, th: Thresholds) -> tuple[bool | None, int | None]:
@@ -134,19 +141,20 @@ def shape_report(hist: pd.DataFrame, th: Thresholds | None = None,
         "crossing": None,
         "checks": [],
         "verdict": "no_crossing",
-        "verdict_text": "No T_rel expansion with green breadth in the last "
+        "verdict_text": "No verified quiet-to-loud crossing in the last "
                         f"{lookback} sessions. Nothing to pull back from.",
         "buy_ready": False,
     }
     if tail.empty:
         return tail, empty
 
-    expand = tail[tail.apply(lambda r: _is_expand(r, th), axis=1)]
-    if expand.empty:
+    # Same definition classify() uses for PULLBACK, so the drawer and the
+    # sector state can never name different crossing days.
+    full = tail[tail.apply(lambda r: _is_crossing(r, th), axis=1)]
+    if full.empty:
         return tail, empty
 
-    # Most recent expansion is the reference crossing for pullback math.
-    cross = expand.iloc[-1]
+    cross = full.iloc[-1]
     from_quiet, quiet_n = _quiet_prior(cross, th)
     cross_date = pd.Timestamp(cross["date"])
     cross_t = float(cross["T"]) if pd.notna(cross["T"]) else None
@@ -173,7 +181,7 @@ def shape_report(hist: pd.DataFrame, th: Thresholds | None = None,
 
     # Marks: all expansion days, then post-crossing reds.
     for i, r in tail.iterrows():
-        if _is_expand(r, th):
+        if _is_crossing(r, th):
             tail.at[i, "mark"] = "crossing"
         elif pd.to_datetime(r["date"]) > cross_date and pd.notna(r.get("B")) and r["B"] < 0:
             if cross_t is not None and pd.notna(r.get("T")) and r["T"] >= cross_t:
@@ -182,7 +190,7 @@ def shape_report(hist: pd.DataFrame, th: Thresholds | None = None,
                 tail.at[i, "mark"] = "pullback"
 
     last = tail.iloc[-1]
-    last_is_cross = _is_expand(last, th)
+    last_is_cross = _is_crossing(last, th)
 
     checks = []
     checks.append({

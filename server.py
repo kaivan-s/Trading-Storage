@@ -15,6 +15,7 @@ the latest cached bhavcopy (and fetches any missing session from NSE).
 from __future__ import annotations
 
 import math
+import json
 import threading
 from datetime import date, datetime, time
 from pathlib import Path
@@ -148,18 +149,15 @@ def _rank_at_rest(coil_rows: pd.DataFrame, coil_stocks: pd.DataFrame):
     mom12_1 null on every row of the saved pool, which is what made Leaders
     at rest carry a rank with nothing behind it.
 
-    Ranked over the whole pool rather than the top 20, so the momentum shown
-    against a coil is present whether or not it made the cut.
+    Annotated over the whole pool rather than the top 20, so the momentum
+    shown against a coil is present whether or not it made the cut.
     """
-    ranked = posscan.leaders_at_rest(coil_rows, coil_stocks, top_n=None)
-    if ranked is None or ranked.empty:
+    if coil_rows is None or coil_rows.empty:
         return coil_rows, pd.DataFrame()
 
-    rest = ranked.head(posscan.REST_TOP_N).reset_index(drop=True)
-    order = {s: i + 1 for i, s in enumerate(rest["symbol"])}
-    out = coil_rows.copy()
-    if "mom12_1" in ranked.columns:
-        out["mom12_1"] = out["symbol"].map(ranked.set_index("symbol")["mom12_1"])
+    out = posscan.annotate_momentum(coil_rows, coil_stocks)
+    rest = posscan.leaders_at_rest(coil_rows, coil_stocks)
+    order = {s: i + 1 for i, s in enumerate(rest["symbol"])} if not rest.empty else {}
     out["rest_rank"] = out["symbol"].map(order)
     return out, rest
 
@@ -598,6 +596,12 @@ class Engine:
                 return None
             hist = self.panel[self.panel["sector"].str.lower() == name.lower()].sort_values("date")
             if hist.empty:
+                members = self.stocks[self.stocks["sector"].str.lower() == name.lower()]
+                if not members.empty:
+                    n = int(members["symbol"].nunique())
+                    return {"found": False, "near": [], "reason":
+                            f"{name} has {n} liquid stocks. Sectors need at least 8 "
+                            "before breadth and width mean anything, so it is not scanned."}
                 near = sorted({s for s in self.panel["sector"].unique()
                                if name.lower()[:6] in s.lower()})
                 return {"found": False, "near": near}
@@ -1484,6 +1488,12 @@ def api_cron_post_market():
             print("[cron] load returned no data — nothing saved")
             return
         _save_post_market(force=force)
+        try:
+            import carry
+            filled, pending = carry.score()
+            print(f"[cron] carry scored {filled}, {pending} pending")
+        except Exception as exc:
+            print(f"[cron] carry score failed: {exc}")
 
     threading.Thread(target=work, daemon=True).start()
     return jsonify({
@@ -1492,6 +1502,53 @@ def api_cron_post_market():
                    "the coil pool and base episodes. Poll /api/status for "
                    "progress.",
     }), 202
+
+
+_carry_busy = threading.Lock()
+
+
+@app.post("/api/cron/carry-snap")
+def api_cron_carry_snap():
+    """
+    Upper-circuit carry snapshot. Schedule at 15:22 IST, weekdays.
+    POST /api/cron/carry-snap
+
+    Must run while the market is open: Groww rolls circuit limits to the next
+    session after the close, so a later call records nothing useful. Scoring
+    happens inside /api/cron/post-market. Returns 202 and runs in a thread.
+    """
+    if not _carry_busy.acquire(blocking=False):
+        return jsonify({"status": "busy", "message": "Snapshot already running."}), 409
+
+    def work():
+        try:
+            import carry
+            rows = carry.snapshot()
+            n = carry.append(rows)
+            at = int(rows["at_circuit"].astype(bool).sum()) if n else 0
+            print(f"[cron] carry snap: {at} at circuit, {n} logged")
+        except Exception as exc:
+            print(f"[cron] carry snap failed: {exc}")
+        finally:
+            _carry_busy.release()
+
+    threading.Thread(target=work, daemon=True).start()
+    return jsonify({"status": "started",
+                    "message": "Reading at-circuit names and order books."}), 202
+
+
+@app.get("/api/carry/report")
+def api_carry_report():
+    """Paper results of the upper-circuit carry tracker, plus recent rows."""
+    import carry
+    rep = carry.report()
+    log = carry.load_log()
+    recent = log.sort_values(["as_of", "symbol"]).tail(50)
+    return jsonify({
+        "report": json.loads(rep.to_json(orient="records")) if not rep.empty else [],
+        "rows": int(len(log)),
+        "recent": json.loads(recent.to_json(orient="records")),
+    })
 
 
 def _known_sessions() -> tuple[set, str | None]:

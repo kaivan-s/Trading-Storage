@@ -1,0 +1,317 @@
+"""
+Upper-circuit carry: a paper-trade tracker for the one short-term pattern
+eval_shortterm.py found worth building on.
+
+THE PATTERN  A stock that closes on its upper price band (5/10/20%) reached
+             +4% above that close the next session 74% of the time over 261
+             sessions, and a buy-at-close / sell-at-gap-or-+4%-or-close trade
+             averaged +2.4% to +3.6% gross. Off the band, closing at the high
+             does nothing.
+
+THE UNKNOWN  Whether the buy fills. A stock pinned at its upper circuit has a
+             queue of buyers and often no sellers; the bhavcopy cannot say
+             whether an order at that price would have been hit. That is what
+             this tracker exists to measure before any of it reaches the app.
+
+Flow, one row per candidate per session in data/cache/carry_log.csv:
+
+    snap   ~15:20-15:28 IST. Groww live prices for the liquid universe, then a
+           per-symbol quote for names up >= 4.5% at their high: circuit limit,
+           total buy / sell quantity. `total_sell_quantity == 0` at the
+           circuit means nothing is on offer -- the order would sit in the
+           queue. Circuit limits roll to the next session after the close, so
+           this only works while the market is open.
+    eod    Same candidates rebuilt from a bhavcopy, with no order book. Used to
+           backfill the log so scoring can start immediately; rows are tagged
+           source=eod and never count toward the fill question.
+    score  After ~18:30 IST once the next session's bhavcopy is out. Fills in
+           the official entry close and the next session's outcome.
+
+Re-running `snap` or `eod` for the same date replaces that date's rows of the
+same source.
+"""
+
+from __future__ import annotations
+
+from datetime import date, datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
+
+import numpy as np
+import pandas as pd
+
+import fetch
+
+LOG_PATH = fetch.CACHE_DIR / "carry_log.csv"
+
+EVENT = 0.04
+BANDS = (0.05, 0.10, 0.20)
+MIN_PRICE = 20.0
+MIN_TURN_LACS = 100.0
+MIN_HIST = 60
+PRE_PCHANGE = 4.5        # % -- below this no 5/10/20% band is reachable
+AT_HIGH = 0.999
+COST = 0.0025            # delivery round trip, for the net column in report
+
+COLUMNS = [
+    "as_of", "source", "logged_at", "symbol", "sector", "prev_close", "ltp",
+    "high", "pchange", "upper_circuit", "band", "at_circuit",
+    "total_buy_qty", "total_sell_qty", "fillable", "volume", "med_turn20",
+    # filled by score()
+    "entry_close", "closed_at_circuit", "nx_date", "nx_open", "nx_high",
+    "nx_low", "nx_close", "gap", "reach", "hit4", "btst",
+]
+
+
+# --------------------------------------------------------------------------
+# Universe
+# --------------------------------------------------------------------------
+
+def _hist_files(end: date, n: int) -> pd.DataFrame:
+    """The last `n` sessions up to and including `end`, from cache or NSE."""
+    return fetch.load_history(end, n, verbose=False)
+
+
+def universe(end: date) -> pd.DataFrame:
+    """Liquid EQ companies as of the last session on or before `end`."""
+    raw = _hist_files(end, MIN_HIST + 5)
+    df = raw[raw["series"].str.upper() == "EQ"]
+    eq_list = fetch.CACHE_DIR / "equity_list.csv"
+    if eq_list.exists():
+        names = set(pd.read_csv(eq_list)["symbol"].astype(str).str.strip())
+        df = df[df["symbol"].isin(names)]
+    df = df.sort_values(["symbol", "date"])
+    g = df.groupby("symbol")
+    out = pd.DataFrame({
+        "n_hist": g.size(),
+        "med_turn20": g["turnover"].apply(lambda s: s.tail(20).median()),
+        "last_close": g["close"].last(),
+    })
+    # load_history stops at MIN_HIST + 5 sessions, so n_hist is capped there;
+    # the check is "has a full window", not "has 60 sessions in total".
+    out = out[(out["n_hist"] >= MIN_HIST)
+              & (out["med_turn20"] >= MIN_TURN_LACS)
+              & (out["last_close"] >= MIN_PRICE)]
+    out = out.reset_index()
+    out["sector"] = out["symbol"].map(_sector_map()).fillna("Unknown")
+    return out
+
+
+def _sector_map() -> dict:
+    path = fetch.CACHE_DIR / "sector_map.json"
+    if not path.exists():
+        return {}
+    smap = pd.read_json(path, orient="index")
+    return smap["basic_industry"].dropna().to_dict()
+
+
+def _band_of(pct: float) -> float:
+    """Nearest price band to a % change; NaN if the move is not on one."""
+    for b in BANDS:
+        if abs(pct - b) < 0.003:
+            return b
+    return np.nan
+
+
+# --------------------------------------------------------------------------
+# Live snapshot
+# --------------------------------------------------------------------------
+
+def _depth_one(groww, symbol: str) -> dict | None:
+    try:
+        q = groww.get_quote(exchange=groww.EXCHANGE_NSE,
+                            segment=groww.SEGMENT_CASH, trading_symbol=symbol)
+    except Exception as exc:
+        print(f"  quote {symbol}: {exc}")
+        return None
+    if not isinstance(q, dict):
+        return None
+    return {
+        "symbol": symbol,
+        "upper_circuit": q.get("upper_circuit_limit"),
+        "total_buy_qty": q.get("total_buy_quantity"),
+        "total_sell_qty": q.get("total_sell_quantity"),
+        "volume": q.get("volume"),
+        "q_ltp": q.get("last_price"),
+    }
+
+
+def snapshot(on_progress=None) -> pd.DataFrame:
+    """Today's at-circuit candidates with the order book behind them."""
+    today = date.today()
+    uni = universe(today - timedelta(days=1))
+    print(f"  universe: {len(uni):,} liquid names")
+    live = fetch.live_quotes_groww(uni["symbol"].tolist(), on_progress=on_progress)
+    if live.empty:
+        raise RuntimeError("Groww returned no prices; is the market open?")
+    m = live.merge(uni[["symbol", "sector", "med_turn20"]], on="symbol")
+    pre = m[(m["pchange"] >= PRE_PCHANGE) & (m["ltp"] >= m["high"] * AT_HIGH)].copy()
+    print(f"  {len(pre)} names up >= {PRE_PCHANGE}% and at their high; reading order books…")
+    if pre.empty:
+        return pd.DataFrame(columns=COLUMNS)
+
+    groww = fetch._get_groww_client()
+    with ThreadPoolExecutor(max_workers=fetch.GROWW_QUOTE_WORKERS) as pool:
+        depth = [d for d in pool.map(lambda s: _depth_one(groww, s), pre["symbol"]) if d]
+    pre = pre.drop(columns=["volume", "turnover", "time"], errors="ignore")
+    pre = pre.merge(pd.DataFrame(depth), on="symbol", how="left")
+    for c in ("upper_circuit", "total_buy_qty", "total_sell_qty", "volume", "q_ltp"):
+        pre[c] = pd.to_numeric(pre[c], errors="coerce")
+    # The per-symbol quote is a few seconds fresher than the batch LTP.
+    pre["ltp"] = pre["q_ltp"].fillna(pre["ltp"])
+    pre["at_circuit"] = pre["ltp"] >= pre["upper_circuit"] * AT_HIGH
+    pre["band"] = (pre["upper_circuit"] / pre["prev_close"] - 1).round(2)
+    pre["fillable"] = pre["total_sell_qty"].fillna(0) > 0
+
+    pre["as_of"] = today.isoformat()
+    pre["source"] = "live"
+    pre["logged_at"] = datetime.now().isoformat(timespec="seconds")
+    return pre.reindex(columns=COLUMNS)
+
+
+# --------------------------------------------------------------------------
+# EOD backfill
+# --------------------------------------------------------------------------
+
+def from_bhavcopy(d: date) -> pd.DataFrame:
+    """Candidates for session `d` rebuilt from its bhavcopy. No order book."""
+    day = fetch.fetch_bhavcopy(d)
+    if day is None or day.empty:
+        return pd.DataFrame(columns=COLUMNS)
+    uni = universe(d - timedelta(days=1))
+    m = day.merge(uni[["symbol", "sector", "med_turn20"]], on="symbol")
+    m = m[m["series"].str.upper() == "EQ"]
+    ret = m["close"] / m["prev_close"] - 1
+    m["band"] = ret.map(_band_of)
+    m = m[(m["close"] >= m["high"] * AT_HIGH) & m["band"].notna()].copy()
+    m["pchange"] = (m["close"] / m["prev_close"] - 1) * 100
+    m["ltp"] = m["close"]
+    m["upper_circuit"] = m["close"]
+    m["at_circuit"] = True
+    m["as_of"] = d.isoformat()
+    m["source"] = "eod"
+    m["logged_at"] = datetime.now().isoformat(timespec="seconds")
+    return m.reindex(columns=COLUMNS)
+
+
+# --------------------------------------------------------------------------
+# Log
+# --------------------------------------------------------------------------
+
+def load_log() -> pd.DataFrame:
+    if not LOG_PATH.exists():
+        return pd.DataFrame(columns=COLUMNS)
+    return pd.read_csv(LOG_PATH).reindex(columns=COLUMNS)
+
+
+def append(rows: pd.DataFrame) -> int:
+    """Replace this (as_of, source) slice of the log with `rows`."""
+    if rows is None or rows.empty:
+        return 0
+    fetch.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    log = load_log()
+    keys = set(zip(rows["as_of"].astype(str), rows["source"].astype(str)))
+    if not log.empty:
+        mine = [k in keys for k in zip(log["as_of"].astype(str), log["source"].astype(str))]
+        log = log[~np.array(mine, dtype=bool)]
+    out = pd.concat([log, rows], ignore_index=True) if not log.empty else rows
+    out.sort_values(["as_of", "source", "symbol"]).to_csv(LOG_PATH, index=False)
+    return int(len(rows))
+
+
+def _next_session(d: date, limit: int = 7) -> tuple[date, pd.DataFrame] | None:
+    for k in range(1, limit + 1):
+        nd = d + timedelta(days=k)
+        if nd >= date.today() + timedelta(days=1):
+            return None
+        if nd.weekday() >= 5:
+            continue
+        df = fetch.fetch_bhavcopy(nd)
+        if df is not None and not df.empty:
+            return nd, df
+    return None
+
+
+def score() -> tuple[int, int]:
+    """Fill outcomes for every row whose next session is now published."""
+    log = load_log()
+    if log.empty:
+        return 0, 0
+    for c in ("closed_at_circuit", "nx_date"):
+        log[c] = log[c].astype(object)
+    todo = log["btst"].isna()
+    filled = 0
+    for as_of in sorted(log.loc[todo, "as_of"].astype(str).unique()):
+        d = date.fromisoformat(as_of)
+        today_bhav = fetch.fetch_bhavcopy(d)
+        nxt = _next_session(d)
+        if today_bhav is None or nxt is None:
+            continue
+        nd, nx = nxt
+        cur = today_bhav.set_index("symbol")
+        nx = nx.set_index("symbol")
+        idx = log.index[todo & (log["as_of"].astype(str) == as_of)]
+        for i in idx:
+            sym = log.at[i, "symbol"]
+            if sym not in cur.index or sym not in nx.index:
+                continue
+            c = cur.loc[sym]
+            n = nx.loc[sym]
+            if isinstance(c, pd.DataFrame):
+                c = c.iloc[0]
+            if isinstance(n, pd.DataFrame):
+                n = n.iloc[0]
+            # The next session's PREV_CLOSE is the official close, adjusted if
+            # the name went ex overnight -- the right base for every return.
+            base = float(n["prev_close"])
+            gap = float(n["open"]) / base - 1
+            reach = float(n["high"]) / base - 1
+            ret = float(n["close"]) / base - 1
+            uc = log.at[i, "upper_circuit"]
+            log.at[i, "entry_close"] = float(c["close"])
+            log.at[i, "closed_at_circuit"] = (
+                bool(float(c["close"]) >= float(uc) * AT_HIGH) if pd.notna(uc) else np.nan)
+            log.at[i, "nx_date"] = nd.isoformat()
+            log.at[i, "nx_open"] = float(n["open"])
+            log.at[i, "nx_high"] = float(n["high"])
+            log.at[i, "nx_low"] = float(n["low"])
+            log.at[i, "nx_close"] = float(n["close"])
+            log.at[i, "gap"] = gap
+            log.at[i, "reach"] = reach
+            log.at[i, "hit4"] = float(reach >= EVENT)
+            log.at[i, "btst"] = gap if gap >= EVENT else (EVENT if reach >= EVENT else ret)
+            filled += 1
+    log.to_csv(LOG_PATH, index=False)
+    return filled, int(log["btst"].isna().sum())
+
+
+def report(log: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Per-bucket results. Only at-circuit rows count; live rows split by fill."""
+    log = load_log() if log is None else log
+    s = log[log["btst"].notna()].copy()
+    if s.empty:
+        return pd.DataFrame()
+    s["at_circuit"] = s["at_circuit"].astype(str).str.lower().isin(["true", "1", "1.0"])
+    s["fillable"] = s["fillable"].astype(str).str.lower().isin(["true", "1", "1.0"])
+    s = s[s["at_circuit"]]
+
+    def bucket(r):
+        if r["source"] == "eod":
+            return "eod backfill (fill unknown)"
+        return "live: sellers present" if r["fillable"] else "live: no sellers (queue)"
+
+    s["bucket"] = s.apply(bucket, axis=1)
+    rows = []
+    for name, g in list(s.groupby("bucket")) + [("all live", s[s["source"] == "live"])]:
+        if g.empty:
+            continue
+        rows.append({
+            "bucket": name, "n": len(g), "sessions": g["as_of"].nunique(),
+            "hit4": g["hit4"].mean(),
+            "gap4": (g["gap"] >= EVENT).mean(),
+            "mean_btst": g["btst"].mean(),
+            "median_btst": g["btst"].median(),
+            "net_mean": g["btst"].mean() - COST,
+            "win_rate": (g["btst"] > 0).mean(),
+            "worst": g["btst"].min(),
+        })
+    return pd.DataFrame(rows)

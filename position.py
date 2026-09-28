@@ -89,6 +89,13 @@ SKIP = 20         # most recent sessions excluded (the reversal month)
 # enough for the daily median to mean something.
 REST_TOP_N = 20
 
+# A leader has to lead the market, not just the coil pool. Ranked against the
+# whole eligible universe, the bottom half of 12-1 measured -0.85% at 7
+# sessions, so a thin pool must not promote those names into the top 20.
+REST_MIN_PCTILE = 0.70
+
+TRADING_DAYS = 252
+
 
 @dataclass(frozen=True)
 class PositionParams:
@@ -115,6 +122,17 @@ def add_position_features(df: pd.DataFrame) -> pd.DataFrame:
     # back out, rather than subtracted, so it compounds correctly.
     df["mom12_1"] = (1 + r_long) / (1 + r_recent).replace(0, np.nan) - 1
     df["mom20"] = r_recent
+
+    # Volatility over the same t-250..t-20 window the return covers. Raw 12-1
+    # is dominated by the most volatile small caps, which are also the names
+    # that crash hardest in a reversal; dividing by vol ranks the steadiest
+    # trends first.
+    daily = g["adj"].pct_change()
+    span = FORMATION - SKIP
+    df["vol12_1"] = daily.groupby(df["symbol"], sort=False).transform(
+        lambda s: s.shift(SKIP).rolling(span, min_periods=int(span * 0.8)).std()
+    ) * np.sqrt(TRADING_DAYS)
+    df["mom_vadj"] = df["mom12_1"] / df["vol12_1"].replace(0, np.nan)
 
     if "med_turn60" not in df.columns:
         df["med_turn60"] = g["turnover"].transform(
@@ -196,42 +214,74 @@ def scan(stocks: pd.DataFrame, as_of=None, top_n: int | None = 40,
     return out[[c for c in cols if c in out.columns]].reset_index(drop=True)
 
 
-def leaders_at_rest(coil_rows: pd.DataFrame, stocks: pd.DataFrame,
-                    as_of=None, top_n: int | None = REST_TOP_N) -> pd.DataFrame:
+def annotate_momentum(coil_rows: pd.DataFrame, stocks: pd.DataFrame,
+                      as_of=None,
+                      params: PositionParams | None = None) -> pd.DataFrame:
     """
-    The coil pool ranked by 12-1 momentum, strongest year first.
+    Stamp every coil row with its momentum readings and whether it may lead.
+
+    `mom_pct` is the 12-1 percentile against the whole eligible universe that
+    day, not against the coil pool, so it means the same thing however many
+    coils there are. `rest_ok` is the Leaders at rest entry test: tradable at
+    the liquidity the momentum evidence was measured on, in the top 30% of
+    the market, and not in a sector the scan has disqualified.
+    """
+    out = coil_rows.copy()
+    for c in ("mom12_1", "mom_vadj", "mom_pct"):
+        out[c] = np.nan
+    out["rest_ok"] = False
+    if out.empty or stocks is None or stocks.empty or "mom12_1" not in stocks.columns:
+        return out
+
+    p = params or PositionParams()
+    as_of = stocks["date"].max() if as_of is None else pd.Timestamp(as_of)
+    day = stocks[stocks["date"] == as_of].drop_duplicates("symbol").set_index("symbol")
+    if day.empty:
+        return out
+
+    ok = eligible(day.reset_index(), p).to_numpy()
+    elig = day[ok]
+    pct = pd.to_numeric(elig["mom12_1"], errors="coerce").rank(pct=True)
+
+    out["mom12_1"] = out["symbol"].map(day["mom12_1"])
+    if "mom_vadj" in day.columns:
+        out["mom_vadj"] = out["symbol"].map(day["mom_vadj"])
+    out["mom_pct"] = out["symbol"].map(pct)
+
+    not_dq = (out["sector_klass"] != "DISQUALIFIED") if "sector_klass" in out.columns else True
+    out["rest_ok"] = (out["mom_pct"] >= REST_MIN_PCTILE).fillna(False) & not_dq
+    return out
+
+
+def leaders_at_rest(coil_rows: pd.DataFrame, stocks: pd.DataFrame,
+                    as_of=None, top_n: int | None = REST_TOP_N,
+                    params: PositionParams | None = None) -> pd.DataFrame:
+    """
+    Coiled market leaders, steadiest strong year first.
 
     A name qualifies on the coil gates -- quiet, tight, near its highs -- and
-    is then ORDERED by how strong its last year was. So this is a proven
-    leader taking a rest, which is why it reads better than either parent
-    list: the coil gates time the entry and momentum picks which bases are
+    must then pass `annotate_momentum`'s entry test. Survivors are ORDERED by
+    volatility-adjusted 12-1 momentum. So this is a proven leader taking a
+    rest: the coil gates time the entry and momentum picks which bases are
     worth waiting on.
 
-    This is the one list in the app where sort order carries information. The
-    coil score does not rank outcomes at all and the Expected Movers score
-    ranked them backwards, but 12-1 momentum orders them monotonically (top 5%
-    +0.73% at 7 sessions down to -0.85% for the bottom half).
+    The entry floor uses raw 12-1 percentile because that is the reading the
+    monotonic evidence was measured on (top 5% +0.73% at 7 sessions down to
+    -0.85% for the bottom half). The ORDER uses the vol-adjusted reading,
+    which is not yet measured on this data -- re-run eval_listsize.py.
 
-    `coil_rows` = stocks.scan() output. `stocks` needs `mom12_1`, so pass an
-    add_position_features() frame. Names without a 12-1 reading -- anything
-    under 270 sessions of history -- rank last rather than being dropped, so a
-    thin cache degrades to the unranked pool instead of an empty list.
+    `coil_rows` = stocks.scan() output, ideally carrying `sector_klass`.
+    `stocks` needs add_position_features(). Names without a 12-1 reading
+    (under 270 sessions of history) cannot pass the floor and are left out,
+    so a thin cache yields a short or empty list rather than an unranked one.
     """
     if coil_rows is None or coil_rows.empty:
         return coil_rows if coil_rows is not None else pd.DataFrame()
 
-    out = coil_rows.copy()
-    if stocks is not None and not stocks.empty and "mom12_1" in stocks.columns:
-        as_of = stocks["date"].max() if as_of is None else pd.Timestamp(as_of)
-        day = stocks[stocks["date"] == as_of]
-        mom = day.set_index("symbol")["mom12_1"]
-        out["mom12_1"] = out["symbol"].map(mom)
-    elif "mom12_1" not in out.columns:
-        out["mom12_1"] = np.nan
-
-    # na_position="last" is the degradation path: no reading means unranked,
-    # not excluded.
-    out = out.sort_values("mom12_1", ascending=False, na_position="last")
+    out = annotate_momentum(coil_rows, stocks, as_of=as_of, params=params)
+    out = out[out["rest_ok"]]
+    key = "mom_vadj" if out["mom_vadj"].notna().any() else "mom12_1"
+    out = out.sort_values(key, ascending=False, na_position="last")
     if top_n is not None:
         out = out.head(top_n)
     return out.reset_index(drop=True)
