@@ -13,7 +13,8 @@ THE UNKNOWN  Whether the buy fills. A stock pinned at its upper circuit has a
              whether an order at that price would have been hit. That is what
              this tracker exists to measure before any of it reaches the app.
 
-Flow, one row per candidate per session in data/cache/carry_log.csv:
+Flow, one row per candidate per session in the Supabase `carry_log` table
+(schema in db.py):
 
     snap   ~15:20-15:28 IST. Groww live prices for the liquid universe, then a
            per-symbol quote for names up >= 4.5% at their high: circuit limit,
@@ -39,9 +40,8 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import pandas as pd
 
+import db
 import fetch
-
-LOG_PATH = fetch.CACHE_DIR / "carry_log.csv"
 
 EVENT = 0.04
 BANDS = (0.05, 0.10, 0.20)
@@ -198,24 +198,21 @@ def from_bhavcopy(d: date) -> pd.DataFrame:
 # --------------------------------------------------------------------------
 
 def load_log() -> pd.DataFrame:
-    if not LOG_PATH.exists():
+    log = db.get_carry_log()
+    if log.empty:
         return pd.DataFrame(columns=COLUMNS)
-    return pd.read_csv(LOG_PATH).reindex(columns=COLUMNS)
+    log = log.reindex(columns=COLUMNS)
+    for c in ("prev_close", "ltp", "high", "pchange", "upper_circuit", "band",
+              "total_buy_qty", "total_sell_qty", "volume", "med_turn20",
+              "entry_close", "nx_open", "nx_high", "nx_low", "nx_close",
+              "gap", "reach", "btst"):
+        log[c] = pd.to_numeric(log[c], errors="coerce")
+    return log
 
 
 def append(rows: pd.DataFrame) -> int:
     """Replace this (as_of, source) slice of the log with `rows`."""
-    if rows is None or rows.empty:
-        return 0
-    fetch.CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    log = load_log()
-    keys = set(zip(rows["as_of"].astype(str), rows["source"].astype(str)))
-    if not log.empty:
-        mine = [k in keys for k in zip(log["as_of"].astype(str), log["source"].astype(str))]
-        log = log[~np.array(mine, dtype=bool)]
-    out = pd.concat([log, rows], ignore_index=True) if not log.empty else rows
-    out.sort_values(["as_of", "source", "symbol"]).to_csv(LOG_PATH, index=False)
-    return int(len(rows))
+    return db.replace_carry_slice(rows)
 
 
 def _next_session(d: date, limit: int = 7) -> tuple[date, pd.DataFrame] | None:
@@ -236,10 +233,10 @@ def score() -> tuple[int, int]:
     log = load_log()
     if log.empty:
         return 0, 0
-    for c in ("closed_at_circuit", "nx_date"):
+    for c in ("closed_at_circuit", "nx_date", "hit4"):
         log[c] = log[c].astype(object)
     todo = log["btst"].isna()
-    filled = 0
+    scored: list = []
     for as_of in sorted(log.loc[todo, "as_of"].astype(str).unique()):
         d = date.fromisoformat(as_of)
         today_bhav = fetch.fetch_bhavcopy(d)
@@ -277,11 +274,11 @@ def score() -> tuple[int, int]:
             log.at[i, "nx_close"] = float(n["close"])
             log.at[i, "gap"] = gap
             log.at[i, "reach"] = reach
-            log.at[i, "hit4"] = float(reach >= EVENT)
+            log.at[i, "hit4"] = bool(reach >= EVENT)
             log.at[i, "btst"] = gap if gap >= EVENT else (EVENT if reach >= EVENT else ret)
-            filled += 1
-    log.to_csv(LOG_PATH, index=False)
-    return filled, int(log["btst"].isna().sum())
+            scored.append(i)
+    db.upsert_carry(log.loc[scored])
+    return len(scored), int(log["btst"].isna().sum())
 
 
 def report(log: pd.DataFrame | None = None) -> pd.DataFrame:
@@ -290,6 +287,7 @@ def report(log: pd.DataFrame | None = None) -> pd.DataFrame:
     s = log[log["btst"].notna()].copy()
     if s.empty:
         return pd.DataFrame()
+    s["hit4"] = s["hit4"].astype(str).str.lower().isin(["true", "1", "1.0"]).astype(float)
     s["at_circuit"] = s["at_circuit"].astype(str).str.lower().isin(["true", "1", "1.0"])
     s["fillable"] = s["fillable"].astype(str).str.lower().isin(["true", "1", "1.0"])
     s = s[s["at_circuit"]]

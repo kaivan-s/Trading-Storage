@@ -108,6 +108,43 @@ CREATE TABLE base_episodes (
     UNIQUE(symbol, started_on)
 );
 
+-- Upper-circuit carry paper tracker (carry.py). One row per candidate per
+-- session per source ('live' snapshot at 15:22 IST, or 'eod' backfill).
+-- Outcome columns stay NULL until the next session's bhavcopy scores them.
+CREATE TABLE carry_log (
+    id BIGSERIAL PRIMARY KEY,
+    as_of DATE NOT NULL,
+    source TEXT NOT NULL,
+    logged_at TIMESTAMPTZ,
+    symbol TEXT NOT NULL,
+    sector TEXT,
+    prev_close NUMERIC,
+    ltp NUMERIC,
+    high NUMERIC,
+    pchange NUMERIC,
+    upper_circuit NUMERIC,
+    band NUMERIC,
+    at_circuit BOOLEAN,
+    total_buy_qty BIGINT,
+    total_sell_qty BIGINT,
+    fillable BOOLEAN,
+    volume BIGINT,
+    med_turn20 NUMERIC,
+    entry_close NUMERIC,
+    closed_at_circuit BOOLEAN,
+    nx_date DATE,
+    nx_open NUMERIC,
+    nx_high NUMERIC,
+    nx_low NUMERIC,
+    nx_close NUMERIC,
+    gap NUMERIC,
+    reach NUMERIC,
+    hit4 BOOLEAN,
+    btst NUMERIC,
+    UNIQUE(as_of, source, symbol)
+);
+CREATE INDEX idx_carry_log_as_of ON carry_log(as_of);
+
 CREATE INDEX idx_base_episodes_state ON base_episodes(state, resolved_on);
 CREATE INDEX idx_base_episodes_since ON base_episodes(state_since);
 
@@ -1460,3 +1497,64 @@ def get_published_coils(limit: int = 20000) -> dict[str, list[str]]:
         if d and s:
             out.setdefault(d, []).append(s)
     return out
+
+
+# --------------------------------------------------------------------------
+# Upper-circuit carry paper tracker
+# --------------------------------------------------------------------------
+
+_CARRY_INT = ("total_buy_qty", "total_sell_qty", "volume")
+_CARRY_BOOL = ("at_circuit", "fillable", "closed_at_circuit", "hit4")
+
+
+def _carry_record(row: dict) -> dict:
+    rec = _row_dict(row)
+    for c in _CARRY_INT:
+        if c in rec:
+            rec[c] = _int(rec[c])
+    for c in _CARRY_BOOL:
+        if c in rec and rec[c] is not None:
+            rec[c] = str(rec[c]).lower() in ("true", "1", "1.0")
+    for c in ("as_of", "nx_date"):
+        if rec.get(c):
+            rec[c] = str(rec[c])[:10]
+    rec.pop("id", None)
+    return rec
+
+
+def replace_carry_slice(rows: pd.DataFrame) -> int:
+    """Replace each (as_of, source) slice present in `rows` with `rows`."""
+    if rows is None or rows.empty:
+        return 0
+    client = get_client()
+    for as_of, source in set(zip(rows["as_of"].astype(str), rows["source"].astype(str))):
+        client.table("carry_log").delete().eq("as_of", as_of).eq("source", source).execute()
+    records = [_carry_record(r) for r in rows.to_dict("records")]
+    result = client.table("carry_log").insert(records).execute()
+    return len(result.data or [])
+
+
+def upsert_carry(rows: pd.DataFrame) -> int:
+    """Write scored rows back, matched on (as_of, source, symbol)."""
+    if rows is None or rows.empty:
+        return 0
+    records = [_carry_record(r) for r in rows.to_dict("records")]
+    result = get_client().table("carry_log").upsert(
+        records, on_conflict="as_of,source,symbol").execute()
+    return len(result.data or [])
+
+
+def get_carry_log(page: int = 1000) -> pd.DataFrame:
+    """Every carry row, paged past PostgREST's 1,000-row cap."""
+    client = get_client()
+    out, start = [], 0
+    while True:
+        r = (client.table("carry_log").select("*")
+             .order("as_of").order("id")
+             .range(start, start + page - 1).execute())
+        batch = r.data or []
+        out.extend(batch)
+        if len(batch) < page:
+            break
+        start += page
+    return pd.DataFrame(out)

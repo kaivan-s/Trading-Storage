@@ -288,7 +288,7 @@ def cmd_carry(args):
             n = carry.append(carry.from_bhavcopy(d))
             total += n
             print(f"  {d}: {n} at-circuit closes")
-        print(f"\n{total} eod rows logged to {carry.LOG_PATH}")
+        print(f"\n{total} eod rows logged to Supabase carry_log")
         return
 
     if args.action == "score":
