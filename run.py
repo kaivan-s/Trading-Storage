@@ -299,7 +299,8 @@ def cmd_carry(args):
     if rep.empty:
         print("Nothing scored yet.")
         return
-    pct = ["hit4", "gap4", "mean_btst", "median_btst", "net_mean", "win_rate", "worst"]
+    pct = ["hit4", "gap4", "mean_btst", "median_btst", "net_mean", "win_rate",
+           "open_trade", "worst"]
     show = rep.copy()
     for c in pct:
         show[c] = (show[c] * 100).round(1)

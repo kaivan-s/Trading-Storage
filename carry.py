@@ -74,7 +74,13 @@ def _hist_files(end: date, n: int) -> pd.DataFrame:
 def universe(end: date) -> pd.DataFrame:
     """Liquid EQ companies as of the last session on or before `end`."""
     raw = _hist_files(end, MIN_HIST + 5)
-    df = raw[raw["series"].str.upper() == "EQ"]
+    # History counts BE sessions too: names move between EQ and trade-for-trade
+    # often, and an EQ-only count drops them for weeks after they move back --
+    # which is exactly when they tend to run into the upper band.
+    df = raw[raw["series"].str.upper().isin(["EQ", "BE"])]
+    on_eq = set(df.loc[(df["date"] == df["date"].max())
+                       & (df["series"].str.upper() == "EQ"), "symbol"])
+    df = df[df["symbol"].isin(on_eq)]
     eq_list = fetch.CACHE_DIR / "equity_list.csv"
     if eq_list.exists():
         names = set(pd.read_csv(eq_list)["symbol"].astype(str).str.strip())
@@ -298,8 +304,16 @@ def report(log: pd.DataFrame | None = None) -> pd.DataFrame:
         return "live: sellers present" if r["fillable"] else "live: no sellers (queue)"
 
     s["bucket"] = s.apply(bucket, axis=1)
+    # Buying at the next open sidesteps the circuit queue entirely. Over the
+    # year it only paid on the 20% band (+1.1%), so it is reported per band.
+    touched = s["nx_high"] / s["nx_open"] - 1 >= EVENT
+    s["open_tr"] = np.where(touched, EVENT, s["nx_close"] / s["nx_open"] - 1)
+    band = pd.to_numeric(s["band"], errors="coerce").round(2)
+    s["band_bucket"] = "band " + (band * 100).round().astype("Int64").astype(str) + "%"
     rows = []
-    for name, g in list(s.groupby("bucket")) + [("all live", s[s["source"] == "live"])]:
+    groups = (list(s.groupby("bucket")) + [("all live", s[s["source"] == "live"])]
+              + list(s.groupby("band_bucket")))
+    for name, g in groups:
         if g.empty:
             continue
         rows.append({
@@ -310,6 +324,7 @@ def report(log: pd.DataFrame | None = None) -> pd.DataFrame:
             "median_btst": g["btst"].median(),
             "net_mean": g["btst"].mean() - COST,
             "win_rate": (g["btst"] > 0).mean(),
+            "open_trade": g["open_tr"].mean(),
             "worst": g["btst"].min(),
         })
     return pd.DataFrame(rows)
