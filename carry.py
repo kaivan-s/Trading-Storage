@@ -433,13 +433,23 @@ def intraday_payload(as_of: str | None = None) -> dict:
         }
     
     # List of scan times we have
-    scans = sorted(df["scan_time"].unique())
+    scans = sorted(df["scan_time"].unique().tolist())
     latest_time = scans[-1] if scans else None
     
     # Latest scan results
     latest = df[df["scan_time"] == latest_time].copy() if latest_time else pd.DataFrame()
     
     # Track progression: how each stock moved through statuses during the day
+    def _py(v):
+        """Convert numpy types to Python natives for JSON."""
+        if pd.isna(v):
+            return None
+        if isinstance(v, (np.bool_, np.integer)):
+            return bool(v) if isinstance(v, np.bool_) else int(v)
+        if isinstance(v, np.floating):
+            return float(v)
+        return v
+
     progression = []
     for symbol in df["symbol"].unique():
         sym_df = df[df["symbol"] == symbol].sort_values("scan_time")
@@ -448,9 +458,9 @@ def intraday_payload(as_of: str | None = None) -> dict:
             history.append({
                 "time": row["scan_time"],
                 "status": row["status"],
-                "pchange": row["pchange"],
-                "distance": row["distance_to_circuit"],
-                "fillable": row.get("fillable"),
+                "pchange": _py(row["pchange"]),
+                "distance": _py(row["distance_to_circuit"]),
+                "fillable": _py(row.get("fillable")),
             })
         
         last = sym_df.iloc[-1]
@@ -458,11 +468,11 @@ def intraday_payload(as_of: str | None = None) -> dict:
             "symbol": symbol,
             "sector": last["sector"],
             "current_status": last["status"],
-            "current_price": last["ltp"],
-            "pchange": last["pchange"],
-            "band": last["band"],
-            "distance_to_circuit": last["distance_to_circuit"],
-            "fillable": last.get("fillable"),
+            "current_price": _py(last["ltp"]),
+            "pchange": _py(last["pchange"]),
+            "band": _py(last["band"]),
+            "distance_to_circuit": _py(last["distance_to_circuit"]),
+            "fillable": _py(last.get("fillable")),
             "first_seen": sym_df["scan_time"].min(),
             "times_seen": len(sym_df),
             "history": history,
