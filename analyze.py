@@ -25,12 +25,17 @@ PHASES = {
     "watching": "Watching",
 }
 
+# Structural states, not instructions. Each name describes where the last close
+# sits relative to the 20-day base, the trigger and the ATR stop level — which
+# is an observation about the chart, not a recommendation to transact. The keys
+# are internal and load-bearing (test_pipeline, StockDrawer colour map); only
+# the labels are user-facing.
 ACTIONS = {
-    "buy": "Buy",
-    "add": "Add",
-    "hold": "Hold",
-    "sell": "Sell",
-    "wait": "Wait",
+    "buy": "At trigger",
+    "add": "At pullback line",
+    "hold": "Structure intact",
+    "sell": "Structure broken",
+    "wait": "Pre-trigger",
 }
 
 
@@ -119,10 +124,11 @@ def explain(report: dict) -> str:
     if phase == "broke_out":
         br = report.get("breakout") or {}
         if br.get("why"):
-            return br["why"] + " Still check CMF and delivery — this is confirmation, not a market order."
+            return br["why"] + " Still check CMF and delivery — this is confirmation, not an execution level."
         return (
             f"{symbol} has closed through its trigger on rising volume. "
-            "That is the confirmation the setup was waiting for — not a buy at any price."
+            "That is the confirmation the setup was waiting for; the structure "
+            "is defined at the trigger, not above it."
         )
 
     if phase == "potential":
@@ -131,8 +137,8 @@ def explain(report: dict) -> str:
             return why
         return (
             f"{symbol} is a potential breakout: coiled under the 20-day high "
-            f"inside a clean {sector} pullback. Put an alert at the trigger; "
-            "do not buy today's close."
+            f"inside a clean {sector} pullback. The structural trigger sits "
+            "above today's close, so nothing is confirmed yet."
         )
 
     if phase == "coiled":
@@ -158,7 +164,7 @@ def explain(report: dict) -> str:
         late = rsi is not None and rsi > 68
         extra = (
             f" RSI is {rsi:.0f} — the first push is already spent, so this is "
-            "a late first unit, not a coil."
+            "a late-stage break, not a coil."
             if late else
             " Coil filters fail on purpose: this is the loud day, not the quiet base."
         )
@@ -188,7 +194,7 @@ def explain(report: dict) -> str:
         fail_s = " Fails: " + "; ".join(x[0].lower() + x[1:] for x in failed[:3]) + "."
     return (
         f"{symbol} is not in a coil or a confirmed breakout. {where}"
-        f"{sector} is {klass}.{fail_s} Nothing here is a buy."
+        f"{sector} is {klass}.{fail_s} No structural setup here."
     )
 
 
@@ -204,7 +210,8 @@ def _round_px(v: float | None) -> float | None:
 
 
 def suggested_entry(report: dict) -> float | None:
-    """The price this system would act at, if it acts at all."""
+    """The structural reference price: the trigger where there is one, else the
+    last close. Used as the origin for the stop and 2R arithmetic below."""
     m = report.get("metrics") or {}
     phase = report.get("phase")
     trigger = m.get("trigger")
@@ -216,11 +223,14 @@ def suggested_entry(report: dict) -> float | None:
 
 def trade_plan(report: dict, entry=None) -> dict:
     """
-    Long-only plan from this system's structure: 20-day base, ATR, trigger.
+    Structural readout of one symbol against its own 20-day base, ATR and
+    trigger. Describes where price sits; it does not say what to do about it.
 
-    Not a validated edge. The stop is where the base is wrong; the target is
-    2R plus a measured move. Action assumes a long from `entry` (or the
-    suggested entry if omitted).
+    Every level here is arithmetic from the base, not a validated edge and not
+    a recommendation: `stop` is the price at which the 20-day base no longer
+    holds, `target` is twice that distance from the reference price, `target2`
+    is the measured move. All of it is computed from `entry` (or the structural
+    reference price when omitted).
     """
     m = report.get("metrics") or {}
     phase = report.get("phase")
@@ -257,7 +267,8 @@ def trade_plan(report: dict, entry=None) -> dict:
         "risk": None,
         "reward": None,
         "rr": None,
-        "why": "Need a positive entry price and enough history to place a stop.",
+        "why": ("Need a positive reference price and enough history to compute "
+                "the structure level."),
     }
     if entry is None or px is None:
         return empty
@@ -323,86 +334,88 @@ def trade_plan(report: dict, entry=None) -> dict:
     if in_position and px <= stop:
         action = "sell"
         why = (
-            f"Last close {px:.2f} is at or through the stop {stop:.2f}. "
-            "The base is wrong from this entry — exit."
+            f"Last close {px:.2f} is at or through the structure level "
+            f"{stop:.2f}. The 20-day base no longer holds from the reference "
+            f"price {entry:.2f}."
         )
     elif failed:
         action = "sell"
         why = (
-            f"Back under the trigger at {trigger:.2f} with CMF negative. "
-            "Treat this as a failed breakout and get out."
+            f"Price is back under the trigger at {trigger:.2f} with money flow "
+            "negative. The breakout did not hold."
         )
     elif in_position and sellers and px < entry:
         action = "sell"
         why = (
             "Sector structure broke (sellers won or the sector is disqualified) "
-            "and the close is below your entry. Do not average down."
+            f"and the close sits below the reference price {entry:.2f}."
         )
     elif at_target and (cmf is not None and cmf < 0 or (m.get("ext_ema20") or 0) > 0.08):
         action = "sell"
         why = (
-            f"First target {target:.2f} is reached and the name is extended or "
-            "money flow is fading. Bank the 2R; do not add."
+            f"The 2R level {target:.2f} has been reached, and the name is "
+            "extended or money flow is fading."
         )
     elif at_target:
         action = "hold"
         why = (
-            f"First target {target:.2f} is tagged. Hold the rest only if you trail "
-            f"under the last swing; do not add. Stretch sits near {target2:.2f}."
+            f"The 2R level {target:.2f} has been reached. The measured move "
+            f"sits near {target2:.2f}."
             if target2 else
-            f"First target {target:.2f} is tagged. Hold and trail; do not add."
+            f"The 2R level {target:.2f} has been reached."
         )
     elif phase == "potential" and trigger and entry < trigger * 0.997 and entering_here:
         action = "wait"
         why = (
-            f"This is still the coil. The buy this system allows is a close "
-            f"through the trigger at {trigger:.2f}, not {entry:.2f}. "
-            f"If you already own it, the stop is {stop:.2f}."
+            f"Still inside the coil. The structural trigger is a close through "
+            f"{trigger:.2f}, above the reference price {entry:.2f}. The "
+            f"structure level sits at {stop:.2f}."
         )
     elif phase == "potential" and trigger and entry >= trigger * 0.997:
         action = "buy"
         why = (
-            f"Entry is at the trigger. Buy only on a close through {trigger:.2f} "
-            f"on rising volume. Stop {stop:.2f}, first target {target:.2f} (2R)."
+            f"The reference price sits at the trigger. The structure confirms "
+            f"on a close through {trigger:.2f} on rising volume. Structure "
+            f"level {stop:.2f}, 2R level {target:.2f}."
         )
     elif confirmed and entering_here and not already_long and px > stop:
         action = "buy"
         vol_s = f" on {vol_x:.1f}× volume" if vol_x else ""
         late_s = (
-            " RSI / extension say the first push is spent — first unit only, do not chase size."
+            " RSI and extension indicate the first push is already spent."
             if late else ""
         )
         why = (
-            f"Volume break through the 20-day high{vol_s}. Buy the first unit "
-            f"near {entry:.2f}. Stop {stop:.2f}, first target {target:.2f}."
-            f"{late_s} Sector class is the industry, not a veto on this print."
+            f"Volume break through the 20-day high{vol_s}. Structure level "
+            f"{stop:.2f}, 2R level {target:.2f}.{late_s} Sector class is the "
+            "industry, not a veto on this print."
         )
     elif confirmed and pullback:
         action = "add"
         why = (
-            f"You are long from {entry:.2f} and price has come back to the "
-            f"breakout line. One add is allowed above {stop:.2f}, not a full "
-            f"new position. First target remains {target:.2f}."
+            f"Price has come back to the breakout line from the reference "
+            f"price {entry:.2f}. Structure level {stop:.2f}, 2R level "
+            f"{target:.2f}."
         )
     elif confirmed and px > stop:
         action = "hold"
         why = (
-            f"Long from {entry:.2f} is working. Hold as long as the close stays "
-            f"above {stop:.2f}. First target {target:.2f}; do not chase an add "
-            "up here."
+            f"The structure from the reference price {entry:.2f} is intact "
+            f"while the close stays above {stop:.2f}. 2R level {target:.2f}."
         )
     elif already_long and px > stop:
         action = "hold"
         why = (
-            f"You are already long from {entry:.2f}, but this is not a clean "
-            f"breakout setup. Hold only if you accept that; stop {stop:.2f}. "
-            "Do not add."
+            f"The last close is above the reference price {entry:.2f}, but "
+            f"this is not a clean breakout structure. Structure level "
+            f"{stop:.2f}."
         )
     else:
         action = "wait"
         why = (
-            f"No buy here. If you use {entry:.2f} anyway, the mechanical stop is "
-            f"{stop:.2f} and 2R is {target:.2f} — that is risk math, not a signal."
+            f"No structural trigger at this price. From the reference price "
+            f"{entry:.2f} the structure level is {stop:.2f} and 2R is "
+            f"{target:.2f} — arithmetic from the base, not a signal."
         )
 
     return {
