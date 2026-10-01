@@ -145,6 +145,36 @@ CREATE TABLE carry_log (
 );
 CREATE INDEX idx_carry_log_as_of ON carry_log(as_of);
 
+-- Intraday circuit scanner: tracks stocks approaching circuit throughout the day.
+-- Multiple scans per day (every 30 min), each row is one stock at one scan time.
+CREATE TABLE carry_intraday (
+    id BIGSERIAL PRIMARY KEY,
+    as_of DATE NOT NULL,
+    scan_time TEXT NOT NULL,           -- e.g. '10:00', '10:30', '14:30'
+    logged_at TIMESTAMPTZ,
+    symbol TEXT NOT NULL,
+    sector TEXT,
+    prev_close NUMERIC,
+    ltp NUMERIC,
+    high NUMERIC,
+    low NUMERIC,
+    pchange NUMERIC,
+    upper_circuit NUMERIC,
+    lower_circuit NUMERIC,
+    band NUMERIC,                       -- 0.05, 0.10, or 0.20
+    distance_to_circuit NUMERIC,        -- how far from upper circuit (fraction)
+    status TEXT NOT NULL,               -- 'heating', 'approaching', 'at_circuit', 'locked'
+    total_buy_qty BIGINT,
+    total_sell_qty BIGINT,
+    fillable BOOLEAN,
+    volume BIGINT,
+    vol_ratio NUMERIC,                  -- volume vs expected at this time of day
+    med_turn20 NUMERIC,
+    UNIQUE(as_of, scan_time, symbol)
+);
+CREATE INDEX idx_carry_intraday_as_of ON carry_intraday(as_of);
+CREATE INDEX idx_carry_intraday_status ON carry_intraday(as_of, status);
+
 CREATE INDEX idx_base_episodes_state ON base_episodes(state, resolved_on);
 CREATE INDEX idx_base_episodes_since ON base_episodes(state_since);
 
@@ -1558,3 +1588,61 @@ def get_carry_log(page: int = 1000) -> pd.DataFrame:
             break
         start += page
     return pd.DataFrame(out)
+
+
+# --------------------------------------------------------------------------
+# Intraday circuit scanner
+# --------------------------------------------------------------------------
+
+_INTRADAY_INT = ("total_buy_qty", "total_sell_qty", "volume")
+_INTRADAY_BOOL = ("fillable",)
+
+
+def _intraday_record(row: dict) -> dict:
+    rec = _row_dict(row)
+    for c in _INTRADAY_INT:
+        if c in rec:
+            rec[c] = _int(rec[c])
+    for c in _INTRADAY_BOOL:
+        if c in rec and rec[c] is not None:
+            rec[c] = str(rec[c]).lower() in ("true", "1", "1.0")
+    if rec.get("as_of"):
+        rec["as_of"] = str(rec["as_of"])[:10]
+    rec.pop("id", None)
+    return rec
+
+
+def upsert_carry_intraday(rows: pd.DataFrame) -> int:
+    """Write intraday scan rows, matched on (as_of, scan_time, symbol)."""
+    if rows is None or rows.empty:
+        return 0
+    records = [_intraday_record(r) for r in rows.to_dict("records")]
+    result = get_client().table("carry_intraday").upsert(
+        records, on_conflict="as_of,scan_time,symbol").execute()
+    return len(result.data or [])
+
+
+def get_carry_intraday(as_of: str | None = None, page: int = 2000) -> pd.DataFrame:
+    """Intraday scans for a date (default: today). Returns all scan times."""
+    client = get_client()
+    if as_of is None:
+        as_of = now_ist().date().isoformat()
+    out, start = [], 0
+    while True:
+        r = (client.table("carry_intraday").select("*")
+             .eq("as_of", as_of)
+             .order("scan_time").order("symbol")
+             .range(start, start + page - 1).execute())
+        batch = r.data or []
+        out.extend(batch)
+        if len(batch) < page:
+            break
+        start += page
+    return pd.DataFrame(out)
+
+
+def clear_carry_intraday(as_of: str) -> int:
+    """Delete all intraday rows for a date (used when resetting)."""
+    client = get_client()
+    result = client.table("carry_intraday").delete().eq("as_of", as_of).execute()
+    return len(result.data or [])

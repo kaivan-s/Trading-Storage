@@ -14,6 +14,7 @@ Sector accumulation scan.
     python run.py carry snap              # 15:20-15:28 IST: upper-circuit candidates + order book
     python run.py carry score             # after ~18:30 IST: fill next-session outcomes, report
     python run.py carry eod --backfill 20 # rebuild past candidates from bhavcopy (no order book)
+    python run.py carry intraday          # every 30 min: scan for stocks approaching circuit
 
 The sector map is a separate step because it takes ~12 minutes and only needs
 doing once (re-run it monthly; NSE reviews the classification annually but
@@ -276,6 +277,22 @@ def cmd_carry(args):
                   .round(2).to_string(index=False))
         return
 
+    if args.action == "intraday":
+        print("Intraday circuit scan (run every 30 min during market hours) …")
+        rows = carry.intraday_scan()
+        n = carry.save_intraday_scan(rows)
+        print(f"\n=== intraday scan: {n} rows saved ===\n")
+        if not rows.empty:
+            # Show summary by status
+            for status in ["approaching", "at_circuit", "heating", "locked"]:
+                sub = rows[rows["status"] == status]
+                if not sub.empty:
+                    print(f"\n{status.upper()} ({len(sub)}):")
+                    cols = ["symbol", "sector", "ltp", "pchange", "distance_to_circuit",
+                            "band", "total_sell_qty", "fillable"]
+                    print(sub[cols].round(3).to_string(index=False))
+        return
+
     if args.action == "eod":
         d = args.end
         days = []
@@ -348,8 +365,8 @@ def main():
                    help="live overlay at run time: potential breakouts for tomorrow")
 
     kp = sub.add_parser("carry", parents=[common],
-                        help="upper-circuit carry paper tracker (snap / eod / score / report)")
-    kp.add_argument("action", choices=["snap", "eod", "score", "report"])
+                        help="upper-circuit carry paper tracker (snap / eod / score / report / intraday)")
+    kp.add_argument("action", choices=["snap", "eod", "score", "report", "intraday"])
     kp.add_argument("--backfill", type=int, default=1,
                     help="eod: weekdays to rebuild, ending at --end (default 1)")
 

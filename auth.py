@@ -21,7 +21,7 @@ import db
 # Public: the Vite app and the authorize redirect need these.
 # Cron endpoints use their own secret-based auth.
 PUBLIC_PATHS = {"/api/auth/config", "/api/quote", "/api/cron/post-market",
-                "/api/cron/carry-snap"}
+                "/api/cron/carry-snap", "/api/cron/carry-scan"}
 
 _CACHE_TTL = 45.0
 _cache: dict[str, tuple[float, dict]] = {}

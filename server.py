@@ -1555,6 +1555,56 @@ def api_carry():
         return jsonify({"error": f"Could not read carry log: {exc}"}), 500
 
 
+_intraday_busy = threading.Lock()
+
+
+@app.post("/api/cron/carry-scan")
+def api_cron_carry_scan():
+    """
+    Intraday circuit scanner. Schedule every 30 min during market hours.
+    POST /api/cron/carry-scan
+    
+    Scans for stocks approaching their upper circuit while still buyable.
+    Call at 10:00, 10:30, 11:00, ... 15:00 IST on trading days.
+    Returns 202 and runs in a thread.
+    """
+    if not _intraday_busy.acquire(blocking=False):
+        return jsonify({"status": "busy", "message": "Scan already running."}), 409
+
+    def work():
+        try:
+            import carry
+            rows = carry.intraday_scan()
+            n = carry.save_intraday_scan(rows)
+            summary = rows["status"].value_counts().to_dict() if not rows.empty else {}
+            print(f"[cron] intraday scan: {n} rows - {summary}")
+        except Exception as exc:
+            print(f"[cron] intraday scan failed: {exc}")
+        finally:
+            _intraday_busy.release()
+
+    threading.Thread(target=work, daemon=True).start()
+    return jsonify({"status": "started",
+                    "message": "Scanning for stocks approaching circuit."}), 202
+
+
+@app.get("/api/carry/intraday")
+def api_carry_intraday():
+    """
+    Intraday scan results for today. Shows stocks approaching or at circuit
+    with their progression through the day.
+    
+    Query params:
+        as_of: date in YYYY-MM-DD format (default: today)
+    """
+    import carry
+    try:
+        as_of = request.args.get("as_of")
+        return jsonify(carry.intraday_payload(as_of))
+    except Exception as exc:
+        return jsonify({"error": f"Could not read intraday scan: {exc}"}), 500
+
+
 def _known_sessions() -> tuple[set, str | None]:
     """Trading days from the loaded panel, plus as_of."""
     found: set = set()

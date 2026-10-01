@@ -52,6 +52,26 @@ PRE_PCHANGE = 4.5        # % -- below this no 5/10/20% band is reachable
 AT_HIGH = 0.999
 COST = 0.0025            # delivery round trip, for the net column in report
 
+# Intraday thresholds: how close to circuit to start tracking
+# For each band: (heating_min, approaching_min, at_circuit_min)
+# e.g., 5% band: heating at 2.5%+, approaching at 4%+, at_circuit at 4.9%+
+INTRADAY_THRESHOLDS = {
+    0.05: {"heating": 0.025, "approaching": 0.040, "at_circuit": 0.049},
+    0.10: {"heating": 0.060, "approaching": 0.085, "at_circuit": 0.098},
+    0.20: {"heating": 0.140, "approaching": 0.175, "at_circuit": 0.195},
+}
+
+# Expected volume fraction by hour (cumulative). Used to normalize vol_ratio.
+# Market: 9:15-15:30 = 6.25 hours. Volume is front-loaded.
+VOLUME_BY_HOUR = {
+    10: 0.25,   # 10:00 - ~25% of day's volume done
+    11: 0.40,   # 11:00 - ~40%
+    12: 0.52,   # 12:00 - ~52%
+    13: 0.62,   # 13:00 - ~62%
+    14: 0.75,   # 14:00 - ~75%
+    15: 0.92,   # 15:00 - ~92%
+}
+
 COLUMNS = [
     "as_of", "source", "logged_at", "symbol", "sector", "prev_close", "ltp",
     "high", "pchange", "upper_circuit", "band", "at_circuit",
@@ -59,6 +79,13 @@ COLUMNS = [
     # filled by score()
     "entry_close", "closed_at_circuit", "nx_date", "nx_open", "nx_high",
     "nx_low", "nx_close", "gap", "reach", "hit4", "btst",
+]
+
+INTRADAY_COLUMNS = [
+    "as_of", "scan_time", "logged_at", "symbol", "sector", "prev_close", "ltp",
+    "high", "low", "pchange", "upper_circuit", "lower_circuit", "band",
+    "distance_to_circuit", "status", "total_buy_qty", "total_sell_qty",
+    "fillable", "volume", "vol_ratio", "med_turn20",
 ]
 
 
@@ -172,6 +199,295 @@ def snapshot(on_progress=None) -> pd.DataFrame:
     pre["source"] = "live"
     pre["logged_at"] = db.now_ist().isoformat(timespec="seconds")
     return pre.reindex(columns=COLUMNS)
+
+
+# --------------------------------------------------------------------------
+# Intraday scanner - runs every 30 minutes during market hours
+# --------------------------------------------------------------------------
+
+def _determine_band(upper_circuit: float, prev_close: float) -> float | None:
+    """Determine which price band (5%, 10%, 20%) applies based on circuit limit."""
+    if not prev_close or prev_close <= 0:
+        return None
+    ratio = upper_circuit / prev_close - 1
+    for band in BANDS:
+        if abs(ratio - band) < 0.005:  # within 0.5% of the band
+            return band
+    return None
+
+
+def _classify_status(pchange_pct: float, band: float, at_circuit: bool, has_sellers: bool) -> str:
+    """
+    Classify a stock's status based on how close it is to circuit.
+    
+    Returns: 'heating', 'approaching', 'at_circuit', or 'locked'
+    """
+    if band not in INTRADAY_THRESHOLDS:
+        return "heating"
+    
+    thresholds = INTRADAY_THRESHOLDS[band]
+    pchange = pchange_pct / 100.0  # convert from % to fraction
+    
+    if at_circuit:
+        return "locked" if not has_sellers else "at_circuit"
+    elif pchange >= thresholds["at_circuit"]:
+        return "at_circuit"
+    elif pchange >= thresholds["approaching"]:
+        return "approaching"
+    elif pchange >= thresholds["heating"]:
+        return "heating"
+    return "heating"
+
+
+def _expected_volume_fraction(hour: int) -> float:
+    """What fraction of daily volume should have traded by this hour."""
+    if hour <= 10:
+        return VOLUME_BY_HOUR.get(10, 0.25)
+    if hour >= 15:
+        return VOLUME_BY_HOUR.get(15, 0.92)
+    return VOLUME_BY_HOUR.get(hour, 0.5)
+
+
+def intraday_scan(scan_time: str | None = None, on_progress=None) -> pd.DataFrame:
+    """
+    Scan for stocks approaching or at their upper circuit.
+    
+    This is the main intraday scanner. Call it every 30 minutes during market hours.
+    It identifies stocks that are:
+    - heating: up significantly, showing momentum toward circuit
+    - approaching: very close to circuit, may still be buyable
+    - at_circuit: at the limit, check if sellers present
+    - locked: at circuit with no sellers (queue only)
+    
+    Args:
+        scan_time: Override scan time label (default: current time rounded to 30 min)
+        on_progress: Callback for progress updates
+    
+    Returns:
+        DataFrame of candidates with their status and order book info
+    """
+    now = db.now_ist()
+    today = now.date()
+    
+    # Determine scan time label (round to nearest 30 min)
+    if scan_time is None:
+        minute = 30 if now.minute >= 15 else 0
+        if now.minute >= 45:
+            hour = now.hour + 1
+            minute = 0
+        else:
+            hour = now.hour
+        scan_time = f"{hour:02d}:{minute:02d}"
+    
+    print(f"[intraday] scan at {scan_time} IST")
+    
+    # Get universe
+    uni = universe(today - timedelta(days=1))
+    print(f"  universe: {len(uni):,} liquid names")
+    
+    # Fetch live prices
+    live = fetch.live_quotes_groww(uni["symbol"].tolist(), on_progress=on_progress)
+    if live.empty:
+        print("  no prices returned")
+        return pd.DataFrame(columns=INTRADAY_COLUMNS)
+    
+    # Merge with universe data
+    m = live.merge(uni[["symbol", "sector", "med_turn20"]], on="symbol")
+    
+    # Filter to stocks showing momentum: up at least 2% and near day's high
+    MIN_GAIN = 0.02  # 2% minimum to consider
+    m = m[(m["pchange"] >= MIN_GAIN * 100) & (m["ltp"] >= m["high"] * 0.995)].copy()
+    print(f"  {len(m)} names up >= 2% near day's high")
+    
+    if m.empty:
+        return pd.DataFrame(columns=INTRADAY_COLUMNS)
+    
+    # Get detailed quotes with circuit limits and order book
+    groww = fetch._get_groww_client()
+    
+    def get_full_quote(sym):
+        try:
+            q = groww.get_quote(exchange=groww.EXCHANGE_NSE,
+                                segment=groww.SEGMENT_CASH, trading_symbol=sym)
+            if not isinstance(q, dict):
+                return None
+            return {
+                "symbol": sym,
+                "upper_circuit": q.get("upper_circuit_limit"),
+                "lower_circuit": q.get("lower_circuit_limit"),
+                "total_buy_qty": q.get("total_buy_quantity"),
+                "total_sell_qty": q.get("total_sell_quantity"),
+                "volume": q.get("volume"),
+                "q_ltp": q.get("last_price"),
+                "q_high": q.get("ohlc", {}).get("high"),
+                "q_low": q.get("ohlc", {}).get("low"),
+            }
+        except Exception as exc:
+            print(f"  quote {sym}: {exc}")
+            return None
+    
+    with ThreadPoolExecutor(max_workers=fetch.GROWW_QUOTE_WORKERS) as pool:
+        quotes = [q for q in pool.map(get_full_quote, m["symbol"]) if q]
+    
+    if not quotes:
+        print("  no detailed quotes returned")
+        return pd.DataFrame(columns=INTRADAY_COLUMNS)
+    
+    # Merge detailed quotes
+    m = m.drop(columns=["volume", "turnover", "time"], errors="ignore")
+    m = m.merge(pd.DataFrame(quotes), on="symbol", how="inner")
+    
+    # Convert numeric columns
+    for c in ("upper_circuit", "lower_circuit", "total_buy_qty", "total_sell_qty", 
+              "volume", "q_ltp", "q_high", "q_low"):
+        m[c] = pd.to_numeric(m[c], errors="coerce")
+    
+    # Use fresher quote data where available
+    m["ltp"] = m["q_ltp"].fillna(m["ltp"])
+    m["high"] = m["q_high"].fillna(m["high"])
+    m["low"] = m["q_low"].fillna(m["low"])
+    
+    # Determine band and calculate distance to circuit
+    m["band"] = m.apply(
+        lambda r: _determine_band(r["upper_circuit"], r["prev_close"]), axis=1)
+    m = m[m["band"].notna()].copy()
+    
+    if m.empty:
+        print("  no stocks with valid circuit bands")
+        return pd.DataFrame(columns=INTRADAY_COLUMNS)
+    
+    # Calculate distance to circuit (0 = at circuit, positive = below circuit)
+    m["distance_to_circuit"] = m["upper_circuit"] / m["ltp"] - 1
+    
+    # Filter to stocks reasonably close to circuit (within 3% of upper limit)
+    MAX_DISTANCE = 0.03
+    m = m[m["distance_to_circuit"] <= MAX_DISTANCE].copy()
+    print(f"  {len(m)} stocks within {MAX_DISTANCE:.0%} of their circuit")
+    
+    if m.empty:
+        return pd.DataFrame(columns=INTRADAY_COLUMNS)
+    
+    # Determine status
+    m["at_circuit"] = m["ltp"] >= m["upper_circuit"] * AT_HIGH
+    m["fillable"] = m["total_sell_qty"].fillna(0) > 0
+    m["status"] = m.apply(
+        lambda r: _classify_status(r["pchange"], r["band"], r["at_circuit"], r["fillable"]),
+        axis=1)
+    
+    # Calculate volume ratio (current volume vs expected at this time of day)
+    # This helps identify unusual activity
+    hour = now.hour
+    expected_frac = _expected_volume_fraction(hour)
+    # Estimate full-day volume based on what we've seen so far
+    m["vol_ratio"] = (m["volume"] / expected_frac) / (m["med_turn20"] * 100000)  # convert lacs to shares approx
+    
+    # Build output
+    m["as_of"] = today.isoformat()
+    m["scan_time"] = scan_time
+    m["logged_at"] = now.isoformat(timespec="seconds")
+    
+    out = m.reindex(columns=INTRADAY_COLUMNS)
+    
+    # Sort by most actionable first
+    status_order = {"approaching": 0, "at_circuit": 1, "heating": 2, "locked": 3}
+    out["_sort"] = out["status"].map(status_order).fillna(4)
+    out = out.sort_values(["_sort", "distance_to_circuit"]).drop(columns="_sort")
+    
+    print(f"  results: {(out['status'] == 'heating').sum()} heating, "
+          f"{(out['status'] == 'approaching').sum()} approaching, "
+          f"{(out['status'] == 'at_circuit').sum()} at circuit, "
+          f"{(out['status'] == 'locked').sum()} locked")
+    
+    return out.reset_index(drop=True)
+
+
+def save_intraday_scan(rows: pd.DataFrame) -> int:
+    """Save intraday scan results to Supabase."""
+    return db.upsert_carry_intraday(rows)
+
+
+def get_intraday_candidates(as_of: str | None = None) -> pd.DataFrame:
+    """Get all intraday scan results for a date."""
+    return db.get_carry_intraday(as_of)
+
+
+def intraday_payload(as_of: str | None = None) -> dict:
+    """
+    Package intraday data for the API response.
+    
+    Returns latest scan, progression of each stock through the day,
+    and summary stats.
+    """
+    now = db.now_ist()
+    if as_of is None:
+        as_of = now.date().isoformat()
+    
+    df = get_intraday_candidates(as_of)
+    if df.empty:
+        return {
+            "as_of": as_of,
+            "scans": [],
+            "latest": [],
+            "progression": [],
+            "summary": {"heating": 0, "approaching": 0, "at_circuit": 0, "locked": 0},
+        }
+    
+    # List of scan times we have
+    scans = sorted(df["scan_time"].unique())
+    latest_time = scans[-1] if scans else None
+    
+    # Latest scan results
+    latest = df[df["scan_time"] == latest_time].copy() if latest_time else pd.DataFrame()
+    
+    # Track progression: how each stock moved through statuses during the day
+    progression = []
+    for symbol in df["symbol"].unique():
+        sym_df = df[df["symbol"] == symbol].sort_values("scan_time")
+        history = []
+        for _, row in sym_df.iterrows():
+            history.append({
+                "time": row["scan_time"],
+                "status": row["status"],
+                "pchange": row["pchange"],
+                "distance": row["distance_to_circuit"],
+                "fillable": row.get("fillable"),
+            })
+        
+        last = sym_df.iloc[-1]
+        progression.append({
+            "symbol": symbol,
+            "sector": last["sector"],
+            "current_status": last["status"],
+            "current_price": last["ltp"],
+            "pchange": last["pchange"],
+            "band": last["band"],
+            "distance_to_circuit": last["distance_to_circuit"],
+            "fillable": last.get("fillable"),
+            "first_seen": sym_df["scan_time"].min(),
+            "times_seen": len(sym_df),
+            "history": history,
+        })
+    
+    # Sort by actionability
+    status_order = {"approaching": 0, "at_circuit": 1, "heating": 2, "locked": 3}
+    progression.sort(key=lambda x: (status_order.get(x["current_status"], 4), 
+                                     x.get("distance_to_circuit") or 1))
+    
+    # Summary counts from latest scan
+    summary = {"heating": 0, "approaching": 0, "at_circuit": 0, "locked": 0}
+    if not latest.empty:
+        for status in summary:
+            summary[status] = int((latest["status"] == status).sum())
+    
+    import json
+    return {
+        "as_of": as_of,
+        "latest_scan": latest_time,
+        "scans": scans,
+        "latest": json.loads(latest.to_json(orient="records")) if not latest.empty else [],
+        "progression": progression,
+        "summary": summary,
+    }
 
 
 # --------------------------------------------------------------------------
