@@ -559,12 +559,29 @@ def _has_industry(rec: dict | None) -> bool:
     return _nz((rec or {}).get("basic_industry")) is not None
 
 
+_EQUITY_LIST_MAX_AGE = 7 * 86400  # refresh after 7 days
+
+
 def fetch_equity_list(sess: NSESession | None = None) -> pd.DataFrame:
     sess = sess or NSESession()
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     path = CACHE_DIR / "equity_list.csv"
     if path.exists():
-        return pd.read_csv(path)
+        age = time.time() - path.stat().st_mtime
+        if age < _EQUITY_LIST_MAX_AGE:
+            return pd.read_csv(path)
+        # Stale — try to refresh; fall back to the cached copy on failure.
+        try:
+            df = _download_equity_list(sess, path)
+            print(f"Refreshed equity_list.csv ({len(df)} names)")
+            return df
+        except Exception as exc:
+            print(f"Could not refresh equity_list.csv ({exc}), using cached copy")
+            return pd.read_csv(path)
+    return _download_equity_list(sess, path)
+
+
+def _download_equity_list(sess: NSESession, path: Path) -> pd.DataFrame:
     r = sess.get(EQUITY_LIST, referer=f"{BASE}/market-data/securities-available-for-trading")
     df = pd.read_csv(io.StringIO(r.text))
     df.columns = [c.strip() for c in df.columns]
