@@ -1773,6 +1773,46 @@ def api_cron_telegram_weekly():
     return jsonify({"status": "started"}), 202
 
 
+# --------------------------------------------------------------------------
+# Interactive Telegram bot (webhook)
+# --------------------------------------------------------------------------
+
+@app.post("/api/telegram/webhook")
+def api_telegram_webhook():
+    """
+    Telegram sends message updates here. The bot replies with stock reports.
+    Set up with: POST /api/telegram/setup-webhook
+    """
+    import telegram_interactive as tgi
+    update = request.get_json(silent=True) or {}
+    try:
+        tgi.process_update(update, engine)
+    except Exception as exc:
+        print(f"[telegram] webhook error: {exc}")
+    return jsonify({"ok": True})
+
+
+@app.post("/api/telegram/setup-webhook")
+def api_telegram_setup_webhook():
+    """Register our webhook URL with Telegram."""
+    import telegram_interactive as tgi
+    body = request.get_json(silent=True) or {}
+    base = body.get("url", "").rstrip("/")
+    if not base:
+        base = request.host_url.rstrip("/")
+    webhook_url = f"{base}/api/telegram/webhook"
+    ok = tgi.set_webhook(webhook_url)
+    return jsonify({"ok": ok, "webhook_url": webhook_url})
+
+
+@app.post("/api/telegram/delete-webhook")
+def api_telegram_delete_webhook():
+    """Remove the webhook (switch to polling mode)."""
+    import telegram_interactive as tgi
+    ok = tgi.delete_webhook()
+    return jsonify({"ok": ok})
+
+
 @app.get("/api/scanners")
 def api_scanners():
     """Latest scanner results (cached from the most recent scan)."""
