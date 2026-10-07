@@ -130,6 +130,7 @@ CREATE TABLE carry_log (
     fillable BOOLEAN,
     volume BIGINT,
     med_turn20 NUMERIC,
+    vol_ratio NUMERIC,
     entry_close NUMERIC,
     closed_at_circuit BOOLEAN,
     nx_date DATE,

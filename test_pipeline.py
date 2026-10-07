@@ -464,7 +464,7 @@ def test_robustness():
         "metrics": {"pos_hi": 0.70, "to_trigger": 0.12},
         "filters": [{"ok": False, "text": "Volume dry-up (5-day ≤ 20-day)"}],
     })
-    check("watching explain is not a buy", "Nothing here is a buy" in why_w)
+    check("watching explain reports no setup", "No structural setup here" in why_w)
 
     pot = {
         "phase": "potential", "sector_klass": "PULLBACK",

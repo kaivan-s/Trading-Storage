@@ -76,6 +76,7 @@ COLUMNS = [
     "as_of", "source", "logged_at", "symbol", "sector", "prev_close", "ltp",
     "high", "pchange", "upper_circuit", "band", "at_circuit",
     "total_buy_qty", "total_sell_qty", "fillable", "volume", "med_turn20",
+    "vol_ratio",
     # filled by score()
     "entry_close", "closed_at_circuit", "nx_date", "nx_open", "nx_high",
     "nx_low", "nx_close", "gap", "reach", "hit4", "btst",
@@ -195,6 +196,11 @@ def snapshot(on_progress=None) -> pd.DataFrame:
     pre["band"] = (pre["upper_circuit"] / pre["prev_close"] - 1).round(2)
     pre["fillable"] = pre["total_sell_qty"].fillna(0) > 0
 
+    # Turnover ratio: approximate today's turnover (vol × ltp) vs 20d median
+    pre["vol_ratio"] = np.where(
+        pre["med_turn20"] > 0,
+        (pre["volume"] * pre["ltp"] / 1e5) / pre["med_turn20"],
+        np.nan)
     pre["as_of"] = today.isoformat()
     pre["source"] = "live"
     pre["logged_at"] = db.now_ist().isoformat(timespec="seconds")
@@ -473,6 +479,8 @@ def intraday_payload(as_of: str | None = None) -> dict:
             "band": _py(last["band"]),
             "distance_to_circuit": _py(last["distance_to_circuit"]),
             "fillable": _py(last.get("fillable")),
+            "vol_ratio": _py(last.get("vol_ratio")),
+            "med_turn20": _py(last.get("med_turn20")),
             "first_seen": sym_df["scan_time"].min(),
             "times_seen": len(sym_df),
             "history": history,
@@ -519,6 +527,9 @@ def from_bhavcopy(d: date) -> pd.DataFrame:
     m["ltp"] = m["close"]
     m["upper_circuit"] = m["close"]
     m["at_circuit"] = True
+    # Turnover ratio: today's turnover vs 20-day median (both in lacs)
+    m["vol_ratio"] = np.where(m["med_turn20"] > 0,
+                              m["turnover"] / m["med_turn20"], np.nan)
     m["as_of"] = d.isoformat()
     m["source"] = "eod"
     m["logged_at"] = db.now_ist().isoformat(timespec="seconds")
@@ -536,8 +547,8 @@ def load_log() -> pd.DataFrame:
     log = log.reindex(columns=COLUMNS)
     for c in ("prev_close", "ltp", "high", "pchange", "upper_circuit", "band",
               "total_buy_qty", "total_sell_qty", "volume", "med_turn20",
-              "entry_close", "nx_open", "nx_high", "nx_low", "nx_close",
-              "gap", "reach", "btst"):
+              "vol_ratio", "entry_close", "nx_open", "nx_high", "nx_low",
+              "nx_close", "gap", "reach", "btst"):
         log[c] = pd.to_numeric(log[c], errors="coerce")
     return log
 
