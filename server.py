@@ -1574,10 +1574,20 @@ def api_cron_carry_scan():
     def work():
         try:
             import carry
+            import telegram_bot
             rows = carry.intraday_scan()
             n = carry.save_intraday_scan(rows)
             summary = rows["status"].value_counts().to_dict() if not rows.empty else {}
             print(f"[cron] intraday scan: {n} rows - {summary}")
+            # Send Telegram alert to paid channel
+            try:
+                data = carry.intraday_payload()
+                msg = telegram_bot.format_circuit_alert(data)
+                if msg:
+                    telegram_bot.send_paid(msg)
+                    print(f"[cron] telegram circuit alert sent")
+            except Exception as tg_exc:
+                print(f"[cron] telegram alert failed: {tg_exc}")
         except Exception as exc:
             print(f"[cron] intraday scan failed: {exc}")
         finally:
@@ -1603,6 +1613,136 @@ def api_carry_intraday():
         return jsonify(carry.intraday_payload(as_of))
     except Exception as exc:
         return jsonify({"error": f"Could not read intraday scan: {exc}"}), 500
+
+
+# --------------------------------------------------------------------------
+# Broader market scanners
+# --------------------------------------------------------------------------
+
+_scanner_busy = threading.Lock()
+_scanner_cache: dict = {}
+
+
+@app.post("/api/cron/scanner-scan")
+def api_cron_scanner_scan():
+    """
+    Run all intraday scanners. Schedule alongside carry-scan (every 30 min).
+    POST /api/cron/scanner-scan
+    """
+    if not _scanner_busy.acquire(blocking=False):
+        return jsonify({"status": "busy"}), 409
+
+    def work():
+        global _scanner_cache
+        try:
+            import scanners
+            import telegram_bot
+            data = scanners.intraday_all()
+            _scanner_cache["intraday"] = data
+            print(f"[cron] scanners: {len(data.get('big_movers', []))} movers, "
+                  f"{len(data.get('unusual_volume', []))} unusual vol, "
+                  f"{len(data.get('sector_pulse', []))} sectors")
+            # Telegram alert to paid channel
+            try:
+                msg = telegram_bot.format_scanners(data)
+                if msg:
+                    telegram_bot.send_paid(msg)
+                    print(f"[cron] telegram scanner alert sent")
+            except Exception as tg_exc:
+                print(f"[cron] telegram scanner alert failed: {tg_exc}")
+        except Exception as exc:
+            print(f"[cron] scanners failed: {exc}")
+        finally:
+            _scanner_busy.release()
+
+    threading.Thread(target=work, daemon=True).start()
+    return jsonify({"status": "started"}), 202
+
+
+@app.post("/api/cron/scanner-eod")
+def api_cron_scanner_eod():
+    """
+    Run EOD scanners (momentum streaks, 52w breakouts). Schedule after market close.
+    POST /api/cron/scanner-eod
+    """
+    def work():
+        global _scanner_cache
+        try:
+            import scanners
+            import telegram_bot
+            data = scanners.eod_all()
+            _scanner_cache["eod"] = data
+            print(f"[cron] EOD scanners: {len(data.get('breakouts_52w', []))} breakouts, "
+                  f"{len(data.get('momentum_streaks', []))} streaks")
+            # Send to both channels
+            try:
+                msg = telegram_bot.format_eod_scanners(data)
+                if msg:
+                    telegram_bot.send_both(msg)
+            except Exception as tg_exc:
+                print(f"[cron] telegram EOD scanner failed: {tg_exc}")
+        except Exception as exc:
+            print(f"[cron] EOD scanners failed: {exc}")
+
+    threading.Thread(target=work, daemon=True).start()
+    return jsonify({"status": "started"}), 202
+
+
+@app.post("/api/cron/telegram-eod")
+def api_cron_telegram_eod():
+    """Send EOD circuit summary to both Telegram channels."""
+    def work():
+        try:
+            import carry
+            import telegram_bot
+            data = carry.payload()
+            msg = telegram_bot.format_eod_summary(data)
+            telegram_bot.send_both(msg)
+            print(f"[cron] telegram EOD carry summary sent")
+        except Exception as exc:
+            print(f"[cron] telegram EOD failed: {exc}")
+
+    threading.Thread(target=work, daemon=True).start()
+    return jsonify({"status": "started"}), 202
+
+
+@app.post("/api/cron/telegram-morning")
+def api_cron_telegram_morning():
+    """Send morning scorecard to both Telegram channels."""
+    def work():
+        try:
+            import carry
+            import telegram_bot
+            data = carry.payload()
+            msg = telegram_bot.format_morning_scorecard(data)
+            if msg:
+                telegram_bot.send_both(msg)
+                print(f"[cron] telegram morning scorecard sent")
+        except Exception as exc:
+            print(f"[cron] telegram morning failed: {exc}")
+
+    threading.Thread(target=work, daemon=True).start()
+    return jsonify({"status": "started"}), 202
+
+
+@app.get("/api/scanners")
+def api_scanners():
+    """Latest scanner results (cached from the most recent scan)."""
+    intraday = _scanner_cache.get("intraday", {})
+    eod = _scanner_cache.get("eod", {})
+    return jsonify({**intraday, **eod})
+
+
+@app.get("/api/scanners/intraday")
+def api_scanners_intraday():
+    """Latest intraday scanner results."""
+    return jsonify(_scanner_cache.get("intraday", {}))
+
+
+@app.get("/api/scanners/eod")
+def api_scanners_eod():
+    """Latest EOD scanner results (streaks, breakouts)."""
+    return jsonify(_scanner_cache.get("eod", {}))
 
 
 def _known_sessions() -> tuple[set, str | None]:
