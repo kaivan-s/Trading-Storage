@@ -1,25 +1,25 @@
 """
-Telegram alert bot for the circuit scanner and broader market scanners.
+Smart Telegram alerts for Morrow Desk.
 
-Environment variables (set in .env or EC2 environment):
+Design principles:
+  1. Alert on CHANGE, not on a timer — don't resend the same stocks.
+  2. Context beats data — one sentence explaining what the number means.
+  3. Fewer, better messages — 3-4/day paid, 2/day + 1/week free.
+  4. Accountability — every morning shows exactly what happened.
+
+Alert schedule:
+  PAID channel (real-time):
+    ⚡ Circuit flash   — only when a NEW stock reaches circuit or status changes
+    📡 Midday pulse    — 12:30 IST, ONE consolidated scanner summary
+  BOTH channels:
+    ☀️ Morning brief   — 9:15, yesterday's scorecard with per-stock results
+    📋 EOD wrap        — 15:45, final circuit list + day's standout moves
+    📊 Weekly digest   — Saturday 10:00, week's results + cumulative track record
+
+Environment variables:
     TELEGRAM_BOT_TOKEN    — from @BotFather
-    TELEGRAM_FREE_CHAT    — public channel ID or @username (EOD alerts)
-    TELEGRAM_PAID_CHAT    — private channel chat ID (real-time alerts)
-
-Usage:
-    # Post intraday circuit alert to PAID channel
-    python telegram_bot.py circuit
-
-    # Post EOD summary to BOTH channels
-    python telegram_bot.py eod
-
-    # Post morning scorecard to BOTH channels
-    python telegram_bot.py morning
-
-    # Post scanner alert to PAID channel
-    python telegram_bot.py scanners
-
-Called automatically by the cron endpoints after each scan.
+    TELEGRAM_FREE_CHAT    — public channel (@username or chat_id)
+    TELEGRAM_PAID_CHAT    — private channel (chat_id, negative number)
 """
 
 from __future__ import annotations
@@ -33,16 +33,20 @@ from pathlib import Path
 import requests
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-FREE_CHAT = os.environ.get("TELEGRAM_FREE_CHAT", "")   # @channel or chat_id
-PAID_CHAT = os.environ.get("TELEGRAM_PAID_CHAT", "")   # chat_id (negative)
+FREE_CHAT = os.environ.get("TELEGRAM_FREE_CHAT", "")
+PAID_CHAT = os.environ.get("TELEGRAM_PAID_CHAT", "")
 
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
+# In-memory state: what we already alerted this session.
+# Reset when the date changes.
+_alerted_date: str = ""
+_alerted_symbols: dict[str, str] = {}  # symbol → last status sent
+
 
 def _send(chat_id: str, text: str, silent: bool = False) -> bool:
-    """Send a message to a Telegram chat/channel."""
     if not BOT_TOKEN or not chat_id:
-        print(f"[telegram] skipped (no token or chat_id)")
+        print("[telegram] skipped (no token or chat_id)")
         return False
     try:
         r = requests.post(f"{API}/sendMessage", json={
@@ -50,6 +54,7 @@ def _send(chat_id: str, text: str, silent: bool = False) -> bool:
             "text": text,
             "parse_mode": "HTML",
             "disable_notification": silent,
+            "link_preview_options": {"is_disabled": True},
         }, timeout=15)
         if not r.ok:
             print(f"[telegram] error {r.status_code}: {r.text[:200]}")
@@ -61,249 +66,389 @@ def _send(chat_id: str, text: str, silent: bool = False) -> bool:
 
 
 def send_paid(text: str, silent: bool = False) -> bool:
-    """Send to the paid (real-time) channel."""
     return _send(PAID_CHAT, text, silent)
 
-
 def send_free(text: str, silent: bool = False) -> bool:
-    """Send to the free (EOD) channel."""
     return _send(FREE_CHAT, text, silent)
 
-
 def send_both(text: str, silent: bool = False) -> tuple[bool, bool]:
-    """Send to both channels."""
     return send_free(text, silent), send_paid(text, silent)
 
 
 # --------------------------------------------------------------------------
-# Message formatters
+# Helpers
 # --------------------------------------------------------------------------
 
-def _qty_fmt(v) -> str:
-    if v is None:
-        return "—"
+def _qty(v) -> str:
+    if v is None: return "—"
     n = int(v)
-    if n >= 1e7:
-        return f"{n / 1e7:.1f}cr"
-    if n >= 1e5:
-        return f"{n / 1e5:.1f}L"
+    if n >= 1e7: return f"{n / 1e7:.1f}cr"
+    if n >= 1e5: return f"{n / 1e5:.1f}L"
     return f"{n:,}"
 
+def _turn(med_turn20) -> str:
+    if not med_turn20: return ""
+    cr = float(med_turn20) / 100
+    return f"₹{cr:.0f}cr" if cr >= 1 else f"₹{cr:.1f}cr"
 
-def format_circuit_alert(data: dict) -> str | None:
-    """
-    Format an intraday circuit scan for Telegram.
-    Returns None if nothing worth alerting.
-    """
-    summary = data.get("summary", {})
-    total = sum(summary.values())
-    if total == 0:
-        return None
+def _band_context(band: float) -> str:
+    """One-line context about how this band has historically performed."""
+    b = int(round(float(band) * 100)) if band else 0
+    if b == 5:
+        return "5% band — the most common; 69% reached +4% next session historically"
+    if b == 10:
+        return "10% band — 74% reached +4% next session in the backtest"
+    if b == 20:
+        return "20% band — the strongest; 86% reached +4% historically"
+    return ""
 
-    scan_time = data.get("latest_scan", "?")
-    as_of = data.get("as_of", "?")
-    lines = [f"🔔 <b>Circuit Scan — {scan_time} IST</b>"]
-    lines.append(f"📅 {as_of}\n")
+def _turnover_context(med_turn20) -> str:
+    """Turnover tier insight from the volume study."""
+    if not med_turn20: return ""
+    cr = float(med_turn20) / 100
+    if cr < 5:
+        return "Lower turnover — historically the strongest continuation (83% hit rate)"
+    if cr < 20:
+        return "Mid-range turnover — 74% hit rate historically"
+    return "Higher turnover — 69% hit rate historically, still positive"
+
+
+# --------------------------------------------------------------------------
+# Smart circuit flash — only on state changes
+# --------------------------------------------------------------------------
+
+def smart_circuit_alert(data: dict) -> str | None:
+    """
+    Compare current scan to what was already alerted.
+    Only produce a message if there are NEW stocks or STATUS CHANGES.
+    """
+    global _alerted_date, _alerted_symbols
+
+    as_of = data.get("as_of", "")
+    if as_of != _alerted_date:
+        _alerted_date = as_of
+        _alerted_symbols = {}
 
     latest = data.get("latest", [])
+    scan_time = data.get("latest_scan", "?")
 
-    # Group by status
-    at_circuit = [r for r in latest if r.get("status") == "at_circuit"]
-    locked = [r for r in latest if r.get("status") == "locked"]
-    approaching = [r for r in latest if r.get("status") == "approaching"]
-    heating = [r for r in latest if r.get("status") == "heating"]
+    # Find what's new or changed
+    new_stocks = []
+    status_changes = []
+    for r in latest:
+        sym = r.get("symbol", "")
+        status = r.get("status", "")
+        if status == "heating":
+            continue  # don't alert on heating — too early, too noisy
 
-    if at_circuit:
-        lines.append("🟢 <b>AT CIRCUIT</b> (sellers present)")
-        for r in at_circuit[:10]:
-            band = f"{int(r.get('band', 0) * 100)}%" if r.get("band") else "?"
-            turn = f"₹{r.get('med_turn20', 0) / 100:.0f}cr" if r.get("med_turn20") else ""
-            lines.append(f"  <b>{r['symbol']}</b> · {band} band · ₹{r.get('ltp', '?')} · {turn}")
+        prev_status = _alerted_symbols.get(sym)
+        if prev_status is None:
+            new_stocks.append(r)
+        elif prev_status != status:
+            status_changes.append((r, prev_status))
+
+    if not new_stocks and not status_changes:
+        return None  # nothing changed — stay silent
+
+    lines = [f"⚡ <b>Circuit Flash — {scan_time} IST</b>\n"]
+
+    if new_stocks:
+        for r in new_stocks:
+            sym = r["symbol"]
+            status = r.get("status", "")
+            band = float(r.get("band", 0))
+            band_pct = f"{int(band * 100)}%" if band else "?"
+            ltp = r.get("ltp", "?")
+            med = r.get("med_turn20")
+
+            # Status emoji
+            if status == "locked":
+                emoji = "🔒"
+                fill_note = f"Queue only — {_qty(r.get('total_buy_qty'))} buyers, no sellers"
+            elif status == "at_circuit":
+                emoji = "🟢"
+                fill_note = "Sellers present on the book"
+            else:
+                emoji = "🟡"
+                dist = r.get("distance_to_circuit")
+                fill_note = f"{dist * 100:.1f}% away" if dist is not None else "approaching"
+
+            lines.append(f"{emoji} <b>{sym}</b> — {band_pct} band · ₹{ltp}")
+            lines.append(f"   {fill_note}")
+            lines.append(f"   Turnover {_turn(med)}")
+
+            # Context line
+            ctx = _band_context(band)
+            if ctx:
+                lines.append(f"   <i>{ctx}</i>")
+            tctx = _turnover_context(med)
+            if tctx:
+                lines.append(f"   <i>{tctx}</i>")
+            lines.append("")
+
+    if status_changes:
+        lines.append("<b>Status changes:</b>")
+        for r, prev in status_changes:
+            sym = r["symbol"]
+            new_st = r.get("status", "")
+            arrow = {"locked": "🔒", "at_circuit": "🟢", "approaching": "🟡"}.get(new_st, "•")
+            prev_label = {"locked": "locked", "at_circuit": "at circuit", "approaching": "approaching", "heating": "heating"}.get(prev, prev)
+            new_label = {"locked": "locked", "at_circuit": "at circuit (sellers appeared!)", "approaching": "approaching"}.get(new_st, new_st)
+
+            note = ""
+            if prev == "locked" and new_st == "at_circuit":
+                note = " — sellers just appeared on the book"
+            elif prev == "approaching" and new_st in ("at_circuit", "locked"):
+                note = " — just reached the circuit"
+
+            lines.append(f"  {arrow} <b>{sym}</b>: {prev_label} → {new_label}{note}")
         lines.append("")
 
-    if locked:
-        lines.append("🔒 <b>LOCKED</b> (queue only)")
-        for r in locked[:10]:
-            band = f"{int(r.get('band', 0) * 100)}%" if r.get("band") else "?"
-            buy_q = _qty_fmt(r.get("total_buy_qty"))
-            lines.append(f"  <b>{r['symbol']}</b> · {band} band · ₹{r.get('ltp', '?')} · {buy_q} buyers")
-        lines.append("")
+    # Update state
+    for r in latest:
+        status = r.get("status", "")
+        if status != "heating":
+            _alerted_symbols[r.get("symbol", "")] = status
 
-    if approaching:
-        lines.append("🟡 <b>APPROACHING</b> (within 1%)")
-        for r in approaching[:8]:
-            band = f"{int(r.get('band', 0) * 100)}%" if r.get("band") else "?"
-            dist = r.get("distance_to_circuit")
-            dist_str = f"{dist * 100:.1f}% away" if dist is not None else ""
-            fill = "✓ sellers" if r.get("fillable") else "no sellers"
-            lines.append(f"  <b>{r['symbol']}</b> · {band} band · {dist_str} · {fill}")
-        lines.append("")
-
-    if heating:
-        lines.append(f"🔥 <b>HEATING</b> ({len(heating)} stocks)")
-        for r in heating[:5]:
-            lines.append(f"  {r['symbol']} +{r.get('pchange', 0):.1f}%")
-        if len(heating) > 5:
-            lines.append(f"  ... and {len(heating) - 5} more")
-        lines.append("")
-
-    # Summary line
-    parts = []
-    if summary.get("at_circuit", 0):
-        parts.append(f"{summary['at_circuit']} at circuit")
-    if summary.get("locked", 0):
-        parts.append(f"{summary['locked']} locked")
-    if summary.get("approaching", 0):
-        parts.append(f"{summary['approaching']} approaching")
-    if summary.get("heating", 0):
-        parts.append(f"{summary['heating']} heating")
-    lines.append(f"📊 {' · '.join(parts)}")
-
-    scans = data.get("scans", [])
-    lines.append(f"🔄 Scan {len(scans)} of the day")
+    total_at = sum(1 for r in latest if r.get("status") in ("at_circuit", "locked"))
+    lines.append(f"📊 {total_at} stocks at circuit right now")
+    lines.append("\n<i>What the scanner observes, not a recommendation.</i>")
 
     return "\n".join(lines)
 
 
-def format_eod_summary(carry_data: dict) -> str:
-    """Format the end-of-day carry summary for both channels."""
-    lines = [f"📋 <b>Circuit Carry — EOD Summary</b>"]
-    as_of = carry_data.get("as_of", "?")
-    lines.append(f"📅 {as_of}\n")
-
-    latest = carry_data.get("latest", [])
-    if not latest:
-        lines.append("No stocks at circuit today.")
-        return "\n".join(lines)
-
-    source = carry_data.get("source", "eod")
-    lines.append(f"<b>{len(latest)} stocks</b> closed at circuit today"
-                 f" ({source} snapshot)\n")
-
-    for r in latest[:20]:
-        band = f"{int(float(r.get('band', 0)) * 100)}%" if r.get("band") else "?"
-        fill = "✅" if r.get("fillable") else "🔒"
-        lines.append(f"{fill} <b>{r.get('symbol', '?')}</b> · {band} · "
-                     f"₹{r.get('ltp', '?')}")
-
-    if len(latest) > 20:
-        lines.append(f"... and {len(latest) - 20} more")
-
-    # Pending count
-    pending = carry_data.get("pending", 0)
-    if pending:
-        lines.append(f"\n⏳ {pending} stocks awaiting next-session results")
-
-    lines.append("\n<i>Observational data, not a recommendation.</i>")
-    return "\n".join(lines)
-
+# --------------------------------------------------------------------------
+# Morning scorecard — accountability
+# --------------------------------------------------------------------------
 
 def format_morning_scorecard(carry_data: dict) -> str | None:
-    """
-    How yesterday's circuit stocks opened. Sent at 9:15 AM.
-    Uses the daily history from the carry payload.
-    """
+    """Per-stock results from the most recent scored session."""
     daily = carry_data.get("daily", [])
+    history = carry_data.get("history", [])
     if not daily:
         return None
 
-    # Most recent scored day
     scored = [d for d in daily if d.get("mean_btst") is not None]
     if not scored:
         return None
 
     d = scored[0]
-    lines = [f"☀️ <b>Morning Scorecard</b>"]
-    lines.append(f"📅 Results for circuit list of {d['as_of']}\n")
-    lines.append(f"📊 <b>{d.get('hits', 0)}/{d.get('n', 0)}</b> reached +4% next session")
-    lines.append(f"📈 Mean move: <b>{d.get('mean_btst', 0) * 100:+.1f}%</b>")
-    lines.append(f"🏆 Best: {d.get('best', 0) * 100:+.1f}%  "
-                 f"📉 Worst: {d.get('worst', 0) * 100:+.1f}%")
+    as_of = d["as_of"]
 
-    # Overall stats
+    lines = [f"☀️ <b>Morning Brief</b>"]
+    lines.append(f"Results for circuit list of {as_of}\n")
+
+    # Per-stock results
+    day_stocks = [r for r in history if str(r.get("as_of")) == str(as_of)]
+    if day_stocks:
+        day_stocks.sort(key=lambda r: -(r.get("btst") or -999))
+        for r in day_stocks:
+            sym = r.get("symbol", "?")
+            btst = r.get("btst")
+            hit = r.get("hit4")
+            fill = r.get("fillable")
+            band = f"{int(float(r.get('band', 0)) * 100)}%" if r.get("band") else "?"
+
+            if fill is False:
+                emoji = "🔒"
+                result = "locked — no fill possible"
+            elif btst is None:
+                emoji = "⏳"
+                result = "pending"
+            elif hit:
+                emoji = "✅"
+                result = f"reached +4% · move {btst * 100:+.1f}%"
+            else:
+                emoji = "❌"
+                result = f"did not reach · move {btst * 100:+.1f}%"
+
+            lines.append(f"{emoji} <b>{sym}</b> ({band}) — {result}")
+
+        lines.append("")
+
+    # Summary
+    n = d.get("n", 0)
+    hits = d.get("hits", 0)
+    mean = d.get("mean_btst", 0)
+    lines.append(f"<b>Score: {hits}/{n}</b> reached +4%")
+    lines.append(f"Mean move: {mean * 100:+.1f}%")
+
+    # Running track record
     summary = carry_data.get("summary", [])
-    all_bucket = next((s for s in summary if s.get("bucket") == "all"), None)
-    if all_bucket:
-        lines.append(f"\n📋 <b>Overall track record</b> ({all_bucket.get('sessions', '?')} sessions)")
-        lines.append(f"  Reached +4%: {all_bucket.get('hit4', 0) * 100:.0f}%")
-        lines.append(f"  Mean move: {all_bucket.get('mean_btst', 0) * 100:+.1f}%")
+    all_b = next((s for s in summary if s.get("bucket") == "all"), None)
+    if all_b:
+        lines.append(f"\n📋 <b>Running track record</b> ({all_b.get('sessions', '?')} sessions)")
+        lines.append(f"Reached +4%: {all_b.get('hit4', 0) * 100:.0f}% of the time")
+        lines.append(f"Mean move: {all_b.get('mean_btst', 0) * 100:+.1f}%")
+        lines.append(f"Share closing positive: {all_b.get('win_rate', 0) * 100:.0f}%")
 
-    lines.append("\n<i>Historical observations, not a performance claim.</i>")
+    lines.append("\n<i>Historical observations of past price data, not a performance claim.</i>")
     return "\n".join(lines)
 
 
-def format_scanners(data: dict) -> str | None:
-    """Format the broader scanner results."""
-    vol = data.get("unusual_volume", [])
-    movers = data.get("big_movers", [])
-    sectors = data.get("sector_pulse", [])
-    scan_time = data.get("scan_time", "?")
+# --------------------------------------------------------------------------
+# Midday pulse — ONE consolidated scanner message at 12:30
+# --------------------------------------------------------------------------
 
-    if not vol and not movers:
-        return None
+def format_midday_pulse(scanner_data: dict, circuit_data: dict) -> str | None:
+    """Single midday message combining circuit status + market movers."""
+    movers = scanner_data.get("big_movers", [])
+    vol = scanner_data.get("unusual_volume", [])
+    sectors = scanner_data.get("sector_pulse", [])
+    latest = circuit_data.get("latest", [])
+    summary = circuit_data.get("summary", {})
 
-    lines = [f"📡 <b>Market Pulse — {scan_time} IST</b>\n"]
+    lines = [f"📡 <b>Midday Pulse — 12:30 IST</b>\n"]
 
+    # Circuit status (compact)
+    at_c = sum(1 for r in latest if r.get("status") in ("at_circuit", "locked"))
+    approaching = sum(1 for r in latest if r.get("status") == "approaching")
+    if at_c or approaching:
+        lines.append(f"🔔 <b>Circuit:</b> {at_c} at circuit, {approaching} approaching")
+        for r in latest[:5]:
+            if r.get("status") in ("at_circuit", "locked", "approaching"):
+                st = {"locked": "🔒", "at_circuit": "🟢", "approaching": "🟡"}.get(r["status"], "•")
+                lines.append(f"  {st} {r['symbol']} ({int(float(r.get('band', 0)) * 100)}%)")
+        lines.append("")
+
+    # Top movers (compact, max 5)
     if movers:
-        lines.append(f"🚀 <b>Big Movers</b> ({len(movers)} stocks up 5%+)")
-        for r in movers[:8]:
-            lines.append(f"  <b>{r['symbol']}</b> +{r['pchange']:.1f}% · "
-                         f"₹{r['ltp']:.0f} · {r['sector']}")
-        if len(movers) > 8:
-            lines.append(f"  ... +{len(movers) - 8} more")
+        lines.append(f"🚀 <b>Big movers</b> ({len(movers)} stocks up 5%+)")
+        for r in movers[:5]:
+            lines.append(f"  <b>{r['symbol']}</b> +{r['pchange']:.1f}% · {r['sector']}")
+        if len(movers) > 5:
+            lines.append(f"  +{len(movers) - 5} more on the dashboard")
         lines.append("")
 
+    # Unusual volume (compact, max 5)
     if vol:
-        lines.append(f"📊 <b>Unusual Volume</b> ({len(vol)} stocks at 2x+ normal)")
-        for r in vol[:8]:
-            lines.append(f"  <b>{r['symbol']}</b> {r['vol_ratio']}x vol · "
-                         f"+{r['pchange']:.1f}% · {r['sector']}")
-        if len(vol) > 8:
-            lines.append(f"  ... +{len(vol) - 8} more")
-        lines.append("")
+        top_vol = [v for v in vol if v["vol_ratio"] >= 3][:5]
+        if top_vol:
+            lines.append(f"📊 <b>Volume spikes</b> (3x+ normal)")
+            for r in top_vol:
+                lines.append(f"  <b>{r['symbol']}</b> {r['vol_ratio']}x · +{r['pchange']:.1f}%")
+            lines.append("")
 
+    # Hot sectors (top 3 only)
     if sectors:
-        hot = [s for s in sectors if s["avg_change"] > 0.5][:5]
+        hot = [s for s in sectors if s["avg_change"] > 0.5][:3]
         if hot:
-            lines.append("🌡️ <b>Hot Sectors</b>")
+            lines.append("🌡️ <b>Hot sectors</b>")
             for s in hot:
-                lines.append(f"  {s['sector']} · {s['adv_pct']:.0f}% advancing · "
-                             f"avg +{s['avg_change']:.1f}% · "
+                lines.append(f"  {s['sector']} — {s['adv_pct']:.0f}% advancing, "
                              f"top: {s['best_stock']} +{s['best_change']:.1f}%")
+            lines.append("")
 
-    lines.append("\n<i>What's moving today — informational, not a recommendation.</i>")
+    if len(lines) <= 2:
+        return None  # nothing interesting today
+
+    lines.append("<i>What's moving — informational, not a recommendation.</i>")
     return "\n".join(lines)
 
 
-def format_eod_scanners(data: dict) -> str | None:
-    """Format EOD scanners (streaks + breakouts)."""
-    streaks = data.get("momentum_streaks", [])
-    breakouts = data.get("breakouts_52w", [])
+# --------------------------------------------------------------------------
+# EOD wrap — final circuit list + day summary
+# --------------------------------------------------------------------------
 
-    if not streaks and not breakouts:
-        return None
+def format_eod_wrap(carry_data: dict, scanner_data: dict | None = None) -> str:
+    """End-of-day combined summary for both channels."""
+    lines = [f"📋 <b>EOD Wrap — {carry_data.get('as_of', '?')}</b>\n"]
 
-    lines = [f"📋 <b>EOD Watchlists — {data.get('as_of', '?')}</b>\n"]
+    latest = carry_data.get("latest", [])
+    source = carry_data.get("source", "eod")
 
-    if breakouts:
-        lines.append(f"📈 <b>52-Week Breakouts</b> ({len(breakouts)} stocks)")
-        for r in breakouts[:10]:
-            lines.append(f"  <b>{r['symbol']}</b> ₹{r['close']:.0f} · "
-                         f"{r['from_high']:+.1f}% from high · "
-                         f"{r['vol_ratio']}x vol · {r['sector']}")
-        if len(breakouts) > 10:
-            lines.append(f"  ... +{len(breakouts) - 10} more")
+    if latest:
+        lines.append(f"🔔 <b>{len(latest)} stocks</b> closed at circuit ({source} snapshot)\n")
+        for r in latest[:15]:
+            band = f"{int(float(r.get('band', 0)) * 100)}%" if r.get("band") else "?"
+            fill = "✅" if r.get("fillable") else "🔒"
+            med = r.get("med_turn20")
+            lines.append(f"{fill} <b>{r.get('symbol', '?')}</b> · {band} · "
+                         f"₹{r.get('ltp', '?')} · {_turn(med)}")
+        if len(latest) > 15:
+            lines.append(f"   +{len(latest) - 15} more")
         lines.append("")
 
-    if streaks:
-        lines.append(f"🔥 <b>Momentum Streaks</b> ({len(streaks)} stocks, 3+ up days)")
-        for r in streaks[:10]:
-            lines.append(f"  <b>{r['symbol']}</b> ₹{r['close']:.0f} · "
-                         f"{r['streak']} days · +{r['cum_return']:.1f}% · {r['sector']}")
-        if len(streaks) > 10:
-            lines.append(f"  ... +{len(streaks) - 10} more")
+        # Context
+        fillable = sum(1 for r in latest if r.get("fillable"))
+        locked = len(latest) - fillable
+        if source == "live":
+            lines.append(f"📊 {fillable} with sellers present, {locked} queue only")
+    else:
+        lines.append("No stocks at circuit today.")
 
-    lines.append("\n<i>Informational watchlists, not recommendations.</i>")
+    # EOD scanner highlights (if available)
+    if scanner_data:
+        breakouts = scanner_data.get("breakouts_52w", [])
+        streaks = scanner_data.get("momentum_streaks", [])
+        if breakouts:
+            lines.append(f"\n📈 <b>52-week breakouts:</b> {len(breakouts)} stocks")
+            for r in breakouts[:3]:
+                lines.append(f"  {r['symbol']} ₹{r['close']:.0f} · "
+                             f"{r['vol_ratio']}x vol · {r['sector']}")
+        if streaks:
+            lines.append(f"\n🔥 <b>Momentum streaks:</b> {len(streaks)} stocks (3+ up days)")
+            for r in streaks[:3]:
+                lines.append(f"  {r['symbol']} · {r['streak']} days · +{r['cum_return']:.1f}%")
+
+    pending = carry_data.get("pending", 0)
+    if pending:
+        lines.append(f"\n⏳ {pending} stocks awaiting next-session results")
+
+    lines.append("\n<i>Tomorrow's morning brief will show how today's list performed.</i>")
+    lines.append("<i>Observations, not recommendations.</i>")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# Weekly digest — the conversion tool
+# --------------------------------------------------------------------------
+
+def format_weekly_digest(carry_data: dict) -> str | None:
+    """Weekly summary for both channels."""
+    daily = carry_data.get("daily", [])
+    summary = carry_data.get("summary", [])
+    if not daily:
+        return None
+
+    # Last 5 trading days
+    recent = [d for d in daily if d.get("mean_btst") is not None][:5]
+    if not recent:
+        return None
+
+    all_b = next((s for s in summary if s.get("bucket") == "all"), None)
+
+    total_n = sum(d.get("n", 0) for d in recent)
+    total_hits = sum(d.get("hits", 0) for d in recent)
+    mean_btst = sum(d.get("mean_btst", 0) * d.get("n", 0) for d in recent) / max(total_n, 1)
+    best = max((d.get("best", -1) for d in recent), default=0)
+    worst = min((d.get("worst", 1) for d in recent), default=0)
+
+    lines = [f"📊 <b>Weekly Digest</b>\n"]
+    lines.append(f"This week: <b>{total_n} circuit observations</b> → "
+                 f"<b>{total_hits} reached +4%</b> ({total_hits / max(total_n, 1) * 100:.0f}%)")
+    lines.append(f"Mean next-session move: {mean_btst * 100:+.1f}%")
+    lines.append(f"Best: {best * 100:+.1f}% · Worst: {worst * 100:+.1f}%\n")
+
+    # Per-day breakdown
+    lines.append("<b>Day by day:</b>")
+    for d in recent:
+        dt = d.get("as_of", "?")
+        n = d.get("n", 0)
+        h = d.get("hits", 0)
+        m = d.get("mean_btst", 0)
+        lines.append(f"  {dt}: {h}/{n} hit · mean {m * 100:+.1f}%")
+
+    # Cumulative track record
+    if all_b:
+        lines.append(f"\n📋 <b>All-time track record</b>")
+        lines.append(f"  {all_b.get('n', '?')} observations over {all_b.get('sessions', '?')} sessions")
+        lines.append(f"  Reached +4%: {all_b.get('hit4', 0) * 100:.0f}%")
+        lines.append(f"  Mean move: {all_b.get('mean_btst', 0) * 100:+.1f}%")
+        lines.append(f"  Share positive: {all_b.get('win_rate', 0) * 100:.0f}%")
+
+    lines.append(f"\n💡 Pro subscribers see circuit flashes in real-time during market hours.")
+    lines.append("<i>Historical observations, not a performance claim or projection.</i>")
     return "\n".join(lines)
 
 
@@ -313,35 +458,47 @@ def format_eod_scanners(data: dict) -> str | None:
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python telegram_bot.py [circuit|eod|morning|scanners|eod-scanners|test]")
+        print("Usage: python telegram_bot.py [test|circuit|midday|eod|morning|weekly]")
         return
 
     cmd = sys.argv[1]
-
-    if cmd == "test":
-        ok = _send(PAID_CHAT or FREE_CHAT,
-                    "✅ <b>Bot connected!</b>\nAlerts will appear here.")
-        print(f"Test message: {'sent' if ok else 'FAILED'}")
-        return
-
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-    if cmd == "circuit":
+    if cmd == "test":
+        ok1 = _send(FREE_CHAT, "✅ <b>Free channel connected.</b> EOD summaries + morning briefs appear here.")
+        ok2 = _send(PAID_CHAT, "✅ <b>Pro channel connected.</b> Real-time circuit flashes + midday pulse appear here.")
+        print(f"Free: {'OK' if ok1 else 'FAIL'}, Paid: {'OK' if ok2 else 'FAIL'}")
+
+    elif cmd == "circuit":
         import carry
         data = carry.intraday_payload()
-        msg = format_circuit_alert(data)
+        msg = smart_circuit_alert(data)
         if msg:
             send_paid(msg)
-            print(f"[telegram] circuit alert sent ({len(msg)} chars)")
+            print(f"[telegram] circuit flash sent")
         else:
-            print("[telegram] nothing to alert")
+            print("[telegram] no changes to alert")
+
+    elif cmd == "midday":
+        import carry, scanners
+        sd = scanners.intraday_all()
+        cd = carry.intraday_payload()
+        msg = format_midday_pulse(sd, cd)
+        if msg:
+            send_paid(msg)
+            print(f"[telegram] midday pulse sent")
 
     elif cmd == "eod":
         import carry
-        data = carry.payload()
-        msg = format_eod_summary(data)
+        cd = carry.payload()
+        try:
+            import scanners
+            sd = scanners.eod_all()
+        except Exception:
+            sd = None
+        msg = format_eod_wrap(cd, sd)
         send_both(msg)
-        print(f"[telegram] EOD summary sent to both channels")
+        print(f"[telegram] EOD wrap sent to both")
 
     elif cmd == "morning":
         import carry
@@ -349,25 +506,15 @@ def main():
         msg = format_morning_scorecard(data)
         if msg:
             send_both(msg)
-            print(f"[telegram] morning scorecard sent")
-        else:
-            print("[telegram] no scored data for scorecard")
+            print(f"[telegram] morning brief sent")
 
-    elif cmd == "scanners":
-        import scanners
-        data = scanners.intraday_all()
-        msg = format_scanners(data)
-        if msg:
-            send_paid(msg)
-            print(f"[telegram] scanner alert sent ({len(msg)} chars)")
-
-    elif cmd == "eod-scanners":
-        import scanners
-        data = scanners.eod_all()
-        msg = format_eod_scanners(data)
+    elif cmd == "weekly":
+        import carry
+        data = carry.payload()
+        msg = format_weekly_digest(data)
         if msg:
             send_both(msg)
-            print(f"[telegram] EOD scanners sent")
+            print(f"[telegram] weekly digest sent")
 
     else:
         print(f"Unknown command: {cmd}")

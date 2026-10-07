@@ -1579,13 +1579,15 @@ def api_cron_carry_scan():
             n = carry.save_intraday_scan(rows)
             summary = rows["status"].value_counts().to_dict() if not rows.empty else {}
             print(f"[cron] intraday scan: {n} rows - {summary}")
-            # Send Telegram alert to paid channel
+            # Smart circuit flash — only alerts when something CHANGED
             try:
                 data = carry.intraday_payload()
-                msg = telegram_bot.format_circuit_alert(data)
+                msg = telegram_bot.smart_circuit_alert(data)
                 if msg:
                     telegram_bot.send_paid(msg)
-                    print(f"[cron] telegram circuit alert sent")
+                    print(f"[cron] circuit flash sent (new/changed stocks)")
+                else:
+                    print(f"[cron] circuit: no changes since last alert — staying silent")
             except Exception as tg_exc:
                 print(f"[cron] telegram alert failed: {tg_exc}")
         except Exception as exc:
@@ -1636,20 +1638,13 @@ def api_cron_scanner_scan():
         global _scanner_cache
         try:
             import scanners
-            import telegram_bot
             data = scanners.intraday_all()
             _scanner_cache["intraday"] = data
             print(f"[cron] scanners: {len(data.get('big_movers', []))} movers, "
                   f"{len(data.get('unusual_volume', []))} unusual vol, "
                   f"{len(data.get('sector_pulse', []))} sectors")
-            # Telegram alert to paid channel
-            try:
-                msg = telegram_bot.format_scanners(data)
-                if msg:
-                    telegram_bot.send_paid(msg)
-                    print(f"[cron] telegram scanner alert sent")
-            except Exception as tg_exc:
-                print(f"[cron] telegram scanner alert failed: {tg_exc}")
+            # No Telegram here — midday pulse is sent once at 12:30,
+            # not on every 30-min scan. See /api/cron/telegram-midday.
         except Exception as exc:
             print(f"[cron] scanners failed: {exc}")
         finally:
@@ -1690,15 +1685,19 @@ def api_cron_scanner_eod():
 
 @app.post("/api/cron/telegram-eod")
 def api_cron_telegram_eod():
-    """Send EOD circuit summary to both Telegram channels."""
+    """
+    EOD wrap — circuit list + scanner highlights. Send at 15:45 IST.
+    Replaces the old timer-based approach with one consolidated message.
+    """
     def work():
         try:
             import carry
             import telegram_bot
-            data = carry.payload()
-            msg = telegram_bot.format_eod_summary(data)
+            cd = carry.payload()
+            sd = _scanner_cache.get("eod")
+            msg = telegram_bot.format_eod_wrap(cd, sd)
             telegram_bot.send_both(msg)
-            print(f"[cron] telegram EOD carry summary sent")
+            print(f"[cron] telegram EOD wrap sent to both channels")
         except Exception as exc:
             print(f"[cron] telegram EOD failed: {exc}")
 
@@ -1720,6 +1719,55 @@ def api_cron_telegram_morning():
                 print(f"[cron] telegram morning scorecard sent")
         except Exception as exc:
             print(f"[cron] telegram morning failed: {exc}")
+
+    threading.Thread(target=work, daemon=True).start()
+    return jsonify({"status": "started"}), 202
+
+
+@app.post("/api/cron/telegram-midday")
+def api_cron_telegram_midday():
+    """
+    Midday pulse — ONE consolidated message at 12:30 IST.
+    Combines circuit status + big movers + volume spikes + hot sectors.
+    """
+    def work():
+        try:
+            import carry
+            import telegram_bot
+            sd = _scanner_cache.get("intraday", {})
+            cd = carry.intraday_payload()
+            msg = telegram_bot.format_midday_pulse(sd, cd)
+            if msg:
+                telegram_bot.send_paid(msg)
+                print(f"[cron] midday pulse sent to paid channel")
+            else:
+                print(f"[cron] midday: nothing interesting to send")
+        except Exception as exc:
+            print(f"[cron] telegram midday failed: {exc}")
+
+    threading.Thread(target=work, daemon=True).start()
+    return jsonify({"status": "started"}), 202
+
+
+@app.post("/api/cron/telegram-weekly")
+def api_cron_telegram_weekly():
+    """
+    Weekly digest — cumulative track record + this week's results.
+    Schedule for Saturday 10:00 IST.
+    """
+    def work():
+        try:
+            import carry
+            import telegram_bot
+            data = carry.payload()
+            msg = telegram_bot.format_weekly_digest(data)
+            if msg:
+                telegram_bot.send_both(msg)
+                print(f"[cron] weekly digest sent to both channels")
+            else:
+                print(f"[cron] weekly: no data for digest")
+        except Exception as exc:
+            print(f"[cron] telegram weekly failed: {exc}")
 
     threading.Thread(target=work, daemon=True).start()
     return jsonify({"status": "started"}), 202
