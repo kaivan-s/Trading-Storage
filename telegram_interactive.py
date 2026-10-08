@@ -28,6 +28,17 @@ import pandas as pd
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
+# Bot commands shown in Telegram's / menu
+BOT_COMMANDS = [
+    {"command": "heatmap", "description": "🗺️ Sector rotation map"},
+    {"command": "flow", "description": "🔄 Money flowing into/out of sectors"},
+    {"command": "triggers", "description": "🎯 Stocks near breakout trigger"},
+    {"command": "delivery", "description": "📦 Unusual institutional delivery"},
+    {"command": "changed", "description": "📋 What changed since yesterday"},
+    {"command": "sector", "description": "🏭 Sector overview — /sector Retailing"},
+    {"command": "help", "description": "📖 All commands"},
+]
+
 KLASS_EMOJI = {
     "CROSSING": "🟢", "PULLBACK": "🟡", "BASE": "⚪",
     "CROSSING_UNVERIFIED": "🟠", "DOWN": "🔴",
@@ -35,16 +46,26 @@ KLASS_EMOJI = {
 }
 
 
-def _reply(chat_id: int, text: str, parse_mode: str = "HTML") -> bool:
+def _reply(chat_id: int, text: str, parse_mode: str = "HTML",
+           buttons: list[list[dict]] | None = None) -> bool:
+    """
+    Send a message, optionally with inline keyboard buttons.
+
+    buttons format: [[{"text": "Label", "callback_data": "cmd"}], ...]
+    Each inner list is one row of buttons.
+    """
     if not BOT_TOKEN:
         return False
+    payload: dict = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": parse_mode,
+        "link_preview_options": {"is_disabled": True},
+    }
+    if buttons:
+        payload["reply_markup"] = {"inline_keyboard": buttons}
     try:
-        r = requests.post(f"{API}/sendMessage", json={
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": parse_mode,
-            "link_preview_options": {"is_disabled": True},
-        }, timeout=15)
+        r = requests.post(f"{API}/sendMessage", json=payload, timeout=15)
         if not r.ok:
             print(f"[tg-bot] reply failed: {r.status_code} {r.text[:200]}")
         return r.ok
@@ -53,10 +74,24 @@ def _reply(chat_id: int, text: str, parse_mode: str = "HTML") -> bool:
         return False
 
 
-def _send_long(chat_id: int, text: str):
-    """Split long messages at the 4096-char Telegram limit."""
+def _answer_callback(callback_id: str, text: str = "") -> bool:
+    """Acknowledge a button press (removes the loading spinner)."""
+    if not BOT_TOKEN:
+        return False
+    try:
+        requests.post(f"{API}/answerCallbackQuery", json={
+            "callback_query_id": callback_id,
+            "text": text,
+        }, timeout=10)
+        return True
+    except Exception:
+        return False
+
+
+def _send_long(chat_id: int, text: str, buttons: list[list[dict]] | None = None):
+    """Split long messages; attach buttons only to the last chunk."""
     if len(text) <= 4000:
-        _reply(chat_id, text)
+        _reply(chat_id, text, buttons=buttons)
         return
     chunks = []
     current = ""
@@ -68,8 +103,37 @@ def _send_long(chat_id: int, text: str):
             current = current + "\n" + line if current else line
     if current:
         chunks.append(current)
-    for chunk in chunks:
-        _reply(chat_id, chunk)
+    for i, chunk in enumerate(chunks):
+        is_last = (i == len(chunks) - 1)
+        _reply(chat_id, chunk, buttons=buttons if is_last else None)
+
+
+# Inline button layouts used across commands
+MAIN_MENU_BUTTONS = [
+    [
+        {"text": "🗺️ Heatmap", "callback_data": "/heatmap"},
+        {"text": "🔄 Flow", "callback_data": "/flow"},
+        {"text": "🎯 Triggers", "callback_data": "/triggers"},
+    ],
+    [
+        {"text": "📦 Delivery", "callback_data": "/delivery"},
+        {"text": "📋 Changed", "callback_data": "/changed"},
+        {"text": "📖 Help", "callback_data": "/help"},
+    ],
+]
+
+
+def _stock_buttons(symbol: str, sector: str | None = None) -> list[list[dict]]:
+    """Buttons shown after a stock report."""
+    row1 = []
+    if sector:
+        row1.append({"text": f"🏭 {sector[:20]}", "callback_data": f"/sector {sector}"})
+    row1.append({"text": "🎯 Triggers", "callback_data": "/triggers"})
+    row2 = [
+        {"text": "🗺️ Heatmap", "callback_data": "/heatmap"},
+        {"text": "🔄 Flow", "callback_data": "/flow"},
+    ]
+    return [row1, row2]
 
 
 # --------------------------------------------------------------------------
@@ -81,19 +145,10 @@ def handle_start(chat_id: int):
         "👋 <b>Welcome to Morrow Desk</b>\n\n"
         "I analyse NSE stocks using sector structure, coil patterns, "
         "volume, delivery and momentum.\n\n"
-        "<b>Try it:</b>\n"
-        "  Just type a stock — <code>TRENT</code>\n\n"
-        "<b>Market views:</b>\n"
-        "  /heatmap — sector rotation map\n"
-        "  /flow — money flowing into/out of sectors\n"
-        "  /triggers — stocks near breakout trigger\n"
-        "  /delivery — unusual institutional delivery\n"
-        "  /changed — what changed since yesterday\n\n"
-        "<b>Lookups:</b>\n"
-        "  /r SYMBOL — full stock report\n"
-        "  /sector NAME — sector overview\n\n"
-        "<i>All analysis is observational, not a recommendation.</i>"
-    ))
+        "📝 <b>Just type any stock name</b> — <code>TRENT</code>, "
+        "<code>RELIANCE</code>, <code>Tata Motors</code>\n\n"
+        "Or tap a button below to explore the market 👇"
+    ), buttons=MAIN_MENU_BUTTONS)
 
 
 def handle_help(chat_id: int):
@@ -101,17 +156,11 @@ def handle_help(chat_id: int):
         "📖 <b>Commands</b>\n\n"
         "<b>Stock report:</b>\n"
         "  Just type a symbol: <code>TRENT</code>\n"
-        "  Or: <code>/r TRENT</code>\n"
         "  Also works: <code>Tata Motors</code>\n\n"
         "<b>Sector:</b>\n"
         "  <code>/sector Retailing</code>\n\n"
-        "<b>Market views:</b>\n"
-        "  /heatmap — all sectors at a glance\n"
-        "  /flow — where money is flowing\n"
-        "  /triggers — stocks within 2% of breakout\n"
-        "  /delivery — unusual delivery activity\n"
-        "  /changed — daily changes digest\n"
-    ))
+        "Tap any button below, or use the ≡ menu 👇"
+    ), buttons=MAIN_MENU_BUTTONS)
 
 
 # --------------------------------------------------------------------------
@@ -249,7 +298,10 @@ def handle_report(chat_id: int, query: str, engine):
     except Exception as exc:
         _reply(chat_id, f"❌ Error: {str(exc)[:200]}")
         return
-    _send_long(chat_id, _fmt_report(data))
+    # Contextual buttons after the report
+    sector = data.get("sector") if data.get("found") else None
+    btns = _stock_buttons(data.get("symbol", ""), sector) if data.get("found") else MAIN_MENU_BUTTONS
+    _send_long(chat_id, _fmt_report(data), buttons=btns)
 
 
 # --------------------------------------------------------------------------
@@ -327,7 +379,11 @@ def handle_sector(chat_id: int, query: str, engine):
     if data is None:
         _reply(chat_id, "⏳ Engine not ready.")
         return
-    _send_long(chat_id, _fmt_sector(data))
+    btns = [
+        [{"text": "🗺️ Heatmap", "callback_data": "/heatmap"},
+         {"text": "🔄 Flow", "callback_data": "/flow"}],
+    ]
+    _send_long(chat_id, _fmt_sector(data), buttons=btns)
 
 
 # --------------------------------------------------------------------------
@@ -383,7 +439,12 @@ def handle_heatmap(chat_id: int, engine):
     lines.append(f"   {(crossing + pullback) / max(total, 1) * 100:.0f}% of sectors in uptrend")
 
     lines.append("\n<i>Sector rotation analysis — not a recommendation.</i>")
-    _send_long(chat_id, "\n".join(lines))
+    btns = [
+        [{"text": "🔄 Flow", "callback_data": "/flow"},
+         {"text": "🎯 Triggers", "callback_data": "/triggers"},
+         {"text": "📋 Changed", "callback_data": "/changed"}],
+    ]
+    _send_long(chat_id, "\n".join(lines), buttons=btns)
 
 
 # --------------------------------------------------------------------------
@@ -444,7 +505,12 @@ def handle_flow(chat_id: int, engine):
 
     lines.append("💡 <i>CMF (Chaikin Money Flow) measures buying vs selling pressure "
                  "weighted by volume. Positive = accumulation, negative = distribution.</i>")
-    _send_long(chat_id, "\n".join(lines))
+    btns = [
+        [{"text": "🗺️ Heatmap", "callback_data": "/heatmap"},
+         {"text": "🎯 Triggers", "callback_data": "/triggers"},
+         {"text": "📦 Delivery", "callback_data": "/delivery"}],
+    ]
+    _send_long(chat_id, "\n".join(lines), buttons=btns)
 
 
 # --------------------------------------------------------------------------
@@ -519,7 +585,12 @@ def handle_triggers(chat_id: int, engine):
     lines.append("💡 <i>A close above the trigger on rising volume = confirmed "
                  "breakout. The trigger is the 20-day high — the price above which "
                  "the base has been overcome.</i>")
-    _send_long(chat_id, "\n".join(lines))
+    btns = [
+        [{"text": "🗺️ Heatmap", "callback_data": "/heatmap"},
+         {"text": "📦 Delivery", "callback_data": "/delivery"},
+         {"text": "🔄 Flow", "callback_data": "/flow"}],
+    ]
+    _send_long(chat_id, "\n".join(lines), buttons=btns)
 
 
 # --------------------------------------------------------------------------
@@ -614,7 +685,12 @@ def handle_delivery(chat_id: int, engine):
     lines.append("\n💡 <i>Delivery % = shares actually transferred to demat accounts "
                  "(not squared off intraday). High delivery on rising prices suggests "
                  "institutional buying. NSE-unique metric.</i>")
-    _send_long(chat_id, "\n".join(lines))
+    btns = [
+        [{"text": "🗺️ Heatmap", "callback_data": "/heatmap"},
+         {"text": "🎯 Triggers", "callback_data": "/triggers"},
+         {"text": "📋 Changed", "callback_data": "/changed"}],
+    ]
+    _send_long(chat_id, "\n".join(lines), buttons=btns)
 
 
 # --------------------------------------------------------------------------
@@ -729,28 +805,16 @@ def handle_changed(chat_id: int, engine):
                      "session's data isn't saved yet.</i>")
 
     lines.append("\n<i>Changes compared to the most recent saved session.</i>")
-    _send_long(chat_id, "\n".join(lines))
+    _send_long(chat_id, "\n".join(lines), buttons=MAIN_MENU_BUTTONS)
 
 
 # --------------------------------------------------------------------------
 # Webhook dispatcher
 # --------------------------------------------------------------------------
 
-def process_update(update: dict, engine) -> None:
-    """Process one Telegram update from the webhook."""
-    msg = update.get("message") or {}
-    text = (msg.get("text") or "").strip()
-    chat_id = msg.get("chat", {}).get("id")
-
-    if not chat_id or not text:
-        return
-
-    # Only respond in private DMs
-    chat_type = msg.get("chat", {}).get("type", "private")
-    if chat_type not in ("private",):
-        return
-
-    lower = text.lower()
+def _dispatch(chat_id: int, text: str, engine) -> None:
+    """Route a text command (from message or button callback)."""
+    lower = text.lower().strip()
 
     if lower == "/start":
         handle_start(chat_id)
@@ -773,14 +837,59 @@ def process_update(update: dict, engine) -> None:
         query = text.split(maxsplit=1)[1] if " " in text else ""
         handle_sector(chat_id, query.strip(), engine)
     elif text.startswith("/"):
-        _reply(chat_id, "Unknown command. Try /help")
+        _reply(chat_id, "Unknown command. Try /help", buttons=MAIN_MENU_BUTTONS)
     else:
         handle_report(chat_id, text.strip(), engine)
+
+
+def process_update(update: dict, engine) -> None:
+    """Process one Telegram update from the webhook."""
+
+    # Handle button presses (callback_query)
+    cb = update.get("callback_query")
+    if cb:
+        chat_id = cb.get("message", {}).get("chat", {}).get("id")
+        data = cb.get("data", "")
+        cb_id = cb.get("id", "")
+        if chat_id and data:
+            _answer_callback(cb_id)
+            _dispatch(chat_id, data, engine)
+        return
+
+    # Handle text messages
+    msg = update.get("message") or {}
+    text = (msg.get("text") or "").strip()
+    chat_id = msg.get("chat", {}).get("id")
+
+    if not chat_id or not text:
+        return
+
+    # Only respond in private DMs
+    chat_type = msg.get("chat", {}).get("type", "private")
+    if chat_type not in ("private",):
+        return
+
+    _dispatch(chat_id, text, engine)
 
 
 # --------------------------------------------------------------------------
 # Webhook management
 # --------------------------------------------------------------------------
+
+def set_commands() -> bool:
+    """Register the bot command menu with Telegram."""
+    if not BOT_TOKEN:
+        return False
+    try:
+        r = requests.post(f"{API}/setMyCommands", json={
+            "commands": BOT_COMMANDS,
+        }, timeout=15)
+        print(f"[telegram] setMyCommands: {r.status_code}")
+        return r.ok
+    except Exception as exc:
+        print(f"[telegram] setMyCommands failed: {exc}")
+        return False
+
 
 def set_webhook(url: str) -> bool:
     if not BOT_TOKEN:
@@ -788,9 +897,11 @@ def set_webhook(url: str) -> bool:
     try:
         r = requests.post(f"{API}/setWebhook", json={
             "url": url,
-            "allowed_updates": ["message"],
+            "allowed_updates": ["message", "callback_query"],
         }, timeout=15)
         print(f"[telegram] setWebhook: {r.status_code} {r.text[:200]}")
+        # Also register the command menu
+        set_commands()
         return r.ok
     except Exception as exc:
         print(f"[telegram] setWebhook failed: {exc}")
