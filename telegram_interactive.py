@@ -26,7 +26,114 @@ import numpy as np
 import pandas as pd
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+PAID_CHAT = os.environ.get("TELEGRAM_PAID_CHAT", "")
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+
+# --------------------------------------------------------------------------
+# Freemium gating
+# --------------------------------------------------------------------------
+# Stock reports (/r, plain text)  → FREE, unlimited
+# Market views (/heatmap, /flow, /triggers, /delivery, /changed)
+#   → FREE: 3 per day
+#   → PAID: unlimited
+#
+# "Paid" = member of the paid Telegram channel. No separate DB needed.
+# --------------------------------------------------------------------------
+
+FREE_DAILY_LIMIT = 3
+_PAID_COMMANDS = {"/heatmap", "/flow", "/triggers", "/delivery", "/changed"}
+
+# In-memory usage tracker: {user_id: {"date": "YYYY-MM-DD", "count": int}}
+_usage: dict[int, dict] = {}
+
+# Cache paid status for 10 min to avoid hammering the API
+_paid_cache: dict[int, tuple[float, bool]] = {}
+_PAID_CACHE_TTL = 600
+
+
+def _is_paid(user_id: int) -> bool:
+    """Check if a user is a member of the paid channel."""
+    import time as _time
+
+    if not PAID_CHAT or not BOT_TOKEN:
+        return False
+
+    # Check cache
+    cached = _paid_cache.get(user_id)
+    if cached and (_time.time() - cached[0]) < _PAID_CACHE_TTL:
+        return cached[1]
+
+    try:
+        r = requests.get(f"{API}/getChatMember", params={
+            "chat_id": PAID_CHAT,
+            "user_id": user_id,
+        }, timeout=10)
+        if r.ok:
+            status = r.json().get("result", {}).get("status", "")
+            is_member = status in ("member", "administrator", "creator")
+            _paid_cache[user_id] = (_time.time(), is_member)
+            return is_member
+    except Exception as exc:
+        print(f"[tg-bot] paid check failed: {exc}")
+
+    _paid_cache[user_id] = (_time.time(), False)
+    return False
+
+
+def _check_limit(user_id: int, command: str) -> bool:
+    """
+    Returns True if the user can use this command.
+    Returns False if they've hit the free daily limit.
+    """
+    from datetime import date as _date
+
+    # Stock reports are always free
+    if command not in _PAID_COMMANDS:
+        return True
+
+    # Paid users have no limit
+    if _is_paid(user_id):
+        return True
+
+    # Free user: check daily usage
+    today = _date.today().isoformat()
+    usage = _usage.get(user_id, {})
+    if usage.get("date") != today:
+        usage = {"date": today, "count": 0}
+
+    if usage["count"] >= FREE_DAILY_LIMIT:
+        return False
+
+    usage["count"] += 1
+    _usage[user_id] = usage
+    return True
+
+
+def _remaining(user_id: int) -> int | None:
+    """How many free market views left today. None if paid."""
+    from datetime import date as _date
+
+    if _is_paid(user_id):
+        return None
+
+    today = _date.today().isoformat()
+    usage = _usage.get(user_id, {})
+    if usage.get("date") != today:
+        return FREE_DAILY_LIMIT
+    return max(0, FREE_DAILY_LIMIT - usage.get("count", 0))
+
+
+def _limit_msg() -> str:
+    return (
+        "🔒 <b>Daily limit reached</b>\n\n"
+        "Free users get 3 market views per day.\n"
+        "Stock reports (<code>TRENT</code>, <code>RELIANCE</code>) are always free.\n\n"
+        "🔓 <b>Unlock unlimited access:</b>\n"
+        "Join the Pro channel for real-time circuit alerts "
+        "and unlimited market views.\n\n"
+        "DM @morrow_desk_admin for access."
+    )
+
 
 # Bot commands shown in Telegram's / menu
 BOT_COMMANDS = [
@@ -812,15 +919,28 @@ def handle_changed(chat_id: int, engine):
 # Webhook dispatcher
 # --------------------------------------------------------------------------
 
-def _dispatch(chat_id: int, text: str, engine) -> None:
+def _dispatch(chat_id: int, user_id: int, text: str, engine) -> None:
     """Route a text command (from message or button callback)."""
     lower = text.lower().strip()
+    cmd = lower.split()[0] if lower else ""
 
+    # Free commands — always available
     if lower == "/start":
         handle_start(chat_id)
-    elif lower == "/help":
+        return
+    if lower == "/help":
         handle_help(chat_id)
-    elif lower == "/heatmap":
+        return
+
+    # Paid-gated market views — check limit
+    if cmd in _PAID_COMMANDS:
+        if not _check_limit(user_id, cmd):
+            _reply(chat_id, _limit_msg(), buttons=[
+                [{"text": "📊 Try a stock report (free)", "callback_data": "/help"}],
+            ])
+            return
+
+    if lower == "/heatmap":
         handle_heatmap(chat_id, engine)
     elif lower == "/flow":
         handle_flow(chat_id, engine)
@@ -839,27 +959,66 @@ def _dispatch(chat_id: int, text: str, engine) -> None:
     elif text.startswith("/"):
         _reply(chat_id, "Unknown command. Try /help", buttons=MAIN_MENU_BUTTONS)
     else:
+        # Plain text = stock lookup (always free)
         handle_report(chat_id, text.strip(), engine)
+
+    # Show remaining count for free users after a gated command
+    if cmd in _PAID_COMMANDS:
+        remaining = _remaining(user_id)
+        if remaining is not None and remaining <= 2:
+            note = (f"💡 {remaining} free market view{'s' if remaining != 1 else ''} "
+                    f"left today. Stock reports are always free.")
+            _reply(chat_id, note, buttons=[
+                [{"text": "📊 Try a stock (free)", "callback_data": "/help"}],
+            ] if remaining == 0 else None)
+
+
+# Deduplication: track recent update IDs to avoid processing retries
+_recent_updates: dict[int, float] = {}
+_DEDUP_TTL = 300  # 5 min
+
+
+def _is_duplicate(update_id: int) -> bool:
+    """Return True if we already processed this update."""
+    import time as _time
+    now = _time.time()
+
+    # Clean old entries
+    stale = [k for k, t in _recent_updates.items() if now - t > _DEDUP_TTL]
+    for k in stale:
+        del _recent_updates[k]
+
+    if update_id in _recent_updates:
+        return True
+    _recent_updates[update_id] = now
+    return False
 
 
 def process_update(update: dict, engine) -> None:
     """Process one Telegram update from the webhook."""
 
+    # Deduplicate: Telegram retries if our response was slow
+    update_id = update.get("update_id")
+    if update_id and _is_duplicate(update_id):
+        return
+
     # Handle button presses (callback_query)
     cb = update.get("callback_query")
     if cb:
         chat_id = cb.get("message", {}).get("chat", {}).get("id")
+        user_id = cb.get("from", {}).get("id") or chat_id
         data = cb.get("data", "")
         cb_id = cb.get("id", "")
         if chat_id and data:
             _answer_callback(cb_id)
-            _dispatch(chat_id, data, engine)
+            _dispatch(chat_id, user_id, data, engine)
         return
 
     # Handle text messages
     msg = update.get("message") or {}
     text = (msg.get("text") or "").strip()
     chat_id = msg.get("chat", {}).get("id")
+    user_id = msg.get("from", {}).get("id") or chat_id
 
     if not chat_id or not text:
         return
@@ -869,7 +1028,7 @@ def process_update(update: dict, engine) -> None:
     if chat_type not in ("private",):
         return
 
-    _dispatch(chat_id, text, engine)
+    _dispatch(chat_id, user_id, text, engine)
 
 
 # --------------------------------------------------------------------------

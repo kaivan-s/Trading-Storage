@@ -1781,14 +1781,19 @@ def api_cron_telegram_weekly():
 def api_telegram_webhook():
     """
     Telegram sends message updates here. The bot replies with stock reports.
-    Set up with: POST /api/telegram/setup-webhook
+    Must return 200 immediately — Telegram retries if the response is slow,
+    causing duplicate messages. All processing happens in a background thread.
     """
     import telegram_interactive as tgi
     update = request.get_json(silent=True) or {}
-    try:
-        tgi.process_update(update, engine)
-    except Exception as exc:
-        print(f"[telegram] webhook error: {exc}")
+
+    def work():
+        try:
+            tgi.process_update(update, engine)
+        except Exception as exc:
+            print(f"[telegram] webhook error: {exc}")
+
+    threading.Thread(target=work, daemon=True).start()
     return jsonify({"ok": True})
 
 
