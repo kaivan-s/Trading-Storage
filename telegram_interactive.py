@@ -154,6 +154,268 @@ KLASS_EMOJI = {
 }
 
 
+# --------------------------------------------------------------------------
+# Pre-computed cache — all bot views are static after post-market
+# --------------------------------------------------------------------------
+# Instead of querying the engine and iterating DataFrames on every user
+# request, we pre-compute everything once after the session closes.
+# Each handler checks the cache first; falls back to live only if stale.
+#
+# Cache structure:
+#   _view_cache = {
+#       "as_of": "2026-10-09",
+#       "heatmap": {...extracted data...},
+#       "heatmap_full": {...},
+#       "flow": {...},
+#       "triggers": [...],
+#       "delivery": {...},
+#       "changed": {...},
+#       "today": {...},
+#       "stocks": {"TRENT": {...report...}, ...},  # filled on demand
+#   }
+
+_view_cache: dict = {}
+
+
+def precompute_bot_cache(engine) -> dict:
+    """
+    Pre-compute all bot view data from the engine.
+    Call this once after post-market or after any full engine load.
+    Returns the cache dict for inspection.
+    """
+    global _view_cache
+
+    with engine._lock:
+        if engine.status != "ready":
+            return {"error": "engine not ready"}
+        scan_rows = engine.scan_rows.copy() if engine.scan_rows is not None and not engine.scan_rows.empty else pd.DataFrame()
+        coil_rows = engine.coil_rows.copy() if engine.coil_rows is not None and not engine.coil_rows.empty else pd.DataFrame()
+        buys = engine.buys.copy() if engine.buys is not None and not engine.buys.empty else pd.DataFrame()
+        coil_stocks = engine.coil_stocks
+        as_of = engine.as_of
+
+    cache: dict = {"as_of": as_of, "stocks": {}}
+
+    # ── Heatmap data ──
+    if not scan_rows.empty:
+        hm: dict = {"total": len(scan_rows), "groups": {}}
+        for klass in ["CROSSING", "PULLBACK", "BASE", "CROSSING_UNVERIFIED"]:
+            grp = scan_rows[scan_rows["klass"] == klass]
+            if not grp.empty:
+                rows = []
+                for _, r in grp.sort_values("T", ascending=False).iterrows():
+                    n_s = int(r.get("n_stocks", 1))
+                    rows.append({
+                        "sector": r["sector"],
+                        "T": float(r.get("T", 0)) if pd.notna(r.get("T")) else 0,
+                        "cmf": float(r.get("cmf", 0)) if pd.notna(r.get("cmf")) else 0,
+                        "adv_pct": int(r.get("n_adv", 0)) / max(n_s, 1) * 100,
+                        "klass": klass,
+                    })
+                hm["groups"][klass] = rows
+        down = scan_rows[scan_rows["klass"].isin(["DOWN", "NONE", "NEGLECT"])]
+        if not down.empty:
+            hm["groups"]["DOWN"] = [{"sector": r["sector"], "T": float(r.get("T", 0)) if pd.notna(r.get("T")) else 0,
+                                      "cmf": float(r.get("cmf", 0)) if pd.notna(r.get("cmf")) else 0,
+                                      "adv_pct": int(r.get("n_adv", 0)) / max(int(r.get("n_stocks", 1)), 1) * 100,
+                                      "klass": "DOWN"}
+                                     for _, r in down.sort_values("T", ascending=False).iterrows()]
+        dq = scan_rows[scan_rows["klass"] == "DISQUALIFIED"]
+        if not dq.empty:
+            hm["groups"]["DISQUALIFIED"] = [{"sector": r["sector"]} for _, r in dq.iterrows()]
+        n_cross = len(scan_rows[scan_rows["klass"] == "CROSSING"])
+        n_pull = len(scan_rows[scan_rows["klass"] == "PULLBACK"])
+        hm["n_crossing"] = n_cross
+        hm["n_pullback"] = n_pull
+        hm["n_actionable"] = n_cross + n_pull
+        hm["regime"] = "BULLISH" if (n_cross + n_pull) / max(len(scan_rows), 1) >= 0.4 else "CAUTIOUS"
+        hm["n_base"] = len(scan_rows[scan_rows["klass"] == "BASE"])
+        hm["n_down"] = len(down) if not down.empty else 0
+        hm["n_dq"] = len(dq) if not dq.empty else 0
+        cache["heatmap"] = hm
+
+    # ── Flow data (sorted by CMF) ──
+    if not scan_rows.empty and "cmf" in scan_rows.columns:
+        flow_df = scan_rows[scan_rows["cmf"].notna()].sort_values("cmf", ascending=False)
+        cache["flow"] = {
+            "inflows": [{"sector": r["sector"], "cmf": float(r["cmf"]),
+                         "adv_pct": int(r.get("n_adv", 0)) / max(int(r.get("n_stocks", 1)), 1) * 100,
+                         "klass": r["klass"]}
+                        for _, r in flow_df[flow_df["cmf"] > 0.03].iterrows()],
+            "neutral": [{"sector": r["sector"], "cmf": float(r["cmf"])}
+                        for _, r in flow_df[(flow_df["cmf"] >= -0.03) & (flow_df["cmf"] <= 0.03)].iterrows()],
+            "outflows": [{"sector": r["sector"], "cmf": float(r["cmf"]), "klass": r["klass"]}
+                         for _, r in flow_df[flow_df["cmf"] < -0.03].sort_values("cmf").iterrows()],
+        }
+
+    # ── Triggers (stocks near breakout) ──
+    pool = buys if not buys.empty else coil_rows
+    if not pool.empty and "to_trigger" in pool.columns:
+        near = pool[pool["to_trigger"].notna() & (pool["to_trigger"] <= 0.02)].sort_values("to_trigger")
+        trig_list = []
+        for _, r in near.iterrows():
+            trig_list.append({
+                "symbol": r.get("symbol", "?"),
+                "adj": float(r.get("adj", 0)) if pd.notna(r.get("adj")) else 0,
+                "trigger": float(r.get("trigger", 0)) if pd.notna(r.get("trigger")) else 0,
+                "to_trigger": float(r.get("to_trigger", 0)),
+                "sector": r.get("sector", ""),
+                "coil": float(r.get("coil")) if pd.notna(r.get("coil")) else None,
+                "cmf": float(r.get("cmf")) if pd.notna(r.get("cmf")) else None,
+                "is_buy": not buys.empty and r.get("symbol", "") in buys["symbol"].values,
+            })
+        cache["triggers"] = trig_list
+
+    # ── Delivery (unusual delivery %) ──
+    if coil_stocks is not None and "deliv_pct" in coil_stocks.columns:
+        latest_date = coil_stocks["date"].max()
+        today_df = coil_stocks[coil_stocks["date"] == latest_date]
+        deliv_results = []
+        for _, row in today_df.iterrows():
+            dp = row.get("deliv_pct")
+            if pd.isna(dp) or dp <= 0:
+                continue
+            sym = row["symbol"]
+            hist = coil_stocks[(coil_stocks["symbol"] == sym) & (coil_stocks["date"] < latest_date)]
+            if len(hist) < 10:
+                continue
+            avg_dp = hist["deliv_pct"].tail(20).mean()
+            if pd.isna(avg_dp) or avg_dp <= 0:
+                continue
+            ratio = dp / avg_dp
+            if ratio >= 1.3 and dp >= 40:
+                deliv_results.append({
+                    "symbol": sym,
+                    "deliv_pct": float(dp),
+                    "avg_deliv": float(avg_dp),
+                    "ratio": float(ratio),
+                    "ret": float(row.get("ret", 0)) if pd.notna(row.get("ret")) else 0,
+                    "sector": row.get("sector", ""),
+                    "turnover": float(row.get("turnover", 0)) if pd.notna(row.get("turnover")) else 0,
+                })
+        deliv_results.sort(key=lambda x: -x["ratio"])
+        cache["delivery"] = {
+            "accum": [r for r in deliv_results if r["ret"] > 0.005],
+            "distrib": [r for r in deliv_results if r["ret"] < -0.005],
+            "total": len(deliv_results),
+        }
+
+    # ── Today's brief data ──
+    today_data: dict = {}
+    if not scan_rows.empty:
+        today_data["n_crossing"] = int((scan_rows["klass"] == "CROSSING").sum())
+        today_data["n_pullback"] = int((scan_rows["klass"] == "PULLBACK").sum())
+        today_data["total_sectors"] = len(scan_rows)
+        today_data["n_coils"] = len(coil_rows) if not coil_rows.empty else 0
+        # Top CMF sector
+        if "cmf" in scan_rows.columns:
+            top = scan_rows[scan_rows["cmf"].notna()].sort_values("cmf", ascending=False)
+            if not top.empty:
+                best = top.iloc[0]
+                today_data["best_sector"] = best["sector"]
+                today_data["best_cmf"] = float(best["cmf"])
+                today_data["best_klass"] = best.get("klass", "")
+                n_s = int(best.get("n_stocks", 1))
+                today_data["best_adv_pct"] = int(best.get("n_adv", 0)) / max(n_s, 1) * 100
+            worst = top.iloc[-1]
+            if worst["cmf"] < -0.05:
+                today_data["worst_sector"] = worst["sector"]
+                today_data["worst_cmf"] = float(worst["cmf"])
+    # Actionable stocks near trigger
+    if not pool.empty and "to_trigger" in pool.columns:
+        near = pool[pool["to_trigger"].notna() & (pool["to_trigger"] <= 0.03)].sort_values("to_trigger").head(3)
+        act = []
+        for _, r in near.iterrows():
+            klass = ""
+            if not scan_rows.empty:
+                sr = scan_rows[scan_rows["sector"] == r.get("sector", "")]
+                if not sr.empty:
+                    klass = sr.iloc[0].get("klass", "")
+            act.append({
+                "symbol": r.get("symbol", "?"),
+                "adj": float(r.get("adj", 0)) if pd.notna(r.get("adj")) else 0,
+                "trigger": float(r.get("trigger", 0)) if pd.notna(r.get("trigger")) else 0,
+                "to_trigger": float(r.get("to_trigger", 0)),
+                "sector": r.get("sector", ""),
+                "klass": klass,
+            })
+        today_data["actionable"] = act
+    cache["today"] = today_data
+
+    # ── Changed data (sector upgrades/downgrades + new/lost setups) ──
+    changed_data: dict = {}
+    try:
+        import db
+        prev_scans = db.get_all_sectors_latest()
+        sector_changes = []
+        if prev_scans and not scan_rows.empty:
+            prev_map = {}
+            for r in prev_scans:
+                sd = str(r.get("scan_date", ""))
+                if sd != str(as_of):
+                    prev_map[r["sector"]] = r.get("klass", "")
+            if prev_map:
+                order = {"CROSSING": 0, "PULLBACK": 1, "CROSSING_UNVERIFIED": 2,
+                         "BASE": 3, "NONE": 4, "NEGLECT": 5, "DOWN": 6, "DISQUALIFIED": 7}
+                for _, r in scan_rows.iterrows():
+                    sec = r["sector"]
+                    new_k = r["klass"]
+                    old_k = prev_map.get(sec)
+                    if old_k and old_k != new_k:
+                        arrow = "↗️" if order.get(new_k, 5) < order.get(old_k, 5) else "↘️"
+                        sector_changes.append({"sector": sec, "old": old_k, "new": new_k, "arrow": arrow})
+        changed_data["sector_changes"] = sector_changes
+
+        prev_setups = db.get_setups(None)
+        new_setups, lost_setups = [], []
+        if prev_setups:
+            prev_syms = {r["symbol"] for r in prev_setups if r.get("symbol")}
+            if not buys.empty:
+                curr_syms = set(buys["symbol"].astype(str))
+                new_setups = sorted(curr_syms - prev_syms)
+                lost_setups = sorted(prev_syms - curr_syms)
+        changed_data["new_setups"] = new_setups
+        changed_data["lost_setups"] = lost_setups
+
+        if not buys.empty:
+            setup_info = {}
+            for sym in new_setups[:10]:
+                rows = buys[buys["symbol"] == sym]
+                if not rows.empty:
+                    rw = rows.iloc[0]
+                    setup_info[sym] = {
+                        "sector": rw.get("sector", ""),
+                        "coil": float(rw["coil"]) if pd.notna(rw.get("coil")) else None,
+                    }
+            changed_data["setup_info"] = setup_info
+    except Exception as exc:
+        print(f"[tg-bot] cache changed-data error: {exc}")
+
+    if not coil_rows.empty:
+        changed_data["n_coils"] = len(coil_rows)
+        near_trig = coil_rows[coil_rows["to_trigger"].notna() & (coil_rows["to_trigger"] <= 0.02)]
+        changed_data["n_near_trigger"] = len(near_trig)
+    if not scan_rows.empty:
+        changed_data["n_crossing"] = int((scan_rows["klass"] == "CROSSING").sum())
+        changed_data["n_pullback"] = int((scan_rows["klass"] == "PULLBACK").sum())
+        changed_data["total_sectors"] = len(scan_rows)
+
+    cache["changed"] = changed_data
+
+    _view_cache = cache
+    n_stocks_cached = len(cache.get("stocks", {}))
+    print(f"[tg-bot] cache refreshed for {as_of}: "
+          f"{len(cache.get('triggers', []))} triggers, "
+          f"{cache.get('delivery', {}).get('total', 0)} delivery, "
+          f"{n_stocks_cached} stocks")
+    return cache
+
+
+def _cache_ok() -> bool:
+    """True if the cache exists and matches the engine's as_of."""
+    return bool(_view_cache and _view_cache.get("as_of"))
+
+
 def _reply(chat_id: int, text: str, parse_mode: str = "HTML",
            buttons: list[list[dict]] | None = None) -> bool:
     """
@@ -581,93 +843,61 @@ def handle_sector(chat_id: int, query: str, engine):
 # --------------------------------------------------------------------------
 
 def handle_today(chat_id: int, engine):
-    with engine._lock:
-        if engine.status != "ready":
-            _reply(chat_id, "⏳ Engine still loading.")
-            return
-        scan_rows = engine.scan_rows.copy() if engine.scan_rows is not None and not engine.scan_rows.empty else pd.DataFrame()
-        coil_rows = engine.coil_rows.copy() if engine.coil_rows is not None and not engine.coil_rows.empty else pd.DataFrame()
-        buys = engine.buys.copy() if engine.buys is not None and not engine.buys.empty else pd.DataFrame()
-        coil_stocks = engine.coil_stocks
-        as_of = engine.as_of
+    td = _view_cache.get("today") if _cache_ok() else None
+    if not td:
+        with engine._lock:
+            if engine.status != "ready":
+                _reply(chat_id, "⏳ Engine still loading.")
+                return
+        precompute_bot_cache(engine)
+        td = _view_cache.get("today", {})
 
+    as_of = _view_cache.get("as_of", "?")
     lines = [f"📅 <b>Today's Brief</b>", f"As of {as_of}\n"]
 
-    # 1. Top actionable — stocks closest to trigger in buy setups
-    actionable = []
-    pool = buys if not buys.empty else coil_rows
-    if not pool.empty and "to_trigger" in pool.columns:
-        near = pool[pool["to_trigger"].notna() & (pool["to_trigger"] <= 0.03)]
-        near = near.sort_values("to_trigger").head(3)
-        for _, r in near.iterrows():
-            sym = r.get("symbol", "?")
-            adj = r.get("adj", 0)
-            trig = r.get("trigger", 0)
-            to_t = r.get("to_trigger", 0)
-            sec = r.get("sector", "")
-            klass = ""
-            if not scan_rows.empty:
-                sr = scan_rows[scan_rows["sector"] == sec]
-                if not sr.empty:
-                    klass = sr.iloc[0].get("klass", "")
-            actionable.append((sym, adj, trig, to_t, sec, klass))
-
+    # 1. Top actionable
+    actionable = td.get("actionable", [])
     if actionable:
         lines.append("🎯 <b>Actionable</b>")
-        for sym, adj, trig, to_t, sec, klass in actionable:
-            e = KLASS_EMOJI.get(klass, "")
-            lines.append(f"  <b>{sym}</b> ₹{adj:,.0f} → trigger ₹{trig:,.0f} ({to_t * 100:.1f}% away)")
-            lines.append(f"  {sec} {e}{klass}")
+        for r in actionable:
+            e = KLASS_EMOJI.get(r.get("klass", ""), "")
+            lines.append(f"  <b>{r['symbol']}</b> ₹{r['adj']:,.0f} → trigger ₹{r['trigger']:,.0f} ({r['to_trigger'] * 100:.1f}% away)")
+            lines.append(f"  {r['sector']} {e}{r.get('klass', '')}")
         lines.append("")
     else:
         lines.append("🎯 No stocks near breakout trigger today.")
         lines.append("<i>The market isn't always offering setups — that's okay.</i>\n")
 
-    # 2. One insight — strongest sector flow or unusual delivery
-    if not scan_rows.empty and "cmf" in scan_rows.columns:
-        top_cmf = scan_rows[scan_rows["cmf"].notna()].sort_values("cmf", ascending=False)
-        if not top_cmf.empty:
-            best = top_cmf.iloc[0]
-            sec = best["sector"]
-            cmf = best["cmf"]
-            klass = best.get("klass", "")
-            n_adv = int(best.get("n_adv", 0))
-            n_stocks = int(best.get("n_stocks", 1))
-            adv_pct = n_adv / n_stocks * 100 if n_stocks > 0 else 0
-            if cmf > 0.05:
-                lines.append("💡 <b>Insight</b>")
-                lines.append(f"Strongest money flow: <b>{sec}</b> (CMF {cmf:+.2f})")
-                lines.append(f"{adv_pct:.0f}% of stocks advancing · {KLASS_EMOJI.get(klass, '')}{klass}")
-                # Check for streak — how many days CMF has been positive
-                if coil_stocks is not None and not coil_stocks.empty:
-                    try:
-                        # Quick check from panel data isn't straightforward, so keep it simple
-                        lines.append(f"<i>Positive CMF = institutions accumulating this sector</i>")
-                    except Exception:
-                        pass
-                lines.append("")
+    # 2. One insight
+    best_sec = td.get("best_sector")
+    best_cmf = td.get("best_cmf", 0)
+    if best_sec and best_cmf > 0.05:
+        klass = td.get("best_klass", "")
+        lines.append("💡 <b>Insight</b>")
+        lines.append(f"Strongest money flow: <b>{best_sec}</b> (CMF {best_cmf:+.2f})")
+        lines.append(f"{td.get('best_adv_pct', 0):.0f}% advancing · {KLASS_EMOJI.get(klass, '')}{klass}")
+        lines.append(f"<i>Positive CMF = institutions accumulating this sector</i>")
+        lines.append("")
 
-            # Also mention worst outflow
-            worst = top_cmf.iloc[-1]
-            if worst["cmf"] < -0.05:
-                lines.append(f"⚠️ Outflow: <b>{worst['sector']}</b> (CMF {worst['cmf']:+.2f})")
-                lines.append(f"<i>Money leaving — avoid new positions here</i>")
-                lines.append("")
+    worst_sec = td.get("worst_sector")
+    worst_cmf = td.get("worst_cmf", 0)
+    if worst_sec:
+        lines.append(f"⚠️ Outflow: <b>{worst_sec}</b> (CMF {worst_cmf:+.2f})")
+        lines.append(f"<i>Money leaving — avoid new positions here</i>")
+        lines.append("")
 
     # 3. Market regime
-    if not scan_rows.empty:
-        total = len(scan_rows)
-        crossing = int((scan_rows["klass"] == "CROSSING").sum())
-        pullback = int((scan_rows["klass"] == "PULLBACK").sum())
-        bullish_pct = (crossing + pullback) / max(total, 1) * 100
-        regime = "BULLISH" if bullish_pct >= 40 else "CAUTIOUS"
-        emoji = "🟢" if regime == "BULLISH" else "🟡"
-        lines.append(f"📊 <b>Market:</b> {emoji} {regime}")
-        lines.append(f"   {crossing} crossing · {pullback} pullback · {bullish_pct:.0f}% in uptrend")
-
-    # Coil pool stat
-    if not coil_rows.empty:
-        lines.append(f"   {len(coil_rows)} stocks coiled (compressed near highs)")
+    n_cross = td.get("n_crossing", 0)
+    n_pull = td.get("n_pullback", 0)
+    total = td.get("total_sectors", 1)
+    bullish_pct = (n_cross + n_pull) / max(total, 1) * 100
+    regime = "BULLISH" if bullish_pct >= 40 else "CAUTIOUS"
+    emoji = "🟢" if regime == "BULLISH" else "🟡"
+    lines.append(f"📊 <b>Market:</b> {emoji} {regime}")
+    lines.append(f"   {n_cross} crossing · {n_pull} pullback · {bullish_pct:.0f}% in uptrend")
+    n_coils = td.get("n_coils", 0)
+    if n_coils:
+        lines.append(f"   {n_coils} stocks coiled (compressed near highs)")
 
     lines.append("\n<i>What the data shows today — not a recommendation.</i>")
 
@@ -697,79 +927,88 @@ def _fmt_sector_row(r) -> str:
     return f"  <b>{sec}</b> · T:{t:.0f}% · {adv_pct:.0f}% adv · {cmf_s}"
 
 
-def handle_heatmap(chat_id: int, engine, full: bool = False):
-    with engine._lock:
-        if engine.status != "ready" or engine.scan_rows is None or engine.scan_rows.empty:
-            _reply(chat_id, "⏳ Engine still loading. Try again in a few minutes.")
-            return
-        df = engine.scan_rows.copy()
-        as_of = engine.as_of
+def _fmt_cached_sector(r: dict) -> str:
+    """One-line sector from cached dict."""
+    cmf = r.get("cmf", 0)
+    cmf_arrow = "↑" if cmf > 0.05 else "↓" if cmf < -0.05 else ""
+    return f"  <b>{r['sector']}</b> · T:{r.get('T', 0):.0f}% · {r.get('adv_pct', 0):.0f}% adv · CMF {cmf:+.2f}{cmf_arrow}"
 
-    total = len(df)
-    crossing = df[df["klass"] == "CROSSING"]
-    pullback = df[df["klass"] == "PULLBACK"]
-    n_crossing = len(crossing)
-    n_pullback = len(pullback)
-    n_actionable = n_crossing + n_pullback
-    regime = "BULLISH" if n_actionable / max(total, 1) >= 0.4 else "CAUTIOUS"
+
+def handle_heatmap(chat_id: int, engine, full: bool = False):
+    # Try cache first
+    hm = _view_cache.get("heatmap") if _cache_ok() else None
+
+    if not hm:
+        # Fall back to live computation if cache is stale
+        with engine._lock:
+            if engine.status != "ready" or engine.scan_rows is None or engine.scan_rows.empty:
+                _reply(chat_id, "⏳ Engine still loading. Try again in a few minutes.")
+                return
+        precompute_bot_cache(engine)
+        hm = _view_cache.get("heatmap")
+        if not hm:
+            _reply(chat_id, "No sector data available.")
+            return
+
+    as_of = _view_cache.get("as_of", "?")
+    groups = hm.get("groups", {})
+    regime = hm.get("regime", "CAUTIOUS")
+    n_act = hm.get("n_actionable", 0)
+    total = hm.get("total", 0)
     emoji = "🟢" if regime == "BULLISH" else "🟡"
 
     if full:
-        # ── Full view: every sector grouped ──
         lines = [f"🗺️ <b>All Sectors</b>", f"As of {as_of}\n"]
-
-        groups = [
-            ("🟢 CROSSING", crossing),
-            ("🟡 PULLBACK", pullback),
-            ("⚪ BASE", df[df["klass"] == "BASE"]),
-            ("🟠 UNVERIFIED", df[df["klass"] == "CROSSING_UNVERIFIED"]),
-            ("🔴 DOWN", df[df["klass"].isin(["DOWN", "NONE", "NEGLECT"])]),
-            ("⛔ DISQUALIFIED", df[df["klass"] == "DISQUALIFIED"]),
+        labels = [
+            ("🟢 CROSSING", "CROSSING"), ("🟡 PULLBACK", "PULLBACK"),
+            ("⚪ BASE", "BASE"), ("🟠 UNVERIFIED", "CROSSING_UNVERIFIED"),
+            ("🔴 DOWN", "DOWN"), ("⛔ DISQUALIFIED", "DISQUALIFIED"),
         ]
-        for label, grp in groups:
-            if grp.empty:
+        for label, key in labels:
+            grp = groups.get(key, [])
+            if not grp:
                 continue
             lines.append(f"<b>{label}</b> ({len(grp)})")
-            for _, r in grp.sort_values("T", ascending=False).iterrows():
-                lines.append(_fmt_sector_row(r))
+            for r in grp:
+                if r.get("T") is not None:
+                    lines.append(_fmt_cached_sector(r))
+                else:
+                    lines.append(f"  {r.get('sector', '?')}")
             lines.append("")
-
-        lines.append(f"{emoji} <b>{regime}</b> · {n_actionable}/{total} sectors in uptrend")
+        lines.append(f"{emoji} <b>{regime}</b> · {n_act}/{total} sectors in uptrend")
         lines.append("\n<i>Sector rotation — not a recommendation.</i>")
-        btns = [
-            [{"text": "🔄 Flow", "callback_data": "/flow"},
-             {"text": "🎯 Triggers", "callback_data": "/triggers"}],
-        ]
+        btns = [[{"text": "🔄 Flow", "callback_data": "/flow"},
+                  {"text": "🎯 Triggers", "callback_data": "/triggers"}]]
         _send_long(chat_id, "\n".join(lines), buttons=btns)
         return
 
-    # ── Concise view: only actionable sectors ──
+    # ── Concise view: actionable only ──
     lines = [f"🗺️ <b>Sector Heatmap</b>", f"As of {as_of}\n"]
-    lines.append(f"{emoji} <b>Market: {regime}</b> — {n_actionable}/{total} sectors in uptrend\n")
+    lines.append(f"{emoji} <b>Market: {regime}</b> — {n_act}/{total} sectors in uptrend\n")
 
-    if not crossing.empty:
-        lines.append(f"🟢 <b>CROSSING</b> ({n_crossing}) — uptrend confirmed")
-        for _, r in crossing.sort_values("T", ascending=False).iterrows():
-            lines.append(_fmt_sector_row(r))
+    crossing = groups.get("CROSSING", [])
+    pullback = groups.get("PULLBACK", [])
+
+    if crossing:
+        lines.append(f"🟢 <b>CROSSING</b> ({len(crossing)}) — uptrend confirmed")
+        for r in crossing:
+            lines.append(_fmt_cached_sector(r))
+        lines.append("")
+    if pullback:
+        lines.append(f"🟡 <b>PULLBACK</b> ({len(pullback)}) — buy zone")
+        for r in pullback:
+            lines.append(_fmt_cached_sector(r))
         lines.append("")
 
-    if not pullback.empty:
-        lines.append(f"🟡 <b>PULLBACK</b> ({n_pullback}) — buy zone")
-        for _, r in pullback.sort_values("T", ascending=False).iterrows():
-            lines.append(_fmt_sector_row(r))
-        lines.append("")
-
-    if n_actionable == 0:
+    if not crossing and not pullback:
         lines.append("No sectors in CROSSING or PULLBACK right now.")
         lines.append("<i>The market isn't always offering setups — that's okay.</i>")
 
-    # Quick counts for the rest
-    rest = {
-        "Base": len(df[df["klass"] == "BASE"]),
-        "Down": len(df[df["klass"].isin(["DOWN", "NONE", "NEGLECT"])]),
-        "Disqualified": len(df[df["klass"] == "DISQUALIFIED"]),
-    }
-    rest_parts = [f"{v} {k.lower()}" for k, v in rest.items() if v > 0]
+    rest_parts = []
+    for label, key in [("base", "n_base"), ("down", "n_down"), ("disqualified", "n_dq")]:
+        v = hm.get(key, 0)
+        if v:
+            rest_parts.append(f"{v} {label}")
     if rest_parts:
         lines.append(f"📊 Also: {' · '.join(rest_parts)}")
 
@@ -787,63 +1026,55 @@ def handle_heatmap(chat_id: int, engine, full: bool = False):
 # --------------------------------------------------------------------------
 
 def handle_flow(chat_id: int, engine):
-    with engine._lock:
-        if engine.status != "ready" or engine.scan_rows is None or engine.scan_rows.empty:
-            _reply(chat_id, "⏳ Engine still loading.")
-            return
-        df = engine.scan_rows.copy()
-        as_of = engine.as_of
-
-    lines = [f"🔄 <b>Sector Money Flow</b>", f"As of {as_of}\n"]
-
-    # Sort by CMF: most positive first (inflows), most negative last (outflows)
-    df = df[df["cmf"].notna()].sort_values("cmf", ascending=False)
-
-    if df.empty:
-        _reply(chat_id, "No CMF data available.")
+    flow = _view_cache.get("flow") if _cache_ok() else None
+    if not flow:
+        with engine._lock:
+            if engine.status != "ready":
+                _reply(chat_id, "⏳ Engine still loading.")
+                return
+        precompute_bot_cache(engine)
+        flow = _view_cache.get("flow")
+    if not flow:
+        _reply(chat_id, "No flow data available.")
         return
 
-    # Inflows
-    inflows = df[df["cmf"] > 0.03]
-    if not inflows.empty:
-        lines.append("💰 <b>INFLOWS</b> (CMF positive — accumulation)")
-        for _, r in inflows.iterrows():
-            e = KLASS_EMOJI.get(r["klass"], "•")
+    as_of = _view_cache.get("as_of", "?")
+    lines = [f"🔄 <b>Sector Money Flow</b>", f"As of {as_of}\n"]
+
+    inflows = flow.get("inflows", [])
+    if inflows:
+        lines.append("💰 <b>INFLOWS</b> (accumulation)")
+        for r in inflows:
+            e = KLASS_EMOJI.get(r.get("klass", ""), "•")
             strength = "█" * min(8, max(1, int(r["cmf"] * 40)))
-            n_adv = int(r.get("n_adv", 0))
-            n_stocks = int(r.get("n_stocks", 1))
-            adv = n_adv / n_stocks * 100 if n_stocks else 0
             lines.append(f"  {e} <b>{r['sector']}</b>")
-            lines.append(f"    {strength} CMF {r['cmf']:+.2f} · {adv:.0f}% advancing · {r['klass']}")
+            lines.append(f"    {strength} CMF {r['cmf']:+.2f} · {r.get('adv_pct', 0):.0f}% advancing")
         lines.append("")
 
-    # Neutral
-    neutral = df[(df["cmf"] >= -0.03) & (df["cmf"] <= 0.03)]
-    if not neutral.empty:
+    neutral = flow.get("neutral", [])
+    if neutral:
         lines.append(f"⚖️ <b>NEUTRAL</b> ({len(neutral)} sectors)")
-        for _, r in neutral.head(5).iterrows():
+        for r in neutral[:5]:
             lines.append(f"  {r['sector']} · CMF {r['cmf']:+.2f}")
         if len(neutral) > 5:
             lines.append(f"  +{len(neutral) - 5} more")
         lines.append("")
 
-    # Outflows
-    outflows = df[df["cmf"] < -0.03].sort_values("cmf")
-    if not outflows.empty:
-        lines.append("🚨 <b>OUTFLOWS</b> (CMF negative — distribution)")
-        for _, r in outflows.iterrows():
-            e = KLASS_EMOJI.get(r["klass"], "•")
+    outflows = flow.get("outflows", [])
+    if outflows:
+        lines.append("🚨 <b>OUTFLOWS</b> (distribution)")
+        for r in outflows:
+            e = KLASS_EMOJI.get(r.get("klass", ""), "•")
             strength = "█" * min(8, max(1, int(abs(r["cmf"]) * 40)))
             lines.append(f"  {e} <b>{r['sector']}</b>")
-            lines.append(f"    {strength} CMF {r['cmf']:+.2f} · {r['klass']}")
+            lines.append(f"    {strength} CMF {r['cmf']:+.2f}")
         lines.append("")
 
-    lines.append("💡 <i>CMF (Chaikin Money Flow) measures buying vs selling pressure "
-                 "weighted by volume. Positive = accumulation, negative = distribution.</i>")
+    lines.append("💡 <i>CMF measures buying vs selling pressure. "
+                 "Positive = accumulation, negative = distribution.</i>")
     btns = [
         [{"text": "🗺️ Heatmap", "callback_data": "/heatmap"},
-         {"text": "🎯 Triggers", "callback_data": "/triggers"},
-         {"text": "📦 Delivery", "callback_data": "/delivery"}],
+         {"text": "🎯 Triggers", "callback_data": "/triggers"}],
     ]
     _send_long(chat_id, "\n".join(lines), buttons=btns)
 
@@ -853,44 +1084,27 @@ def handle_flow(chat_id: int, engine):
 # --------------------------------------------------------------------------
 
 def handle_triggers(chat_id: int, engine):
-    with engine._lock:
-        if engine.status != "ready" or engine.coil_rows is None:
-            _reply(chat_id, "⏳ Engine still loading.")
-            return
-        coils = engine.coil_rows.copy() if not engine.coil_rows.empty else pd.DataFrame()
-        buys = engine.buys.copy() if engine.buys is not None and not engine.buys.empty else pd.DataFrame()
-        as_of = engine.as_of
+    trig_list = _view_cache.get("triggers") if _cache_ok() else None
+    if trig_list is None:
+        with engine._lock:
+            if engine.status != "ready":
+                _reply(chat_id, "⏳ Engine still loading.")
+                return
+        precompute_bot_cache(engine)
+        trig_list = _view_cache.get("triggers")
 
-    # Combine coils and buys, prefer buys
-    pool = buys if not buys.empty else coils
-    if pool.empty:
-        _reply(chat_id, "No coiled stocks right now. The market may not be offering this setup.")
-        return
-
-    # Filter to stocks within 2% of trigger
-    pool = pool[pool["to_trigger"].notna() & (pool["to_trigger"] <= 0.02)].copy()
-    pool = pool.sort_values("to_trigger")
-
-    if pool.empty:
+    if not trig_list:
         _reply(chat_id, "📭 No stocks within 2% of their trigger right now.\n\n"
                         "<i>When a coiled stock is within 1-2% of its 20-day high, "
-                        "one strong session can close through it — that's the breakout confirmation.</i>")
+                        "one strong session can close through it.</i>")
         return
 
-    lines = [f"🎯 <b>Trigger Watch — {len(pool)} stocks near breakout</b>"]
+    as_of = _view_cache.get("as_of", "?")
+    lines = [f"🎯 <b>Trigger Watch — {len(trig_list)} stocks near breakout</b>"]
     lines.append(f"As of {as_of}\n")
 
-    for _, r in pool.head(15).iterrows():
-        sym = r.get("symbol", "?")
-        adj = r.get("adj", 0)
-        trig = r.get("trigger", 0)
-        to_trig = r.get("to_trigger", 0)
-        sector = r.get("sector", "")
-        coil = r.get("coil")
-        cmf = r.get("cmf")
-        rsi = r.get("rsi")
-
-        pct = to_trig * 100
+    for r in trig_list[:15]:
+        pct = r["to_trigger"] * 100
         if pct < 0.5:
             proximity = "🔴 <b>AT TRIGGER</b>"
         elif pct < 1.0:
@@ -898,31 +1112,26 @@ def handle_triggers(chat_id: int, engine):
         else:
             proximity = "🟡 within 2%"
 
-        lines.append(f"  <b>{sym}</b> — {proximity}")
-        lines.append(f"    ₹{adj:,.1f} → trigger ₹{trig:,.1f} ({pct:.1f}% away)")
+        lines.append(f"  <b>{r['symbol']}</b> — {proximity}")
+        lines.append(f"    ₹{r['adj']:,.1f} → trigger ₹{r['trigger']:,.1f} ({pct:.1f}% away)")
 
-        detail_parts = [sector]
-        if coil:
-            detail_parts.append(f"coil {coil:.1f}")
-        if cmf is not None and not (isinstance(cmf, float) and (np.isnan(cmf) or np.isinf(cmf))):
-            detail_parts.append(f"CMF {cmf:+.2f}")
-        lines.append(f"    {' · '.join(detail_parts)}")
+        parts = [r["sector"]]
+        if r.get("coil"):
+            parts.append(f"coil {r['coil']:.1f}")
+        if r.get("cmf") is not None:
+            parts.append(f"CMF {r['cmf']:+.2f}")
+        lines.append(f"    {' · '.join(parts)}")
 
-        # Is it in the buy setup list?
-        is_buy = not buys.empty and sym in buys["symbol"].values
-        if is_buy:
+        if r.get("is_buy"):
             lines.append("    ✅ In buy setup list")
         lines.append("")
 
-    if len(pool) > 15:
-        lines.append(f"  +{len(pool) - 15} more on the dashboard")
+    if len(trig_list) > 15:
+        lines.append(f"  +{len(trig_list) - 15} more on the dashboard")
 
-    lines.append("💡 <i>A close above the trigger on rising volume = confirmed "
-                 "breakout. The trigger is the 20-day high — the price above which "
-                 "the base has been overcome.</i>")
+    lines.append("💡 <i>A close above the trigger on rising volume = confirmed breakout.</i>")
     btns = [
         [{"text": "🗺️ Heatmap", "callback_data": "/heatmap"},
-         {"text": "📦 Delivery", "callback_data": "/delivery"},
          {"text": "🔄 Flow", "callback_data": "/flow"}],
     ]
     _send_long(chat_id, "\n".join(lines), buttons=btns)
@@ -933,63 +1142,25 @@ def handle_triggers(chat_id: int, engine):
 # --------------------------------------------------------------------------
 
 def handle_delivery(chat_id: int, engine):
-    with engine._lock:
-        if engine.status != "ready" or engine.coil_stocks is None:
-            _reply(chat_id, "⏳ Engine still loading.")
-            return
-        stocks = engine.coil_stocks.copy()
-        as_of = engine.as_of
+    deliv = _view_cache.get("delivery") if _cache_ok() else None
+    if not deliv:
+        with engine._lock:
+            if engine.status != "ready":
+                _reply(chat_id, "⏳ Engine still loading.")
+                return
+        precompute_bot_cache(engine)
+        deliv = _view_cache.get("delivery")
 
-    # Get the latest day
-    latest_date = stocks["date"].max()
-    today = stocks[stocks["date"] == latest_date].copy()
-    if today.empty:
-        _reply(chat_id, "No data available.")
-        return
-
-    # Need deliv_pct column
-    if "deliv_pct" not in today.columns:
-        _reply(chat_id, "Delivery data not available in the current panel.")
-        return
-
-    # Compute each stock's 20-day average delivery
-    results = []
-    for _, row in today.iterrows():
-        sym = row["symbol"]
-        dp = row.get("deliv_pct")
-        if pd.isna(dp) or dp <= 0:
-            continue
-        hist = stocks[(stocks["symbol"] == sym) & (stocks["date"] < latest_date)]
-        if len(hist) < 10:
-            continue
-        avg_dp = hist["deliv_pct"].tail(20).mean()
-        if pd.isna(avg_dp) or avg_dp <= 0:
-            continue
-        ratio = dp / avg_dp
-        if ratio >= 1.3 and dp >= 40:
-            results.append({
-                "symbol": sym,
-                "deliv_pct": dp,
-                "avg_deliv": avg_dp,
-                "ratio": ratio,
-                "ret": float(row.get("ret", 0)) if pd.notna(row.get("ret")) else 0,
-                "sector": row.get("sector", ""),
-                "turnover": float(row.get("turnover", 0)) if pd.notna(row.get("turnover")) else 0,
-            })
-
-    if not results:
+    if not deliv or deliv.get("total", 0) == 0:
         _reply(chat_id, "📭 No unusual delivery activity today.\n\n"
-                        "<i>Unusual delivery = delivery % significantly above the stock's "
-                        "own 20-day average. High delivery means physical settlement, "
-                        "which typically indicates institutional positions.</i>")
+                        "<i>Unusual delivery = delivery % significantly above the "
+                        "stock's own 20-day average. High delivery typically "
+                        "indicates institutional positions.</i>")
         return
 
-    # Sort by ratio, take top
-    results.sort(key=lambda x: -x["ratio"])
-
-    # Split into accumulation (price up) and distribution (price down)
-    accum = [r for r in results if r["ret"] > 0.005]
-    distrib = [r for r in results if r["ret"] < -0.005]
+    as_of = _view_cache.get("as_of", "?")
+    accum = deliv.get("accum", [])
+    distrib = deliv.get("distrib", [])
 
     lines = [f"📦 <b>Unusual Delivery</b>"]
     lines.append(f"As of {as_of}\n")
@@ -1016,14 +1187,12 @@ def handle_delivery(chat_id: int, engine):
             lines.append(f"    {r['ret'] * 100:+.1f}% · {r['sector']} · ₹{cr:.0f}cr turnover")
             lines.append("")
 
-    lines.append(f"📊 {len(results)} stocks with unusual delivery today")
-    lines.append("\n💡 <i>Delivery % = shares actually transferred to demat accounts "
-                 "(not squared off intraday). High delivery on rising prices suggests "
-                 "institutional buying. NSE-unique metric.</i>")
+    lines.append(f"📊 {deliv['total']} stocks with unusual delivery today")
+    lines.append("\n💡 <i>Delivery % = shares transferred to demat (not squared off). "
+                 "High delivery + price rise = institutional buying.</i>")
     btns = [
         [{"text": "🗺️ Heatmap", "callback_data": "/heatmap"},
-         {"text": "🎯 Triggers", "callback_data": "/triggers"},
-         {"text": "📋 Changed", "callback_data": "/changed"}],
+         {"text": "🎯 Triggers", "callback_data": "/triggers"}],
     ]
     _send_long(chat_id, "\n".join(lines), buttons=btns)
 
@@ -1033,84 +1202,47 @@ def handle_delivery(chat_id: int, engine):
 # --------------------------------------------------------------------------
 
 def handle_changed(chat_id: int, engine):
-    with engine._lock:
-        if engine.status != "ready":
-            _reply(chat_id, "⏳ Engine still loading.")
-            return
-        scan_rows = engine.scan_rows.copy() if engine.scan_rows is not None and not engine.scan_rows.empty else pd.DataFrame()
-        buys = engine.buys.copy() if engine.buys is not None and not engine.buys.empty else pd.DataFrame()
-        coil_rows = engine.coil_rows.copy() if engine.coil_rows is not None and not engine.coil_rows.empty else pd.DataFrame()
-        as_of = engine.as_of
+    cd = _view_cache.get("changed") if _cache_ok() else None
+    if not cd:
+        with engine._lock:
+            if engine.status != "ready":
+                _reply(chat_id, "⏳ Engine still loading.")
+                return
+        precompute_bot_cache(engine)
+        cd = _view_cache.get("changed", {})
 
-    # Load previous sector scans from DB
-    import db
-    sector_changes = []
-    new_setups = []
-    lost_setups = []
-
-    try:
-        prev_scans = db.get_all_sectors_latest()
-        if prev_scans:
-            prev_map = {}
-            for r in prev_scans:
-                sd = str(r.get("scan_date", ""))
-                if sd != str(as_of):
-                    prev_map[r["sector"]] = r.get("klass", "")
-
-            if prev_map and not scan_rows.empty:
-                for _, r in scan_rows.iterrows():
-                    sec = r["sector"]
-                    new_k = r["klass"]
-                    old_k = prev_map.get(sec)
-                    if old_k and old_k != new_k:
-                        # Determine if upgrade or downgrade
-                        order = {"CROSSING": 0, "PULLBACK": 1, "CROSSING_UNVERIFIED": 2,
-                                 "BASE": 3, "NONE": 4, "NEGLECT": 5, "DOWN": 6, "DISQUALIFIED": 7}
-                        old_o = order.get(old_k, 5)
-                        new_o = order.get(new_k, 5)
-                        arrow = "↗️" if new_o < old_o else "↘️"
-                        sector_changes.append((sec, old_k, new_k, arrow))
-    except Exception as exc:
-        print(f"[tg-bot] changed: prev scans error: {exc}")
-
-    # New setups vs previous day's setups from DB
-    try:
-        prev_setups = db.get_setups(None)
-        if prev_setups:
-            prev_syms = {r["symbol"] for r in prev_setups if r.get("symbol")}
-            if not buys.empty:
-                curr_syms = set(buys["symbol"].astype(str))
-                new_setups = sorted(curr_syms - prev_syms)
-                lost_setups = sorted(prev_syms - curr_syms)
-    except Exception:
-        pass
-
+    as_of = _view_cache.get("as_of", "?")
     lines = [f"📋 <b>What Changed</b>"]
     lines.append(f"As of {as_of}\n")
 
     anything = False
 
+    sector_changes = cd.get("sector_changes", [])
     if sector_changes:
         anything = True
         lines.append("<b>Sector moves:</b>")
-        for sec, old_k, new_k, arrow in sector_changes:
-            e_old = KLASS_EMOJI.get(old_k, "•")
-            e_new = KLASS_EMOJI.get(new_k, "•")
-            lines.append(f"  {arrow} <b>{sec}</b>: {e_old}{old_k} → {e_new}{new_k}")
+        for sc in sector_changes:
+            e_old = KLASS_EMOJI.get(sc["old"], "•")
+            e_new = KLASS_EMOJI.get(sc["new"], "•")
+            lines.append(f"  {sc['arrow']} <b>{sc['sector']}</b>: {e_old}{sc['old']} → {e_new}{sc['new']}")
         lines.append("")
 
+    new_setups = cd.get("new_setups", [])
+    setup_info = cd.get("setup_info", {})
     if new_setups:
         anything = True
         lines.append("<b>New setups entered:</b>")
         for sym in new_setups[:10]:
-            buy_row = buys[buys["symbol"] == sym].iloc[0] if not buys.empty and sym in buys["symbol"].values else None
-            sec = buy_row["sector"] if buy_row is not None and "sector" in buy_row.index else ""
-            coil = f" · coil {buy_row['coil']:.1f}" if buy_row is not None and "coil" in buy_row.index and pd.notna(buy_row["coil"]) else ""
+            info = setup_info.get(sym, {})
+            sec = info.get("sector", "")
+            coil_v = info.get("coil")
+            coil = f" · coil {coil_v:.1f}" if coil_v is not None else ""
             lines.append(f"  ⚡ <code>{sym}</code> — {sec}{coil}")
         if len(new_setups) > 10:
             lines.append(f"  +{len(new_setups) - 10} more")
         lines.append("")
 
+    lost_setups = cd.get("lost_setups", [])
     if lost_setups:
         anything = True
         lines.append("<b>Setups removed:</b>")
@@ -1120,18 +1252,17 @@ def handle_changed(chat_id: int, engine):
             lines.append(f"  +{len(lost_setups) - 10} more")
         lines.append("")
 
-    # Coil stats
-    if not coil_rows.empty:
-        n_coil = len(coil_rows)
-        near_trig = coil_rows[coil_rows["to_trigger"].notna() & (coil_rows["to_trigger"] <= 0.02)]
-        lines.append(f"<b>Coil pool:</b> {n_coil} stocks coiled, {len(near_trig)} within 2% of trigger")
+    n_coils = cd.get("n_coils", 0)
+    if n_coils:
+        n_near = cd.get("n_near_trigger", 0)
+        lines.append(f"<b>Coil pool:</b> {n_coils} stocks coiled, {n_near} within 2% of trigger")
         anything = True
 
-    if not scan_rows.empty:
-        crossing = int((scan_rows["klass"] == "CROSSING").sum())
-        pullback = int((scan_rows["klass"] == "PULLBACK").sum())
-        total = len(scan_rows)
-        lines.append(f"<b>Sectors:</b> {crossing} crossing · {pullback} pullback · {total} total")
+    n_cross = cd.get("n_crossing", 0)
+    n_pull = cd.get("n_pullback", 0)
+    total = cd.get("total_sectors", 0)
+    if total:
+        lines.append(f"<b>Sectors:</b> {n_cross} crossing · {n_pull} pullback · {total} total")
         anything = True
 
     if not anything:

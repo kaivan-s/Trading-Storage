@@ -1498,6 +1498,12 @@ def api_cron_post_market():
             print(f"[cron] carry scored {filled}, {pending} pending")
         except Exception as exc:
             print(f"[cron] carry score failed: {exc}")
+        # Pre-compute bot cache so Telegram replies are instant
+        try:
+            import telegram_interactive as tgi
+            tgi.precompute_bot_cache(engine)
+        except Exception as exc:
+            print(f"[cron] bot cache failed: {exc}")
 
     threading.Thread(target=work, daemon=True).start()
     return jsonify({
@@ -2077,6 +2083,12 @@ def _boot():
     """
     try:
         engine.load(DEFAULT_DAYS, date.today())
+        # Pre-compute bot cache after startup load
+        try:
+            import telegram_interactive as tgi
+            tgi.precompute_bot_cache(engine)
+        except Exception:
+            pass
     except Exception as exc:
         engine._set(status="error", error=str(exc), message="Startup load failed.")
 
