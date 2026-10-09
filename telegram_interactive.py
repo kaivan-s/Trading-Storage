@@ -684,7 +684,20 @@ def handle_today(chat_id: int, engine):
 # /heatmap — sector rotation map
 # --------------------------------------------------------------------------
 
-def handle_heatmap(chat_id: int, engine):
+def _fmt_sector_row(r) -> str:
+    """One-line sector summary for heatmap."""
+    sec = r["sector"]
+    t = r.get("T", 0)
+    cmf = r.get("cmf", 0)
+    n_adv = int(r.get("n_adv", 0))
+    n_stocks = int(r.get("n_stocks", 1))
+    adv_pct = n_adv / n_stocks * 100 if n_stocks > 0 else 0
+    cmf_arrow = "↑" if pd.notna(cmf) and cmf > 0.05 else "↓" if pd.notna(cmf) and cmf < -0.05 else ""
+    cmf_s = f"CMF {cmf:+.2f}{cmf_arrow}" if pd.notna(cmf) else ""
+    return f"  <b>{sec}</b> · T:{t:.0f}% · {adv_pct:.0f}% adv · {cmf_s}"
+
+
+def handle_heatmap(chat_id: int, engine, full: bool = False):
     with engine._lock:
         if engine.status != "ready" or engine.scan_rows is None or engine.scan_rows.empty:
             _reply(chat_id, "⏳ Engine still loading. Try again in a few minutes.")
@@ -692,51 +705,79 @@ def handle_heatmap(chat_id: int, engine):
         df = engine.scan_rows.copy()
         as_of = engine.as_of
 
-    lines = [f"🗺️ <b>Sector Heatmap</b>", f"As of {as_of}\n"]
-
-    # Group by classification
-    groups = {
-        "🟢 CROSSING": df[df["klass"] == "CROSSING"],
-        "🟡 PULLBACK": df[df["klass"] == "PULLBACK"],
-        "⚪ BASE": df[df["klass"] == "BASE"],
-        "🟠 UNVERIFIED": df[df["klass"] == "CROSSING_UNVERIFIED"],
-        "🔴 DOWN": df[df["klass"].isin(["DOWN", "NONE", "NEGLECT"])],
-        "⛔ DISQUALIFIED": df[df["klass"] == "DISQUALIFIED"],
-    }
-
     total = len(df)
-    for label, grp in groups.items():
-        if grp.empty:
-            continue
-        lines.append(f"<b>{label}</b> ({len(grp)} sectors)")
-        grp_sorted = grp.sort_values("T", ascending=False)
-        for _, r in grp_sorted.iterrows():
-            sec = r["sector"]
-            t = r.get("T", 0)
-            cmf = r.get("cmf", 0)
-            n_adv = int(r.get("n_adv", 0))
-            n_stocks = int(r.get("n_stocks", 1))
-            adv_pct = n_adv / n_stocks * 100 if n_stocks > 0 else 0
-            bar = "█" * max(1, int(t / 10)) if pd.notna(t) else ""
-            cmf_s = f"CMF {cmf:+.2f}" if pd.notna(cmf) else ""
-            lines.append(f"  {sec}")
-            lines.append(f"    {bar} T:{t:.0f}% · {adv_pct:.0f}% adv · {cmf_s}")
+    crossing = df[df["klass"] == "CROSSING"]
+    pullback = df[df["klass"] == "PULLBACK"]
+    n_crossing = len(crossing)
+    n_pullback = len(pullback)
+    n_actionable = n_crossing + n_pullback
+    regime = "BULLISH" if n_actionable / max(total, 1) >= 0.4 else "CAUTIOUS"
+    emoji = "🟢" if regime == "BULLISH" else "🟡"
+
+    if full:
+        # ── Full view: every sector grouped ──
+        lines = [f"🗺️ <b>All Sectors</b>", f"As of {as_of}\n"]
+
+        groups = [
+            ("🟢 CROSSING", crossing),
+            ("🟡 PULLBACK", pullback),
+            ("⚪ BASE", df[df["klass"] == "BASE"]),
+            ("🟠 UNVERIFIED", df[df["klass"] == "CROSSING_UNVERIFIED"]),
+            ("🔴 DOWN", df[df["klass"].isin(["DOWN", "NONE", "NEGLECT"])]),
+            ("⛔ DISQUALIFIED", df[df["klass"] == "DISQUALIFIED"]),
+        ]
+        for label, grp in groups:
+            if grp.empty:
+                continue
+            lines.append(f"<b>{label}</b> ({len(grp)})")
+            for _, r in grp.sort_values("T", ascending=False).iterrows():
+                lines.append(_fmt_sector_row(r))
+            lines.append("")
+
+        lines.append(f"{emoji} <b>{regime}</b> · {n_actionable}/{total} sectors in uptrend")
+        lines.append("\n<i>Sector rotation — not a recommendation.</i>")
+        btns = [
+            [{"text": "🔄 Flow", "callback_data": "/flow"},
+             {"text": "🎯 Triggers", "callback_data": "/triggers"}],
+        ]
+        _send_long(chat_id, "\n".join(lines), buttons=btns)
+        return
+
+    # ── Concise view: only actionable sectors ──
+    lines = [f"🗺️ <b>Sector Heatmap</b>", f"As of {as_of}\n"]
+    lines.append(f"{emoji} <b>Market: {regime}</b> — {n_actionable}/{total} sectors in uptrend\n")
+
+    if not crossing.empty:
+        lines.append(f"🟢 <b>CROSSING</b> ({n_crossing}) — uptrend confirmed")
+        for _, r in crossing.sort_values("T", ascending=False).iterrows():
+            lines.append(_fmt_sector_row(r))
         lines.append("")
 
-    # Summary
-    crossing = len(groups["🟢 CROSSING"])
-    pullback = len(groups["🟡 PULLBACK"])
-    down = len(groups["🔴 DOWN"])
-    regime = "BULLISH" if (crossing + pullback) / max(total, 1) >= 0.4 else "CAUTIOUS"
-    lines.append(f"📊 <b>Market regime: {regime}</b>")
-    lines.append(f"   {crossing} crossing · {pullback} pullback · {down} down")
-    lines.append(f"   {(crossing + pullback) / max(total, 1) * 100:.0f}% of sectors in uptrend")
+    if not pullback.empty:
+        lines.append(f"🟡 <b>PULLBACK</b> ({n_pullback}) — buy zone")
+        for _, r in pullback.sort_values("T", ascending=False).iterrows():
+            lines.append(_fmt_sector_row(r))
+        lines.append("")
 
-    lines.append("\n<i>Sector rotation analysis — not a recommendation.</i>")
+    if n_actionable == 0:
+        lines.append("No sectors in CROSSING or PULLBACK right now.")
+        lines.append("<i>The market isn't always offering setups — that's okay.</i>")
+
+    # Quick counts for the rest
+    rest = {
+        "Base": len(df[df["klass"] == "BASE"]),
+        "Down": len(df[df["klass"].isin(["DOWN", "NONE", "NEGLECT"])]),
+        "Disqualified": len(df[df["klass"] == "DISQUALIFIED"]),
+    }
+    rest_parts = [f"{v} {k.lower()}" for k, v in rest.items() if v > 0]
+    if rest_parts:
+        lines.append(f"📊 Also: {' · '.join(rest_parts)}")
+
+    lines.append("\n<i>Sector rotation — not a recommendation.</i>")
     btns = [
+        [{"text": "📋 Show all sectors", "callback_data": "/heatmap_full"}],
         [{"text": "🔄 Flow", "callback_data": "/flow"},
-         {"text": "🎯 Triggers", "callback_data": "/triggers"},
-         {"text": "📋 Changed", "callback_data": "/changed"}],
+         {"text": "🎯 Triggers", "callback_data": "/triggers"}],
     ]
     _send_long(chat_id, "\n".join(lines), buttons=btns)
 
@@ -1129,6 +1170,8 @@ def _dispatch(chat_id: int, user_id: int, text: str, engine) -> None:
 
     if lower == "/heatmap":
         handle_heatmap(chat_id, engine)
+    elif lower == "/heatmap_full":
+        handle_heatmap(chat_id, engine, full=True)
     elif lower == "/flow":
         handle_flow(chat_id, engine)
     elif lower == "/triggers":
