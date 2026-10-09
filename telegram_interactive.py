@@ -41,7 +41,7 @@ API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 # --------------------------------------------------------------------------
 
 FREE_DAILY_LIMIT = 3
-_PAID_COMMANDS = {"/heatmap", "/flow", "/triggers", "/delivery", "/changed"}
+_PAID_COMMANDS = {"/heatmap", "/flow", "/triggers", "/delivery", "/changed", "/today"}
 
 # In-memory usage tracker: {user_id: {"date": "YYYY-MM-DD", "count": int}}
 _usage: dict[int, dict] = {}
@@ -137,6 +137,7 @@ def _limit_msg() -> str:
 
 # Bot commands shown in Telegram's / menu
 BOT_COMMANDS = [
+    {"command": "today", "description": "📅 What matters today — top picks + insight"},
     {"command": "heatmap", "description": "🗺️ Sector rotation map"},
     {"command": "flow", "description": "🔄 Money flowing into/out of sectors"},
     {"command": "triggers", "description": "🎯 Stocks near breakout trigger"},
@@ -218,6 +219,9 @@ def _send_long(chat_id: int, text: str, buttons: list[list[dict]] | None = None)
 # Inline button layouts used across commands
 MAIN_MENU_BUTTONS = [
     [
+        {"text": "📅 Today's Brief", "callback_data": "/today"},
+    ],
+    [
         {"text": "🗺️ Heatmap", "callback_data": "/heatmap"},
         {"text": "🔄 Flow", "callback_data": "/flow"},
         {"text": "🎯 Triggers", "callback_data": "/triggers"},
@@ -225,7 +229,6 @@ MAIN_MENU_BUTTONS = [
     [
         {"text": "📦 Delivery", "callback_data": "/delivery"},
         {"text": "📋 Changed", "callback_data": "/changed"},
-        {"text": "📖 Help", "callback_data": "/help"},
     ],
 ]
 
@@ -271,10 +274,11 @@ def handle_help(chat_id: int):
 
 
 # --------------------------------------------------------------------------
-# /r SYMBOL — stock report
+# /r SYMBOL — stock report (quick mode by default, detail on tap)
 # --------------------------------------------------------------------------
 
-def _fmt_report(data: dict) -> str:
+def _fmt_report_quick(data: dict) -> str:
+    """4-line quick verdict — what 80% of users need."""
     if not data.get("found"):
         near = data.get("near", [])
         if near:
@@ -287,72 +291,129 @@ def _fmt_report(data: dict) -> str:
         return f"🔍 <b>{data.get('query', '?')}</b> — not found in the universe."
 
     sym = data["symbol"]
-    sector = data.get("sector") or "—"
-    klass = data.get("sector_klass") or "—"
-    phase = data.get("phase_label") or data.get("phase", "—")
+    sector = data.get("sector") or ""
+    klass = data.get("sector_klass") or ""
+    phase = data.get("phase_label") or data.get("phase", "")
     m = data.get("metrics") or {}
     plan = data.get("plan") or {}
-    shape = data.get("shape") or {}
-
-    lines = [f"📊 <b>{sym}</b>"]
-    lines.append(f"As of {data.get('as_of', '?')}\n")
+    why = data.get("why") or ""
 
     adj = m.get("adj")
-    if adj:
-        lines.append(f"💰 Price: <b>₹{adj:,.1f}</b>")
-
-    e = KLASS_EMOJI.get(klass, "•")
-    lines.append(f"\n🏭 <b>Sector:</b> {sector}")
-    lines.append(f"   {e} {klass}")
-
-    if shape:
-        t = shape.get("T")
-        b = shape.get("B")
-        rs = shape.get("rs")
-        if t is not None:
-            lines.append(f"   Breadth (T): {t:.0f}% {'📈' if t > 50 else '📉'}")
-        if b is not None:
-            lines.append(f"   Width (B): {b:.0f}%")
-        if rs is not None:
-            lines.append(f"   RS: {rs:+.1f}")
-
+    e = KLASS_EMOJI.get(klass, "")
     phase_emoji = {
         "Broke out": "🚀", "Potential": "🎯", "Coiled": "⚡",
         "Near miss": "👀", "At the high": "📈", "Volume break": "💥",
         "Watching": "⏳",
     }.get(phase, "•")
-    lines.append(f"\n{phase_emoji} <b>Status:</b> {phase}")
 
-    lines.append(f"\n📈 <b>Technical:</b>")
+    # Line 1: symbol + price
+    lines = [f"📊 <b>{sym}</b> — ₹{adj:,.1f}" if adj else f"📊 <b>{sym}</b>"]
+
+    # Line 2: verdict (phase)
+    lines.append(f"\n{phase_emoji} <b>{phase}</b>")
+
+    # Line 3: key context — trigger distance, sector, or action
+    trigger = m.get("trigger") or m.get("prior_trigger")
+    to_trig = m.get("to_trigger")
+    cmf = m.get("cmf")
+
+    context_parts = []
+    if to_trig is not None and trigger:
+        if abs(to_trig) < 0.02:
+            context_parts.append(f"{to_trig * 100:.1f}% from trigger ₹{trigger:,.0f}")
+        else:
+            context_parts.append(f"Trigger ₹{trigger:,.0f} ({to_trig * 100:+.1f}%)")
+    if sector and klass:
+        context_parts.append(f"{sector} {e}{klass}")
+    if cmf is not None:
+        flow_word = "accumulation" if cmf > 0.05 else "distribution" if cmf < -0.05 else ""
+        if flow_word:
+            context_parts.append(flow_word)
+    if context_parts:
+        lines.append(" · ".join(context_parts))
+
+    # Line 4: the plain English summary — trimmed to first sentence
+    if why:
+        first_sentence = why.split(". ")[0] + "." if ". " in why else why[:200]
+        lines.append(f"\n💡 <i>{first_sentence}</i>")
+
+    # Trade plan one-liner if available
+    stop, target = plan.get("stop"), plan.get("target")
+    if stop and target and adj:
+        lines.append(f"\n📐 Stop ₹{stop:,.0f} · Target ₹{target:,.0f}")
+
+    return "\n".join(lines)
+
+
+def _fmt_report_full(data: dict) -> str:
+    """Detailed report with all metrics — shown when user taps 'Full report'."""
+    if not data.get("found"):
+        return _fmt_report_quick(data)
+
+    sym = data["symbol"]
+    m = data.get("metrics") or {}
+    plan = data.get("plan") or {}
+    shape = data.get("shape") or {}
+    sector = data.get("sector") or "—"
+    klass = data.get("sector_klass") or "—"
+    adj = m.get("adj")
+
+    lines = [f"📊 <b>{sym} — Full Report</b>"]
+    lines.append(f"As of {data.get('as_of', '?')}\n")
+
+    # Price + Trend
+    if adj:
+        lines.append(f"💰 ₹{adj:,.1f}")
     ema50, ema200 = m.get("ema50"), m.get("ema200")
     if adj and ema50 and ema200:
         if adj > ema50 > ema200:
-            lines.append("   ✅ Above EMA50 & EMA200 (uptrend)")
+            lines.append("✅ Uptrend (above EMA50 & 200)")
         elif adj > ema200:
-            lines.append("   🟡 Above EMA200, below EMA50")
+            lines.append("🟡 Above EMA200, below EMA50")
         else:
-            lines.append("   🔴 Below both EMAs (downtrend)")
+            lines.append("🔴 Downtrend (below both EMAs)")
 
+    # Sector
+    lines.append(f"\n🏭 <b>{sector}</b> {KLASS_EMOJI.get(klass, '')} {klass}")
+    if shape:
+        parts = []
+        t = shape.get("T")
+        if t is not None:
+            parts.append(f"T:{t:.0f}%")
+        b = shape.get("B")
+        if b is not None:
+            parts.append(f"B:{b:.0f}%")
+        cmf_s = shape.get("cmf")
+        if cmf_s is not None:
+            parts.append(f"CMF:{cmf_s:+.2f}")
+        rs = shape.get("rs")
+        if rs is not None:
+            parts.append(f"RS:{rs:+.1f}")
+        if parts:
+            lines.append("   " + " · ".join(parts))
+
+    # Technical
+    lines.append(f"\n📈 <b>Technical</b>")
     trigger = m.get("trigger") or m.get("prior_trigger")
     to_trig = m.get("to_trigger")
     if trigger:
         dist = f" ({to_trig * 100:+.1f}%)" if to_trig is not None else ""
-        lines.append(f"   🎯 Trigger: ₹{trigger:,.1f}{dist}")
-
+        lines.append(f"   Trigger: ₹{trigger:,.1f}{dist}")
     coil = m.get("coil")
     if coil is not None:
-        lines.append(f"   ⚡ Coil score: {coil:.1f}")
+        lines.append(f"   Coil: {coil:.1f}")
     rsi = m.get("rsi")
     if rsi is not None:
-        lines.append(f"   {'🔴' if rsi > 70 else '🟢' if rsi < 30 else '•'} RSI: {rsi:.0f}")
+        lines.append(f"   RSI: {rsi:.0f}")
     pos_hi = m.get("pos_hi")
     if pos_hi is not None:
-        lines.append(f"   📏 Position: {pos_hi * 100:.0f}% of 85-day range")
+        lines.append(f"   Position: {pos_hi * 100:.0f}% of 85-day range")
 
-    lines.append(f"\n📊 <b>Volume & Flow:</b>")
+    # Volume & Flow
+    lines.append(f"\n📊 <b>Volume & Flow</b>")
     vol_x = m.get("vol_expand")
     if vol_x is not None:
-        lines.append(f"   Volume: {vol_x:.1f}× 20-day avg")
+        lines.append(f"   Volume: {vol_x:.1f}× avg")
     med_to = m.get("median_turnover")
     if med_to is not None:
         cr = med_to / 100
@@ -365,37 +426,39 @@ def _fmt_report(data: dict) -> str:
     if deliv is not None:
         lines.append(f"   Delivery: {deliv:.0f}%")
 
+    # Trade plan
     action = plan.get("action_label")
     if action:
-        lines.append(f"\n🔔 <b>Structure:</b> {action}")
+        lines.append(f"\n🔔 <b>{action}</b>")
     stop, target, rr = plan.get("stop"), plan.get("target"), plan.get("rr")
     if stop is not None:
         lines.append(f"   Stop: ₹{stop:,.1f}")
     if target is not None:
-        lines.append(f"   2R target: ₹{target:,.1f}")
+        lines.append(f"   Target: ₹{target:,.1f}")
     if rr is not None:
         lines.append(f"   R:R = 1:{rr:.1f}")
 
+    # Setup / breakout
     setup = data.get("setup")
     if setup and setup.get("why"):
-        lines.append(f"\n💡 <b>Setup:</b> {setup['why'][:200]}")
+        lines.append(f"\n💡 {setup['why'][:200]}")
     breakout = data.get("breakout")
     if breakout and breakout.get("why"):
-        lines.append(f"\n💥 <b>Breakout:</b> {breakout['why'][:200]}")
+        lines.append(f"\n💥 {breakout['why'][:200]}")
 
+    # Full summary
     why = data.get("why")
     if why:
-        lines.append(f"\n📝 <b>Summary:</b>\n<i>{why[:400]}</i>")
+        lines.append(f"\n📝 <i>{why[:400]}</i>")
 
     lines.append("\n<i>Observational analysis — not a recommendation.</i>")
     return "\n".join(lines)
 
 
-def handle_report(chat_id: int, query: str, engine):
+def handle_report(chat_id: int, query: str, engine, full: bool = False):
     if not query:
-        _reply(chat_id, "Usage: /r SYMBOL\nExample: <code>/r TRENT</code>")
+        _reply(chat_id, "Just type a stock name — <code>TRENT</code>, <code>RELIANCE</code>")
         return
-    _reply(chat_id, f"🔍 Looking up <b>{query.upper()}</b>...")
     with engine._lock:
         if engine.status != "ready" or engine.stocks is None:
             _reply(chat_id, "⏳ Engine still loading. Try again in a few minutes.")
@@ -405,10 +468,30 @@ def handle_report(chat_id: int, query: str, engine):
     except Exception as exc:
         _reply(chat_id, f"❌ Error: {str(exc)[:200]}")
         return
-    # Contextual buttons after the report
+
+    sym = data.get("symbol", query.upper())
     sector = data.get("sector") if data.get("found") else None
-    btns = _stock_buttons(data.get("symbol", ""), sector) if data.get("found") else MAIN_MENU_BUTTONS
-    _send_long(chat_id, _fmt_report(data), buttons=btns)
+
+    if full:
+        msg = _fmt_report_full(data)
+        btns = _stock_buttons(sym, sector) if data.get("found") else MAIN_MENU_BUTTONS
+    else:
+        msg = _fmt_report_quick(data)
+        # Quick mode: show "Full report" button + sector
+        btns = []
+        if data.get("found"):
+            row1 = [{"text": "📊 Full report", "callback_data": f"/detail {sym}"}]
+            if sector:
+                row1.append({"text": f"🏭 {sector[:18]}", "callback_data": f"/sector {sector}"})
+            btns.append(row1)
+            btns.append([
+                {"text": "🎯 Triggers", "callback_data": "/triggers"},
+                {"text": "🗺️ Heatmap", "callback_data": "/heatmap"},
+            ])
+        else:
+            btns = MAIN_MENU_BUTTONS
+
+    _send_long(chat_id, msg, buttons=btns)
 
 
 # --------------------------------------------------------------------------
@@ -491,6 +574,110 @@ def handle_sector(chat_id: int, query: str, engine):
          {"text": "🔄 Flow", "callback_data": "/flow"}],
     ]
     _send_long(chat_id, _fmt_sector(data), buttons=btns)
+
+
+# --------------------------------------------------------------------------
+# /today — "just tell me what matters"
+# --------------------------------------------------------------------------
+
+def handle_today(chat_id: int, engine):
+    with engine._lock:
+        if engine.status != "ready":
+            _reply(chat_id, "⏳ Engine still loading.")
+            return
+        scan_rows = engine.scan_rows.copy() if engine.scan_rows is not None and not engine.scan_rows.empty else pd.DataFrame()
+        coil_rows = engine.coil_rows.copy() if engine.coil_rows is not None and not engine.coil_rows.empty else pd.DataFrame()
+        buys = engine.buys.copy() if engine.buys is not None and not engine.buys.empty else pd.DataFrame()
+        coil_stocks = engine.coil_stocks
+        as_of = engine.as_of
+
+    lines = [f"📅 <b>Today's Brief</b>", f"As of {as_of}\n"]
+
+    # 1. Top actionable — stocks closest to trigger in buy setups
+    actionable = []
+    pool = buys if not buys.empty else coil_rows
+    if not pool.empty and "to_trigger" in pool.columns:
+        near = pool[pool["to_trigger"].notna() & (pool["to_trigger"] <= 0.03)]
+        near = near.sort_values("to_trigger").head(3)
+        for _, r in near.iterrows():
+            sym = r.get("symbol", "?")
+            adj = r.get("adj", 0)
+            trig = r.get("trigger", 0)
+            to_t = r.get("to_trigger", 0)
+            sec = r.get("sector", "")
+            klass = ""
+            if not scan_rows.empty:
+                sr = scan_rows[scan_rows["sector"] == sec]
+                if not sr.empty:
+                    klass = sr.iloc[0].get("klass", "")
+            actionable.append((sym, adj, trig, to_t, sec, klass))
+
+    if actionable:
+        lines.append("🎯 <b>Actionable</b>")
+        for sym, adj, trig, to_t, sec, klass in actionable:
+            e = KLASS_EMOJI.get(klass, "")
+            lines.append(f"  <b>{sym}</b> ₹{adj:,.0f} → trigger ₹{trig:,.0f} ({to_t * 100:.1f}% away)")
+            lines.append(f"  {sec} {e}{klass}")
+        lines.append("")
+    else:
+        lines.append("🎯 No stocks near breakout trigger today.")
+        lines.append("<i>The market isn't always offering setups — that's okay.</i>\n")
+
+    # 2. One insight — strongest sector flow or unusual delivery
+    if not scan_rows.empty and "cmf" in scan_rows.columns:
+        top_cmf = scan_rows[scan_rows["cmf"].notna()].sort_values("cmf", ascending=False)
+        if not top_cmf.empty:
+            best = top_cmf.iloc[0]
+            sec = best["sector"]
+            cmf = best["cmf"]
+            klass = best.get("klass", "")
+            n_adv = int(best.get("n_adv", 0))
+            n_stocks = int(best.get("n_stocks", 1))
+            adv_pct = n_adv / n_stocks * 100 if n_stocks > 0 else 0
+            if cmf > 0.05:
+                lines.append("💡 <b>Insight</b>")
+                lines.append(f"Strongest money flow: <b>{sec}</b> (CMF {cmf:+.2f})")
+                lines.append(f"{adv_pct:.0f}% of stocks advancing · {KLASS_EMOJI.get(klass, '')}{klass}")
+                # Check for streak — how many days CMF has been positive
+                if coil_stocks is not None and not coil_stocks.empty:
+                    try:
+                        # Quick check from panel data isn't straightforward, so keep it simple
+                        lines.append(f"<i>Positive CMF = institutions accumulating this sector</i>")
+                    except Exception:
+                        pass
+                lines.append("")
+
+            # Also mention worst outflow
+            worst = top_cmf.iloc[-1]
+            if worst["cmf"] < -0.05:
+                lines.append(f"⚠️ Outflow: <b>{worst['sector']}</b> (CMF {worst['cmf']:+.2f})")
+                lines.append(f"<i>Money leaving — avoid new positions here</i>")
+                lines.append("")
+
+    # 3. Market regime
+    if not scan_rows.empty:
+        total = len(scan_rows)
+        crossing = int((scan_rows["klass"] == "CROSSING").sum())
+        pullback = int((scan_rows["klass"] == "PULLBACK").sum())
+        bullish_pct = (crossing + pullback) / max(total, 1) * 100
+        regime = "BULLISH" if bullish_pct >= 40 else "CAUTIOUS"
+        emoji = "🟢" if regime == "BULLISH" else "🟡"
+        lines.append(f"📊 <b>Market:</b> {emoji} {regime}")
+        lines.append(f"   {crossing} crossing · {pullback} pullback · {bullish_pct:.0f}% in uptrend")
+
+    # Coil pool stat
+    if not coil_rows.empty:
+        lines.append(f"   {len(coil_rows)} stocks coiled (compressed near highs)")
+
+    lines.append("\n<i>What the data shows today — not a recommendation.</i>")
+
+    btns = [
+        [{"text": "🎯 All triggers", "callback_data": "/triggers"},
+         {"text": "🗺️ Heatmap", "callback_data": "/heatmap"}],
+        [{"text": "📦 Delivery", "callback_data": "/delivery"},
+         {"text": "🔄 Flow", "callback_data": "/flow"}],
+    ]
+    _send_long(chat_id, "\n".join(lines), buttons=btns)
 
 
 # --------------------------------------------------------------------------
@@ -950,6 +1137,11 @@ def _dispatch(chat_id: int, user_id: int, text: str, engine) -> None:
         handle_delivery(chat_id, engine)
     elif lower == "/changed":
         handle_changed(chat_id, engine)
+    elif lower == "/today":
+        handle_today(chat_id, engine)
+    elif lower.startswith("/detail "):
+        query = text.split(maxsplit=1)[1] if " " in text else ""
+        handle_report(chat_id, query.strip(), engine, full=True)
     elif lower.startswith("/r ") or lower.startswith("/report "):
         query = text.split(maxsplit=1)[1] if " " in text else ""
         handle_report(chat_id, query.strip(), engine)
@@ -968,9 +1160,7 @@ def _dispatch(chat_id: int, user_id: int, text: str, engine) -> None:
         if remaining is not None and remaining <= 2:
             note = (f"💡 {remaining} free market view{'s' if remaining != 1 else ''} "
                     f"left today. Stock reports are always free.")
-            _reply(chat_id, note, buttons=[
-                [{"text": "📊 Try a stock (free)", "callback_data": "/help"}],
-            ] if remaining == 0 else None)
+            _reply(chat_id, note)
 
 
 # Deduplication: track recent update IDs to avoid processing retries
