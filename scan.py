@@ -345,7 +345,7 @@ def explain_setup(shape: dict, row) -> str:
         parts.append(f"{symbol} is coiled: " + ", ".join(bits) + ".")
     parts.append(
         "The setup is a close through that 20-day high on rising volume — "
-        "not a buy at today's price."
+        "not actionable at today's price."
     )
     return " ".join(parts)
 

@@ -649,10 +649,10 @@ def _fmt_report_quick(data: dict) -> str:
         first_sentence = why.split(". ")[0] + "." if ". " in why else why[:200]
         lines.append(f"\n💡 <i>{first_sentence}</i>")
 
-    # Trade plan one-liner if available
+    # Structural levels one-liner if available
     stop, target = plan.get("stop"), plan.get("target")
     if stop and target and adj:
-        lines.append(f"\n📐 Stop ₹{stop:,.0f} · Target ₹{target:,.0f}")
+        lines.append(f"\n📐 Base ₹{stop:,.0f} · 2R ₹{target:,.0f}")
 
     return "\n".join(lines)
 
@@ -738,15 +738,15 @@ def _fmt_report_full(data: dict) -> str:
     if deliv is not None:
         lines.append(f"   Delivery: {deliv:.0f}%")
 
-    # Trade plan
+    # Structural levels
     action = plan.get("action_label")
     if action:
         lines.append(f"\n🔔 <b>{action}</b>")
     stop, target, rr = plan.get("stop"), plan.get("target"), plan.get("rr")
     if stop is not None:
-        lines.append(f"   Stop: ₹{stop:,.1f}")
+        lines.append(f"   Base level: ₹{stop:,.1f}")
     if target is not None:
-        lines.append(f"   Target: ₹{target:,.1f}")
+        lines.append(f"   2R level: ₹{target:,.1f}")
     if rr is not None:
         lines.append(f"   R:R = 1:{rr:.1f}")
 
@@ -1045,7 +1045,7 @@ def handle_heatmap(chat_id: int, engine, full: bool = False):
             lines.append(_fmt_cached_sector(r))
         lines.append("")
     if pullback:
-        lines.append(f"🟡 <b>PULLBACK</b> ({len(pullback)}) — buy zone")
+        lines.append(f"🟡 <b>PULLBACK</b> ({len(pullback)}) — setup zone")
         for r in pullback:
             lines.append(_fmt_cached_sector(r))
         lines.append("")
@@ -1173,7 +1173,7 @@ def handle_triggers(chat_id: int, engine):
         lines.append(f"    {' · '.join(parts)}")
 
         if r.get("is_buy"):
-            lines.append("    ✅ In buy setup list")
+            lines.append("    ✅ In setup list")
         lines.append("")
 
     if len(trig_list) > 15:
