@@ -1816,7 +1816,8 @@ def api_telegram_setup_webhook():
         base = request.host_url.rstrip("/")
     webhook_url = f"{base}/api/telegram/webhook"
     ok = tgi.set_webhook(webhook_url)
-    return jsonify({"ok": ok, "webhook_url": webhook_url})
+    cmd_ok = tgi.set_commands()
+    return jsonify({"ok": ok, "webhook_url": webhook_url, "commands_registered": cmd_ok})
 
 
 @app.post("/api/telegram/delete-webhook")
