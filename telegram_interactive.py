@@ -649,10 +649,9 @@ def _fmt_report_quick(data: dict) -> str:
         first_sentence = why.split(". ")[0] + "." if ". " in why else why[:200]
         lines.append(f"\n💡 <i>{first_sentence}</i>")
 
-    # Structural levels one-liner if available
-    stop, target = plan.get("stop"), plan.get("target")
-    if stop and target and adj:
-        lines.append(f"\n📐 Base ₹{stop:,.0f} · 2R ₹{target:,.0f}")
+    # Structural ₹-levels removed — showing absolute levels in a broadcast
+    # channel risks being read as a recommendation. The website shows them
+    # with full disclaimers; the bot keeps it observational.
 
     return "\n".join(lines)
 
@@ -738,17 +737,9 @@ def _fmt_report_full(data: dict) -> str:
     if deliv is not None:
         lines.append(f"   Delivery: {deliv:.0f}%")
 
-    # Structural levels
-    action = plan.get("action_label")
-    if action:
-        lines.append(f"\n🔔 <b>{action}</b>")
-    stop, target, rr = plan.get("stop"), plan.get("target"), plan.get("rr")
-    if stop is not None:
-        lines.append(f"   Base level: ₹{stop:,.1f}")
-    if target is not None:
-        lines.append(f"   2R level: ₹{target:,.1f}")
-    if rr is not None:
-        lines.append(f"   R:R = 1:{rr:.1f}")
+    # Structural ₹-levels (stop / target / R:R) removed from bot output.
+    # Absolute price levels in a chat message can be forwarded out of context
+    # and read as advice. The website shows them with inline disclaimers.
 
     # Setup / breakout
     setup = data.get("setup")
@@ -758,10 +749,8 @@ def _fmt_report_full(data: dict) -> str:
     if breakout and breakout.get("why"):
         lines.append(f"\n💥 {breakout['why'][:200]}")
 
-    # Full summary
-    why = data.get("why")
-    if why:
-        lines.append(f"\n📝 <i>{why[:400]}</i>")
+    # plan.why contains absolute ₹-levels (structure / 2R) — omitted from
+    # bot output for the same reason the structural block was removed above.
 
     lines.append("\n<i>Observational analysis — not a recommendation.</i>")
     return "\n".join(lines)
@@ -905,10 +894,10 @@ def handle_today(chat_id: int, engine):
     as_of = _view_cache.get("as_of", "?")
     lines = [f"📅 <b>Today's Brief</b>", f"As of {as_of}\n"]
 
-    # 1. Top actionable
+    # 1. Stocks near their breakout trigger
     actionable = td.get("actionable", [])
     if actionable:
-        lines.append("🎯 <b>Actionable</b>")
+        lines.append("🎯 <b>Near trigger</b>")
         for r in actionable:
             e = KLASS_EMOJI.get(r.get("klass", ""), "")
             lines.append(f"  <b>{r['symbol']}</b> ₹{r['adj']:,.0f} → trigger ₹{r['trigger']:,.0f} ({r['to_trigger'] * 100:.1f}% away)")
@@ -933,7 +922,7 @@ def handle_today(chat_id: int, engine):
     worst_cmf = td.get("worst_cmf", 0)
     if worst_sec:
         lines.append(f"⚠️ Outflow: <b>{worst_sec}</b> (CMF {worst_cmf:+.2f})")
-        lines.append(f"<i>Money leaving — avoid new positions here</i>")
+        lines.append(f"<i>Institutions are net distributors in this sector</i>")
         lines.append("")
 
     # 3. Market regime
