@@ -242,7 +242,7 @@ def explain_volume_break(row) -> str:
 
 
 def _energy_score(day: pd.DataFrame) -> pd.Series:
-    """Same energy idea as tom.for_tomorrow_momentum, clipped 0–1."""
+    """Same energy idea as the old for-tomorrow momentum score, clipped 0–1."""
     def clip01(s, lo, hi):
         return ((pd.to_numeric(s, errors="coerce") - lo) / (hi - lo)).clip(0, 1)
 

@@ -10,7 +10,6 @@ Sector accumulation scan.
     python run.py coil --days 220         # daily pre-breakout watchlist
     python run.py coiltest --days 320     # forward-test vs all-stock base rate
     python run.py buytest --days 320      # forward-test the buy funnel (shape ∩ coil)
-    python run.py tom --days 220          # live overlay at run time → for-tomorrow list
     python run.py carry snap              # 15:20-15:28 IST: upper-circuit candidates + order book
     python run.py carry score             # after ~18:30 IST: fill next-session outcomes, report
     python run.py carry eod --backfill 20 # rebuild past candidates from bhavcopy (no order book)
@@ -206,26 +205,6 @@ def cmd_coiltest(args):
         print(f"\nWritten to {args.csv}")
 
 
-def cmd_tom(args):
-    stocks, _ = _load(max(args.days, 220), args.end, args.sector_level)
-    print("\nComputing coil indicators …")
-    stocks = stk.add_indicators(stocks)
-    print("Fetching live last prices …")
-    import tom as tomscan
-    live = fetch.live_snapshot()
-    print(f"  {len(live):,} live prints")
-    rows = tomscan.for_tomorrow_momentum(stocks, live)
-    print(f"\n=== for tomorrow  ({len(rows)} names) ===\n")
-    if rows.empty:
-        print("Nothing near or through a trigger on this snapshot.")
-        return
-    show = rows.drop(columns=["why"], errors="ignore")
-    print(show.round(3).to_string(index=False))
-    if args.csv:
-        rows.to_csv(args.csv, index=False)
-        print(f"\nWritten to {args.csv}")
-
-
 def cmd_buytest(args):
     stocks, p = _load(args.days, args.end, args.sector_level)
     print("\nComputing coil indicators …")
@@ -361,8 +340,6 @@ def main():
                    help="forward-test the coil scan against the all-stock base rate")
     sub.add_parser("buytest", parents=[common],
                    help="forward-test the buy funnel (sector shape ∩ coil)")
-    sub.add_parser("tom", parents=[common],
-                   help="live overlay at run time: potential breakouts for tomorrow")
 
     kp = sub.add_parser("carry", parents=[common],
                         help="upper-circuit carry paper tracker (snap / eod / score / report / intraday)")
@@ -373,7 +350,7 @@ def main():
     args = ap.parse_args()
     {"sectors": cmd_sectors, "scan": cmd_scan, "backtest": cmd_backtest,
      "sector": cmd_sector, "coil": cmd_coil, "coiltest": cmd_coiltest,
-     "buytest": cmd_buytest, "tom": cmd_tom, "carry": cmd_carry}[args.cmd](args)
+     "buytest": cmd_buytest, "carry": cmd_carry}[args.cmd](args)
 
 
 if __name__ == "__main__":

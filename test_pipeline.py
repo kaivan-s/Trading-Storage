@@ -527,31 +527,6 @@ def test_robustness():
     check("momentum explain does not treat sector class as a veto",
           "not a veto" in mom and "volume break" in mom.lower())
 
-    print("\n--- for tomorrow overlay ---")
-    import tom as tomscan
-    eod_dates = pd.bdate_range("2026-08-03", periods=25)
-    eod_rows = []
-    for i, d in enumerate(eod_dates):
-        eod_rows.append({
-            "date": d, "symbol": "AAA", "sector": "Banks",
-            "adj": 100.0, "volume": 1000.0, "trigger": 103.0,
-            "ema50": 90.0, "ema200": 80.0, "pos_hi": 0.96, "rsi": 55.0, "cmf": 0.1,
-        })
-    eod = pd.DataFrame(eod_rows)
-    live = pd.DataFrame([{
-        "symbol": "AAA", "ltp": 102.5, "volume": 1800.0, "pchange": 1.2,
-    }])
-    buys = pd.DataFrame([{"symbol": "AAA"}])
-    ft = tomscan.for_tomorrow(eod, live, buys)
-    check("live near-trigger setup is for tom",
-          len(ft) == 1 and ft.iloc[0]["kind"] == "setup",
-          f"(n={len(ft)} kind={None if ft.empty else ft.iloc[0]['kind']})")
-    live2 = pd.DataFrame([{
-        "symbol": "AAA", "ltp": 104.0, "volume": 3000.0, "pchange": 3.0,
-    }])
-    th = tomscan.for_tomorrow(eod, live2, buys)
-    check("live through trigger is tagged through",
-          not th.empty and th.iloc[0]["kind"] == "through")
     return ok
 
 
