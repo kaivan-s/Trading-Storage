@@ -94,12 +94,14 @@ def _turn(med_turn20) -> str:
 def _band_context(band: float) -> str:
     """One-line context about how this band has historically performed."""
     b = int(round(float(band) * 100)) if band else 0
+    # Raw pattern base rates (all closes on the band, fill not assumed). Shown
+    # as context only — whether you could actually buy is the open question.
     if b == 5:
-        return "5% band — the most common; 69% reached +4% next session historically"
+        return "5% band — most common; raw pattern reached +4% ~69% of the time (fill not guaranteed)"
     if b == 10:
-        return "10% band — 74% reached +4% next session in the backtest"
+        return "10% band — raw pattern reached +4% ~74% of the time (fill not guaranteed)"
     if b == 20:
-        return "20% band — the strongest; 86% reached +4% historically"
+        return "20% band — strongest; raw pattern reached +4% ~86% of the time (fill not guaranteed)"
     return ""
 
 def _turnover_context(med_turn20) -> str:
@@ -221,6 +223,22 @@ def smart_circuit_alert(data: dict) -> str | None:
 # Morning scorecard — accountability
 # --------------------------------------------------------------------------
 
+def _track_bucket(summary: list) -> tuple[dict | None, str]:
+    """
+    The track-record bucket to headline, preferring the only one that reflects
+    a trade that could have filled (live, sellers present). Returns (row, basis).
+    """
+    by = {s.get("bucket"): s for s in (summary or [])}
+    for name, basis in (
+        ("live: sellers present", "sellers present"),
+        ("all live", "live snapshots, fill mixed"),
+        ("all", "all observations, fill unknown"),
+    ):
+        if by.get(name):
+            return by[name], basis
+    return None, ""
+
+
 def format_morning_scorecard(carry_data: dict) -> str | None:
     """Per-stock results from the most recent scored session."""
     daily = carry_data.get("daily", [])
@@ -273,14 +291,15 @@ def format_morning_scorecard(carry_data: dict) -> str | None:
     lines.append(f"<b>Score: {hits}/{n}</b> reached +4%")
     lines.append(f"Mean move: {mean * 100:+.1f}%")
 
-    # Running track record
+    # Running track record — the tradeable bucket (sellers present) when we
+    # have it, not the blended number that includes names you couldn't buy.
     summary = carry_data.get("summary", [])
-    all_b = next((s for s in summary if s.get("bucket") == "all"), None)
-    if all_b:
-        lines.append(f"\n📋 <b>Running track record</b> ({all_b.get('sessions', '?')} sessions)")
-        lines.append(f"Reached +4%: {all_b.get('hit4', 0) * 100:.0f}% of the time")
-        lines.append(f"Mean move: {all_b.get('mean_btst', 0) * 100:+.1f}%")
-        lines.append(f"Share closing positive: {all_b.get('win_rate', 0) * 100:.0f}%")
+    tb, basis = _track_bucket(summary)
+    if tb:
+        lines.append(f"\n📋 <b>Running track record</b> ({tb.get('sessions', '?')} sessions · {basis})")
+        lines.append(f"Reached +4%: {tb.get('hit4', 0) * 100:.0f}% of the time")
+        lines.append(f"Mean move: {tb.get('mean_btst', 0) * 100:+.1f}%")
+        lines.append(f"Share closing positive: {tb.get('win_rate', 0) * 100:.0f}%")
 
     lines.append("\n<i>Historical observations of past price data, not a performance claim.</i>")
     return "\n".join(lines)
@@ -416,7 +435,7 @@ def format_weekly_digest(carry_data: dict) -> str | None:
     if not recent:
         return None
 
-    all_b = next((s for s in summary if s.get("bucket") == "all"), None)
+    tb, basis = _track_bucket(summary)
 
     total_n = sum(d.get("n", 0) for d in recent)
     total_hits = sum(d.get("hits", 0) for d in recent)
@@ -439,13 +458,13 @@ def format_weekly_digest(carry_data: dict) -> str | None:
         m = d.get("mean_btst", 0)
         lines.append(f"  {dt}: {h}/{n} hit · mean {m * 100:+.1f}%")
 
-    # Cumulative track record
-    if all_b:
-        lines.append(f"\n📋 <b>All-time track record</b>")
-        lines.append(f"  {all_b.get('n', '?')} observations over {all_b.get('sessions', '?')} sessions")
-        lines.append(f"  Reached +4%: {all_b.get('hit4', 0) * 100:.0f}%")
-        lines.append(f"  Mean move: {all_b.get('mean_btst', 0) * 100:+.1f}%")
-        lines.append(f"  Share positive: {all_b.get('win_rate', 0) * 100:.0f}%")
+    # Cumulative track record — tradeable bucket (sellers present) where we have it
+    if tb:
+        lines.append(f"\n📋 <b>All-time track record</b> ({basis})")
+        lines.append(f"  {tb.get('n', '?')} observations over {tb.get('sessions', '?')} sessions")
+        lines.append(f"  Reached +4%: {tb.get('hit4', 0) * 100:.0f}%")
+        lines.append(f"  Mean move: {tb.get('mean_btst', 0) * 100:+.1f}%")
+        lines.append(f"  Share positive: {tb.get('win_rate', 0) * 100:.0f}%")
 
     lines.append(f"\n💡 Pro subscribers see circuit flashes in real-time during market hours.")
     lines.append("<i>Historical observations, not a performance claim or projection.</i>")

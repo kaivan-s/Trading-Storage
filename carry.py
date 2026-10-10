@@ -138,10 +138,27 @@ def _sector_map() -> dict:
     return smap["basic_industry"].dropna().to_dict()
 
 
-def _band_of(pct: float) -> float:
-    """Nearest price band to a % change; NaN if the move is not on one."""
+BAND_TOL = 0.004  # how close a move/limit must sit to a real band to count
+
+
+def _snap_band(ratio) -> float:
+    """
+    Nearest real NSE price band (5/10/20%) to a ratio, else NaN.
+
+    One definition shared by the live snapshot (ratio = circuit/prev_close - 1),
+    the EOD rebuild (ratio = close/prev_close - 1) and the intraday scan, so all
+    three paths agree on what counts as a band close instead of each rounding
+    its own way. A locked name sits within tick rounding of its band; anything
+    further off (2% ASM bands, no-limit names, mid-moves) returns NaN.
+    """
+    try:
+        r = float(ratio)
+    except (TypeError, ValueError):
+        return np.nan
+    if np.isnan(r):
+        return np.nan
     for b in BANDS:
-        if abs(pct - b) < 0.003:
+        if abs(r - b) < BAND_TOL:
             return b
     return np.nan
 
@@ -193,7 +210,7 @@ def snapshot(on_progress=None) -> pd.DataFrame:
     # The per-symbol quote is a few seconds fresher than the batch LTP.
     pre["ltp"] = pre["q_ltp"].fillna(pre["ltp"])
     pre["at_circuit"] = pre["ltp"] >= pre["upper_circuit"] * AT_HIGH
-    pre["band"] = (pre["upper_circuit"] / pre["prev_close"] - 1).round(2)
+    pre["band"] = (pre["upper_circuit"] / pre["prev_close"] - 1).map(_snap_band)
     pre["fillable"] = pre["total_sell_qty"].fillna(0) > 0
 
     # Turnover ratio: approximate today's turnover (vol × ltp) vs 20d median
@@ -212,14 +229,11 @@ def snapshot(on_progress=None) -> pd.DataFrame:
 # --------------------------------------------------------------------------
 
 def _determine_band(upper_circuit: float, prev_close: float) -> float | None:
-    """Determine which price band (5%, 10%, 20%) applies based on circuit limit."""
+    """Which price band (5/10/20%) applies, from the circuit limit."""
     if not prev_close or prev_close <= 0:
         return None
-    ratio = upper_circuit / prev_close - 1
-    for band in BANDS:
-        if abs(ratio - band) < 0.005:  # within 0.5% of the band
-            return band
-    return None
+    band = _snap_band(upper_circuit / prev_close - 1)
+    return None if np.isnan(band) else float(band)
 
 
 def _classify_status(pchange_pct: float, band: float, at_circuit: bool, has_sellers: bool) -> str:
@@ -380,12 +394,14 @@ def intraday_scan(scan_time: str | None = None, on_progress=None) -> pd.DataFram
         lambda r: _classify_status(r["pchange"], r["band"], r["at_circuit"], r["fillable"]),
         axis=1)
     
-    # Calculate volume ratio (current volume vs expected at this time of day)
-    # This helps identify unusual activity
+    # Turnover ratio, same unitless measure the 15:22 snapshot uses: project
+    # today's turnover-so-far to a full day, then divide by the 20-day median
+    # (both in lacs). The old form divided shares by rupees and was meaningless.
     hour = now.hour
-    expected_frac = _expected_volume_fraction(hour)
-    # Estimate full-day volume based on what we've seen so far
-    m["vol_ratio"] = (m["volume"] / expected_frac) / (m["med_turn20"] * 100000)  # convert lacs to shares approx
+    expected_frac = max(_expected_volume_fraction(hour), 0.01)
+    projected_turn_lacs = (m["volume"] * m["ltp"] / 1e5) / expected_frac
+    m["vol_ratio"] = np.where(
+        m["med_turn20"] > 0, projected_turn_lacs / m["med_turn20"], np.nan)
     
     # Build output
     m["as_of"] = today.isoformat()
@@ -521,7 +537,7 @@ def from_bhavcopy(d: date) -> pd.DataFrame:
     m = day.merge(uni[["symbol", "sector", "med_turn20"]], on="symbol")
     m = m[m["series"].str.upper() == "EQ"]
     ret = m["close"] / m["prev_close"] - 1
-    m["band"] = ret.map(_band_of)
+    m["band"] = ret.map(_snap_band)
     m = m[(m["close"] >= m["high"] * AT_HIGH) & m["band"].notna()].copy()
     m["pchange"] = (m["close"] / m["prev_close"] - 1) * 100
     m["ltp"] = m["close"]
@@ -652,6 +668,14 @@ def _records(df: pd.DataFrame) -> list[dict]:
     return json.loads(df.to_json(orient="records", date_format="iso"))
 
 
+def _bucket(rep: pd.DataFrame, name: str) -> dict | None:
+    """One bucket row from report() as a plain dict, or None if absent."""
+    if rep is None or rep.empty:
+        return None
+    hit = rep[rep["bucket"] == name]
+    return _records(hit)[0] if not hit.empty else None
+
+
 def payload(history_sessions: int = 60) -> dict:
     """Everything the Circuit carry screen shows, in one response."""
     log = load_log()
@@ -680,12 +704,30 @@ def payload(history_sessions: int = 60) -> dict:
         ["as_of", "btst"], ascending=[False, False])
 
     rep = report()
+    # The honest headline is the only bucket where an order could actually have
+    # filled (live, sellers on offer). Fall back to all-live, then the blended
+    # pattern, only when no fillable history exists yet. `base_rate` always
+    # carries the blended pattern so the UI can show it as clearly-labelled
+    # context next to the tradeable number.
+    fillable = _bucket(rep, "live: sellers present")
+    all_live = _bucket(rep, "all live")
+    pattern = _bucket(rep, "all")
+    headline = fillable or all_live or pattern
+    headline_basis = (
+        "live, sellers present" if fillable is not None
+        else "live snapshots (fill mixed)" if all_live is not None
+        else "pattern base rate — fill unknown" if pattern is not None
+        else None
+    )
     return {
         "as_of": as_of,
         "source": "live" if (latest["source"] == "live").any() else "eod",
         "logged_at": latest["logged_at"].dropna().max() if len(latest) else None,
         "latest": _records(latest),
         "summary": _records(rep) if not rep.empty else [],
+        "headline": headline,
+        "headline_basis": headline_basis,
+        "base_rate": pattern,
         "daily": _records(daily),
         "history": _records(history),
         "pending": int(log["btst"].isna().sum()),
