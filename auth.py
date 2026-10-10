@@ -26,7 +26,8 @@ PUBLIC_PATHS = {"/api/auth/config", "/api/quote", "/api/cron/post-market",
                 "/api/cron/telegram-eod", "/api/cron/telegram-morning",
                 "/api/cron/telegram-midday", "/api/cron/telegram-weekly",
                 "/api/telegram/webhook", "/api/telegram/setup-webhook",
-                "/api/telegram/delete-webhook"}
+                "/api/telegram/delete-webhook",
+                "/api/subscription/webhook"}
 
 _CACHE_TTL = 45.0
 _cache: dict[str, tuple[float, dict]] = {}
@@ -144,6 +145,26 @@ def me_payload() -> dict:
     except Exception:
         sub = {}
     
+    # Check if there's a pending Telegram link verification for this email
+    telegram_link_code = None
+    telegram_linked = False
+    try:
+        from db import get_client
+        client = get_client()
+        # Check if already linked
+        sub_row = client.table("subscriptions").select("telegram_id") \
+            .eq("email", email.lower()).execute()
+        if sub_row.data and sub_row.data[0].get("telegram_id"):
+            telegram_linked = True
+        else:
+            # Check for pending OTP
+            vr = client.table("link_verifications").select("otp,verified") \
+                .eq("email", email.lower()).eq("verified", False).execute()
+            if vr.data:
+                telegram_link_code = vr.data[0].get("otp")
+    except Exception:
+        pass
+
     return {
         "id": user.get("id"),
         "email": email,
@@ -154,4 +175,6 @@ def me_payload() -> dict:
         "subscription_expires": sub.get("expires_at"),
         "subscription_id": sub.get("subscription_id"),
         "subscription_cancelled": sub.get("cancelled", False),
+        "telegram_linked": telegram_linked,
+        "telegram_link_code": telegram_link_code,
     }

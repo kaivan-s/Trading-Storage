@@ -1187,22 +1187,31 @@ def save_setups(
 ) -> int:
     """
     Save buy setups to Supabase.
-    
-    `buys` = coiled stocks filtered to sectors in setup patterns (CROSSING,
-    PULLBACK, CROSSING_UNVERIFIED). This is the intersection of stock-level
-    coil filters and sector-level classification.
-    
-    Called together with save_sector_scans since setups depend on sector state.
-    
+
+    `buys` = coiled stocks filtered to sectors in CROSSING or PULLBACK.
+    An empty buys DataFrame is legitimate (no sectors qualify) — in that
+    case we clear any old rows for this date so the UI shows "none tonight"
+    rather than a stale list.
+
     Returns number of rows saved.
     """
-    if buys is None or buys.empty:
-        return 0
-    
     verdict_by_sector = verdict_by_sector or {}
     scan_date = str(scan_date)[:10]
     client = get_client()
-    
+
+    # Always delete old rows for this date first (idempotent replacement).
+    # Previously this only happened when buys was non-empty, so an empty
+    # night left the previous run's rows in place, making the UI show
+    # the old list without a stale indicator.
+    try:
+        client.table("setups").delete().eq("scan_date", scan_date).execute()
+    except Exception as e:
+        print(f"delete old setups failed: {e}")
+
+    if buys is None or buys.empty:
+        print(f"[db] setups {scan_date}: 0 (no qualifying sectors)")
+        return 0
+
     records = []
     for _, r in buys.iterrows():
         sector = r.get("sector")
@@ -1225,27 +1234,21 @@ def save_setups(
             "deliv_quality_rel": _clean(r.get("deliv_quality_rel")),
             "base_days": _clean(r.get("base_days")),
             "recommended": bool(r.get("recommended", False)),
-            # Bridged episode age, so the UI does not need the panel to tell
-            # a genuinely new setup from one that wobbled for a session.
             "episode_days": _int(r.get("episode_days")),
             "episode_new": bool(r.get("episode_new", False)),
         }
         records.append(rec)
-    
+
     if not records:
         return 0
-    
-    # Full replacement for the date (idempotent)
-    try:
-        client.table("setups").delete().eq("scan_date", scan_date).execute()
-    except Exception as e:
-        print(f"delete old setups failed: {e}")
-    
+
     try:
         result = client.table("setups").insert(records).execute()
-        return len(result.data) if result.data else 0
+        n = len(result.data) if result.data else 0
+        print(f"[db] setups {scan_date}: saved {n} rows")
+        return n
     except Exception as e:
-        print(f"save setups failed: {e}")
+        print(f"[db] save setups failed for {scan_date}: {e}")
         return 0
 
 

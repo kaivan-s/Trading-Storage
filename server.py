@@ -1427,6 +1427,9 @@ def _save_post_market(force: bool = False) -> dict:
 
     if scan_rows is not None and not scan_rows.empty:
         attempt("sectors", lambda: db.save_sector_scans(as_of, scan_rows, panel))
+        n_buys = len(buys) if buys is not None and not buys.empty else 0
+        setup_klasses = list(scan_rows[scan_rows["klass"].isin(SETUP_KLASSES)]["sector"]) if not scan_rows.empty else []
+        print(f"[cron] setups: {n_buys} buys in {len(setup_klasses)} setup sectors ({setup_klasses[:5]})")
         attempt("setups", lambda: db.save_setups(as_of, buys, verdict))
     else:
         out["sectors"] = out["setups"] = 0

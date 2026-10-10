@@ -1,9 +1,11 @@
 """
 Subscription management via Dodo Payments + Supabase.
 
-- Stores subscription status in Supabase `subscriptions` table
-- Dodo webhooks update the table on subscription changes
-- Fast lookups from Supabase instead of API calls
+- Dodo handles payments on the website
+- Dodo webhooks update Supabase `subscriptions` table
+- On payment, auto-sends Telegram channel invite link
+- Website + Telegram bot both read Supabase for premium status
+- One subscription → both website + Telegram access
 """
 
 import os
@@ -203,14 +205,6 @@ def check_subscription(customer_email: str) -> dict:
 def create_checkout_url(customer_email: str, plan: str = "monthly", customer_name: str = "") -> str | None:
     """
     Create a Dodo checkout URL for subscription.
-    
-    Args:
-        customer_email: Customer's email
-        plan: "monthly" or "yearly"
-        customer_name: Optional customer name
-    
-    Returns:
-        Checkout URL or None on error
     """
     if not DODO_API_KEY:
         return None
@@ -397,12 +391,22 @@ def handle_webhook(event_type: str, data: dict) -> bool:
             }, on_conflict="email").execute()
             clear_cache(email)
             print(f"[subscription] Activated: {email}")
+            # Auto-send Telegram channel invite if user has linked their account
+            try:
+                send_telegram_invite(email)
+            except Exception as exc:
+                print(f"[subscription] invite after activation failed: {exc}")
             return True
             
         elif event_type in ("subscription.cancelled", "subscription.on_hold", "subscription.expired"):
             _save_subscription_to_db(email, False, None, subscription_id, None)
             clear_cache(email)
             print(f"[subscription] Deactivated: {email}")
+            # Remove from Telegram channel
+            try:
+                revoke_telegram_access(email)
+            except Exception as exc:
+                print(f"[subscription] revoke after deactivation failed: {exc}")
             return True
         
         else:
@@ -411,4 +415,127 @@ def handle_webhook(event_type: str, data: dict) -> bool:
             
     except Exception as e:
         print(f"[subscription] Webhook error: {e}")
+        return False
+
+
+# ── Telegram channel invite on payment ──
+
+def send_telegram_invite(email: str) -> str | None:
+    """
+    Generate a one-time Telegram channel invite link and send it to the
+    user's linked Telegram account.
+
+    Returns the invite link, or None if no Telegram ID is linked.
+    """
+    import requests as _req
+
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    paid_chat = os.getenv("TELEGRAM_PAID_CHAT", "")
+    if not bot_token or not paid_chat:
+        return None
+
+    api = f"https://api.telegram.org/bot{bot_token}"
+
+    # Look up the user's telegram_id from Supabase
+    try:
+        client = _get_supabase()
+        result = client.table("subscriptions").select("telegram_id") \
+            .eq("email", email.lower()).execute()
+        telegram_id = result.data[0].get("telegram_id") if result.data else None
+    except Exception:
+        telegram_id = None
+
+    if not telegram_id:
+        print(f"[subscription] No telegram_id linked for {email}")
+        return None
+
+    # Create one-time invite link (expires in 7 days)
+    try:
+        r = _req.post(f"{api}/createChatInviteLink", json={
+            "chat_id": paid_chat,
+            "member_limit": 1,
+            "expire_date": int((datetime.now() + timedelta(days=7)).timestamp()),
+            "name": f"Premium – {email[:20]}",
+        }, timeout=15)
+        if not r.ok:
+            print(f"[subscription] invite link failed: {r.text}")
+            return None
+        invite_link = r.json().get("result", {}).get("invite_link")
+    except Exception as exc:
+        print(f"[subscription] invite link error: {exc}")
+        return None
+
+    if not invite_link:
+        return None
+
+    # Send the invite via bot DM
+    try:
+        _req.post(f"{api}/sendMessage", json={
+            "chat_id": int(telegram_id),
+            "text": (
+                f"🎉 <b>Welcome to Premium!</b>\n\n"
+                f"Your subscription is active. Here's your exclusive "
+                f"Telegram channel invite:\n\n"
+                f"👉 {invite_link}\n\n"
+                f"<i>This link is one-time use and expires in 7 days.</i>\n\n"
+                f"All bot commands are now unlimited. Try /today"
+            ),
+            "parse_mode": "HTML",
+        }, timeout=15)
+        print(f"[subscription] invite sent to {telegram_id} for {email}")
+    except Exception as exc:
+        print(f"[subscription] invite send error: {exc}")
+
+    return invite_link
+
+
+def revoke_telegram_access(email: str) -> bool:
+    """
+    Remove a user from the paid Telegram channel on subscription expiry.
+    """
+    import requests as _req
+
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    paid_chat = os.getenv("TELEGRAM_PAID_CHAT", "")
+    if not bot_token or not paid_chat:
+        return False
+
+    api = f"https://api.telegram.org/bot{bot_token}"
+
+    try:
+        client = _get_supabase()
+        result = client.table("subscriptions").select("telegram_id") \
+            .eq("email", email.lower()).execute()
+        telegram_id = result.data[0].get("telegram_id") if result.data else None
+    except Exception:
+        return False
+
+    if not telegram_id:
+        return False
+
+    try:
+        # Ban then unban = removes from channel without permanent ban
+        _req.post(f"{api}/banChatMember", json={
+            "chat_id": paid_chat,
+            "user_id": int(telegram_id),
+        }, timeout=15)
+        _req.post(f"{api}/unbanChatMember", json={
+            "chat_id": paid_chat,
+            "user_id": int(telegram_id),
+            "only_if_banned": True,
+        }, timeout=15)
+
+        # Notify the user
+        _req.post(f"{api}/sendMessage", json={
+            "chat_id": int(telegram_id),
+            "text": (
+                "⏰ Your premium subscription has ended.\n\n"
+                "You can still use 3 free market views per day.\n"
+                "Resubscribe anytime at morrowdesk.com/pricing"
+            ),
+        }, timeout=15)
+        print(f"[subscription] revoked channel access for {telegram_id}")
+        return True
+    except Exception as exc:
+        print(f"[subscription] revoke error: {exc}")
         return False
