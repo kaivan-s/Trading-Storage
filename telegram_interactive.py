@@ -159,11 +159,15 @@ def _limit_msg() -> str:
     return (
         "🔒 <b>Daily limit reached</b>\n\n"
         "Free users get 3 market views per day.\n"
-        "Stock reports (<code>TRENT</code>, <code>RELIANCE</code>) are always free.\n\n"
-        "🔓 <b>Unlock unlimited access:</b>\n"
-        "Join the Pro channel for real-time circuit alerts "
-        "and unlimited market views.\n\n"
-        "DM @morrow_desk_admin for access."
+        "Stock reports (<code>TRENT</code>, <code>RELIANCE</code>) "
+        "are always free — no limit.\n\n"
+        "🔓 <b>Unlock unlimited access</b>\n"
+        "Subscribe at <b>morrowdesk.com/pricing</b> to get:\n"
+        "  • Unlimited bot commands\n"
+        "  • Telegram channel alerts\n"
+        "  • Full website access\n\n"
+        "Already subscribed? Link your account:\n"
+        "<code>/link your@email.com</code>"
     )
 
 
@@ -553,19 +557,31 @@ def handle_start(chat_id: int):
         "volume, delivery and momentum.\n\n"
         "📝 <b>Just type any stock name</b> — <code>TRENT</code>, "
         "<code>RELIANCE</code>, <code>Tata Motors</code>\n\n"
-        "Or tap a button below to explore the market 👇"
+        "🆓 Stock reports and /today are always free.\n"
+        "📊 3 market views per day (heatmap, flow, triggers…).\n"
+        "⭐ Premium = unlimited everything + channel alerts.\n\n"
+        "Already a subscriber? Link your account:\n"
+        "<code>/link your@email.com</code>\n\n"
+        "Or tap a button below to explore 👇"
     ), buttons=MAIN_MENU_BUTTONS)
 
 
 def handle_help(chat_id: int):
     _reply(chat_id, (
         "📖 <b>Commands</b>\n\n"
-        "<b>Stock report:</b>\n"
-        "  Just type a symbol: <code>TRENT</code>\n"
-        "  Also works: <code>Tata Motors</code>\n\n"
-        "<b>Sector:</b>\n"
-        "  <code>/sector Retailing</code>\n\n"
-        "Tap any button below, or use the ≡ menu 👇"
+        "<b>🆓 Always free:</b>\n"
+        "  <code>TRENT</code> — stock report (just type any name)\n"
+        "  /today — today's brief\n"
+        "  /link — link your website account\n\n"
+        "<b>📊 Market views</b> <i>(3/day free, unlimited premium)</i><b>:</b>\n"
+        "  /heatmap — sector rotation map\n"
+        "  /flow — money flow into/out of sectors\n"
+        "  /triggers — stocks near breakout\n"
+        "  /delivery — unusual institutional delivery\n"
+        "  /changed — what changed since yesterday\n"
+        "  /sector Name — sector deep-dive\n\n"
+        "<b>⭐ Premium:</b> morrowdesk.com/pricing\n"
+        "Unlimited commands + channel alerts."
     ), buttons=MAIN_MENU_BUTTONS)
 
 
@@ -1511,7 +1527,8 @@ def _dispatch(chat_id: int, user_id: int, text: str, engine) -> None:
     if cmd in _PAID_COMMANDS:
         if not _check_limit(user_id, cmd):
             _reply(chat_id, _limit_msg(), buttons=[
-                [{"text": "📊 Try a stock report (free)", "callback_data": "/help"}],
+                [{"text": "📊 Stock report (free)", "callback_data": "/help"},
+                 {"text": "🔗 Link account", "callback_data": "/link"}],
             ])
             return
 
@@ -1548,9 +1565,14 @@ def _dispatch(chat_id: int, user_id: int, text: str, engine) -> None:
     if cmd in _PAID_COMMANDS:
         remaining = _remaining(user_id)
         if remaining is not None and remaining <= 2:
-            note = (f"💡 {remaining} free market view{'s' if remaining != 1 else ''} "
-                    f"left today. Stock reports are always free.")
-            _reply(chat_id, note)
+            if remaining == 0:
+                note = "💡 That was your last free market view today. Stock reports are always free."
+            else:
+                note = (f"💡 {remaining} free market view{'s' if remaining != 1 else ''} "
+                        f"left today. Stock reports are always free.")
+            _reply(chat_id, note, buttons=[
+                [{"text": "🔗 Link account", "callback_data": "/link"}],
+            ] if remaining == 0 else None)
 
 
 # Deduplication: track recent update IDs to avoid processing retries
