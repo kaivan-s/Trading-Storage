@@ -1799,3 +1799,70 @@ def get_fresh_fundamental_symbols(cutoff_iso: str) -> list[str]:
         return [row["symbol"] for row in (r.data or []) if row.get("symbol")]
     except Exception:
         return []
+
+
+# -------------------------------------------------------------------------
+# Results calendar
+# -------------------------------------------------------------------------
+#
+# CREATE TABLE results_calendar (
+#     symbol              TEXT NOT NULL,
+#     earnings_date       DATE NOT NULL,
+#     eps_estimate        NUMERIC,
+#     eps_high            NUMERIC,
+#     eps_low             NUMERIC,
+#     revenue_estimate_cr NUMERIC,
+#     ex_dividend_date    DATE,
+#     updated_at          TIMESTAMPTZ DEFAULT NOW(),
+#     PRIMARY KEY (symbol, earnings_date)
+# );
+# CREATE INDEX idx_results_cal_date ON results_calendar(earnings_date);
+
+def save_results_calendar(rows: list[dict]) -> int:
+    """Upsert results calendar entries."""
+    if not rows:
+        return 0
+    client = get_client()
+    saved = 0
+    for row in rows:
+        try:
+            client.table("results_calendar").upsert(
+                row, on_conflict="symbol,earnings_date"
+            ).execute()
+            saved += 1
+        except Exception as e:
+            print(f"  save results_calendar {row.get('symbol')}: {e}")
+    return saved
+
+
+def get_results_calendar(from_date: str = None, to_date: str = None,
+                         limit: int = 500) -> list[dict]:
+    """Read results calendar, optionally filtered by date range."""
+    client = get_client()
+    try:
+        q = (client.table("results_calendar")
+             .select("*")
+             .order("earnings_date", desc=False))
+        if from_date:
+            q = q.gte("earnings_date", from_date)
+        if to_date:
+            q = q.lte("earnings_date", to_date)
+        r = q.limit(limit).execute()
+        return r.data or []
+    except Exception as e:
+        print(f"get results_calendar: {e}")
+        return []
+
+
+def clear_results_calendar_future(from_date: str) -> int:
+    """Delete future calendar entries before a refresh."""
+    client = get_client()
+    try:
+        r = (client.table("results_calendar")
+             .delete()
+             .gte("earnings_date", from_date)
+             .execute())
+        return len(r.data or [])
+    except Exception as e:
+        print(f"clear results_calendar: {e}")
+        return 0

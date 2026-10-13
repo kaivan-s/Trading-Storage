@@ -488,6 +488,146 @@ def _find_year_ago(q: dict, quarters: list[dict]) -> dict | None:
     return best
 
 
+# -------------------------------------------------------------------------
+# Results calendar
+# -------------------------------------------------------------------------
+
+def fetch_earnings_date(symbol: str) -> dict | None:
+    """
+    Fetch next earnings date + estimates from Yahoo Finance.
+    Returns a dict ready for db.save_results_calendar, or None.
+    """
+    yf_symbol = f"{symbol}.NS"
+    try:
+        ticker = yf.Ticker(yf_symbol)
+        cal = ticker.calendar
+    except Exception as exc:
+        print(f"  yf calendar {symbol}: {exc}")
+        return None
+
+    if not cal or not isinstance(cal, dict):
+        return None
+
+    earnings_raw = cal.get("Earnings Date")
+    if not earnings_raw:
+        return None
+
+    if isinstance(earnings_raw, list):
+        earnings_date = earnings_raw[0]
+    else:
+        earnings_date = earnings_raw
+
+    if hasattr(earnings_date, "isoformat"):
+        earnings_date_str = earnings_date.isoformat()
+    else:
+        earnings_date_str = str(earnings_date)
+
+    eps_est = _num(cal.get("Earnings Average"))
+    eps_high = _num(cal.get("Earnings High"))
+    eps_low = _num(cal.get("Earnings Low"))
+    rev_est = _num(cal.get("Revenue Average"))
+    rev_est_cr = round(rev_est / 1e7, 0) if rev_est else None
+
+    ex_div = cal.get("Ex-Dividend Date")
+    ex_div_str = None
+    if ex_div and hasattr(ex_div, "isoformat"):
+        ex_div_str = ex_div.isoformat()
+
+    return {
+        "symbol": symbol,
+        "earnings_date": earnings_date_str,
+        "eps_estimate": eps_est,
+        "eps_high": eps_high,
+        "eps_low": eps_low,
+        "revenue_estimate_cr": rev_est_cr,
+        "ex_dividend_date": ex_div_str,
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def refresh_results_calendar(
+    symbols: list[str],
+    on_progress=None,
+) -> int:
+    """
+    Fetch upcoming earnings dates for all symbols and save to DB.
+    Returns the number of entries saved.
+    """
+    from datetime import date as date_cls
+    today = date_cls.today().isoformat()
+
+    # Clear future entries before refreshing
+    try:
+        db.clear_results_calendar_future(today)
+    except Exception:
+        pass
+
+    entries = []
+    for i, sym in enumerate(symbols):
+        try:
+            entry = fetch_earnings_date(sym)
+            if entry and entry.get("earnings_date") and entry["earnings_date"] >= today:
+                entries.append(entry)
+        except Exception as exc:
+            print(f"  [{i+1}/{len(symbols)}] calendar {sym}: {exc}")
+
+        if on_progress and (i + 1) % 50 == 0:
+            on_progress(i + 1, len(symbols))
+
+        if (i + 1) % 100 == 0:
+            print(f"  [calendar {i+1}/{len(symbols)}] {len(entries)} upcoming so far")
+
+        time.sleep(0.2)
+
+    saved = 0
+    try:
+        saved = db.save_results_calendar(entries)
+    except Exception as exc:
+        print(f"  save calendar batch: {exc}")
+
+    print(f"[calendar] done: {saved} entries saved from {len(symbols)} symbols")
+    return saved
+
+
+def get_results_calendar(days_ahead: int = 45) -> list[dict]:
+    """
+    Read results calendar from DB, enriched with fundamentals data.
+    Returns entries from today to days_ahead days from now.
+    """
+    from datetime import date as date_cls
+    today = date_cls.today()
+    end = (today + timedelta(days=days_ahead)).isoformat()
+
+    rows = db.get_results_calendar(from_date=today.isoformat(), to_date=end)
+    if not rows:
+        return []
+
+    # Enrich with fundamentals (earnings trend, market cap, PE)
+    symbols = [r["symbol"] for r in rows]
+    fund_lookup = {}
+    try:
+        from supabase import Client
+        client = db.get_client()
+        resp = (client.table("company_fundamentals")
+                .select("symbol,name,industry,earnings_trend,market_cap_cr,pe_ttm")
+                .in_("symbol", symbols)
+                .execute())
+        fund_lookup = {r["symbol"]: r for r in (resp.data or [])}
+    except Exception:
+        pass
+
+    for row in rows:
+        f = fund_lookup.get(row["symbol"], {})
+        row["name"] = f.get("name")
+        row["industry"] = f.get("industry")
+        row["earnings_trend"] = f.get("earnings_trend")
+        row["market_cap_cr"] = f.get("market_cap_cr")
+        row["pe_ttm"] = f.get("pe_ttm")
+
+    rows.sort(key=lambda r: (r.get("earnings_date") or "", r.get("symbol") or ""))
+    return rows
+
+
 def _latest_yoy_growth(quarters: list[dict]) -> dict:
     """YoY growth for the most recent quarter."""
     if len(quarters) < 5:

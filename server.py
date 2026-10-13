@@ -1504,6 +1504,75 @@ def api_cron_fundamentals_refresh():
     }), 202
 
 
+@app.get("/api/results-calendar")
+def api_results_calendar():
+    """
+    Upcoming quarterly results dates, enriched with fundamentals.
+
+    GET /api/results-calendar?days=45
+    """
+    import fundamentals as fun
+    try:
+        days = int(request.args.get("days", 45))
+        rows = fun.get_results_calendar(days_ahead=days)
+        return jsonify({"count": len(rows), "rows": rows})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+_calendar_busy = threading.Lock()
+
+
+@app.post("/api/cron/results-calendar")
+def api_cron_results_calendar():
+    """
+    Refresh results calendar from Yahoo Finance.
+
+    POST /api/cron/results-calendar
+
+    Fetches upcoming earnings dates for all symbols. Takes ~15 min
+    for 1,700 stocks. Returns 202 immediately.
+    """
+    import fundamentals as fun
+
+    if not _calendar_busy.acquire(blocking=False):
+        return jsonify({"status": "busy",
+                        "message": "Calendar refresh already running."}), 409
+
+    symbols = []
+    with engine._lock:
+        if engine.coil_stocks is not None and not engine.coil_stocks.empty:
+            last = engine.coil_stocks[
+                engine.coil_stocks["date"] == engine.coil_stocks["date"].max()
+            ]
+            symbols = list(last["symbol"].unique())
+    if not symbols:
+        try:
+            eq = fetch.fetch_equity_list()
+            symbols = list(eq["symbol"].unique())
+        except Exception:
+            pass
+    if not symbols:
+        _calendar_busy.release()
+        return jsonify({"error": "No symbols available"}), 400
+
+    def work():
+        try:
+            n = fun.refresh_results_calendar(symbols)
+            print(f"[cron] results calendar: {n} entries saved")
+        except Exception as exc:
+            print(f"[cron] results calendar failed: {exc}")
+        finally:
+            _calendar_busy.release()
+
+    threading.Thread(target=work, daemon=True).start()
+    return jsonify({
+        "status": "started",
+        "symbols": len(symbols),
+        "message": f"Fetching results calendar for {len(symbols)} symbols.",
+    }), 202
+
+
 # --------------------------------------------------------------------------
 # Interactive Telegram bot (webhook)
 # --------------------------------------------------------------------------
