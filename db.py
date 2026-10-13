@@ -1122,7 +1122,9 @@ def save_coiled_bases(
             # whenever a name has no 12-1 reading (those rank last, not out).
             "rest_rank": _int(r.get("rest_rank")),
             "coil_days": _int(r.get("coil_days")),
-            "recommended": bool(r.get("recommended", False)),
+            # Postgres column is still named `recommended`. The API renames it
+            # to shape_confirmed on read so that word never leaves the server.
+            "recommended": bool(r.get("shape_confirmed", r.get("recommended", False))),
             "episode_days": _int(r.get("episode_days")),
             "episode_new": bool(r.get("episode_new", False)),
         }
@@ -1164,6 +1166,13 @@ def get_coiled_bases_dates(limit: int = 60) -> list[str]:
     return out
 
 
+def _as_public_row(row: dict) -> dict:
+    """Rename the stored `recommended` flag before it reaches the client."""
+    if "recommended" in row:
+        row["shape_confirmed"] = bool(row.pop("recommended"))
+    return row
+
+
 def get_coiled_bases(scan_date: date | str) -> list[dict]:
     """Get coiled bases for a specific date."""
     scan_date = str(scan_date)[:10]
@@ -1173,7 +1182,7 @@ def get_coiled_bases(scan_date: date | str) -> list[dict]:
               .eq("scan_date", scan_date)
               .order("coil", desc=True)
               .execute())
-    return result.data or []
+    return [_as_public_row(r) for r in (result.data or [])]
 
 
 # ---------------------------------------------------------------------------
@@ -1233,7 +1242,9 @@ def save_setups(
             "cmf": _clean(r.get("cmf")),
             "deliv_quality_rel": _clean(r.get("deliv_quality_rel")),
             "base_days": _clean(r.get("base_days")),
-            "recommended": bool(r.get("recommended", False)),
+            # Postgres column is still named `recommended`. The API renames it
+            # to shape_confirmed on read so that word never leaves the server.
+            "recommended": bool(r.get("shape_confirmed", r.get("recommended", False))),
             "episode_days": _int(r.get("episode_days")),
             "episode_new": bool(r.get("episode_new", False)),
         }
@@ -1280,7 +1291,7 @@ def get_setups(scan_date: date | str) -> list[dict]:
               .eq("scan_date", scan_date)
               .order("coil", desc=True)
               .execute())
-    return result.data or []
+    return [_as_public_row(r) for r in (result.data or [])]
 
 
 # ---------------------------------------------------------------- episodes

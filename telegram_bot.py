@@ -66,13 +66,22 @@ def _send(chat_id: str, text: str, silent: bool = False) -> bool:
 
 
 def send_paid(text: str, silent: bool = False) -> bool:
-    return _send(PAID_CHAT, text, silent)
+    # Channel sending disabled — bot-only for now
+    # return _send(PAID_CHAT, text, silent)
+    print("[telegram] send_paid skipped (channels disabled)")
+    return False
 
 def send_free(text: str, silent: bool = False) -> bool:
-    return _send(FREE_CHAT, text, silent)
+    # Channel sending disabled — bot-only for now
+    # return _send(FREE_CHAT, text, silent)
+    print("[telegram] send_free skipped (channels disabled)")
+    return False
 
 def send_both(text: str, silent: bool = False) -> tuple[bool, bool]:
-    return send_free(text, silent), send_paid(text, silent)
+    # Channel sending disabled — bot-only for now
+    # return send_free(text, silent), send_paid(text, silent)
+    print("[telegram] send_both skipped (channels disabled)")
+    return False, False
 
 
 # --------------------------------------------------------------------------

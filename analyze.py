@@ -620,5 +620,7 @@ def build(query: str, *, stocks: pd.DataFrame, panel: pd.DataFrame,
         "near": [],
     }
     report["why"] = explain(report)
-    report["plan"] = trade_plan(report, entry)
+    # Trade plan (entry/stop/target levels) intentionally NOT included in the
+    # response — price targets on a named security read as a recommendation.
+    # trade_plan() is retained for internal/test use only.
     return report
