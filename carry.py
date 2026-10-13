@@ -34,6 +34,8 @@ same source.
 
 from __future__ import annotations
 
+import threading
+import time
 from datetime import date, timedelta
 from concurrent.futures import ThreadPoolExecutor
 
@@ -167,23 +169,34 @@ def _snap_band(ratio) -> float:
 # Live snapshot
 # --------------------------------------------------------------------------
 
+_snap_throttle = threading.Semaphore(3)
+
+
 def _depth_one(groww, symbol: str) -> dict | None:
-    try:
-        q = groww.get_quote(exchange=groww.EXCHANGE_NSE,
-                            segment=groww.SEGMENT_CASH, trading_symbol=symbol)
-    except Exception as exc:
-        print(f"  quote {symbol}: {exc}")
-        return None
-    if not isinstance(q, dict):
-        return None
-    return {
-        "symbol": symbol,
-        "upper_circuit": q.get("upper_circuit_limit"),
-        "total_buy_qty": q.get("total_buy_quantity"),
-        "total_sell_qty": q.get("total_sell_quantity"),
-        "volume": q.get("volume"),
-        "q_ltp": q.get("last_price"),
-    }
+    for attempt in range(fetch.GROWW_RETRIES):
+        _snap_throttle.acquire()
+        try:
+            q = groww.get_quote(exchange=groww.EXCHANGE_NSE,
+                                segment=groww.SEGMENT_CASH, trading_symbol=symbol)
+            if not isinstance(q, dict):
+                return None
+            return {
+                "symbol": symbol,
+                "upper_circuit": q.get("upper_circuit_limit"),
+                "total_buy_qty": q.get("total_buy_quantity"),
+                "total_sell_qty": q.get("total_sell_quantity"),
+                "volume": q.get("volume"),
+                "q_ltp": q.get("last_price"),
+            }
+        except Exception as exc:
+            if attempt == fetch.GROWW_RETRIES - 1:
+                print(f"  quote {symbol}: {exc}")
+                return None
+            time.sleep(fetch.GROWW_PAUSE * (attempt + 1) * 2)
+        finally:
+            time.sleep(fetch.GROWW_PAUSE)
+            _snap_throttle.release()
+    return None
 
 
 def snapshot(on_progress=None) -> pd.DataFrame:
@@ -322,30 +335,41 @@ def intraday_scan(scan_time: str | None = None, on_progress=None) -> pd.DataFram
     if m.empty:
         return pd.DataFrame(columns=INTRADAY_COLUMNS)
     
-    # Get detailed quotes with circuit limits and order book
+    # Get detailed quotes with circuit limits and order book.
+    # Groww rate-limits per-symbol get_quote calls aggressively, so we
+    # throttle concurrency and retry on failure with exponential backoff.
     groww = fetch._get_groww_client()
-    
+    _quote_throttle = threading.Semaphore(3)
+
     def get_full_quote(sym):
-        try:
-            q = groww.get_quote(exchange=groww.EXCHANGE_NSE,
-                                segment=groww.SEGMENT_CASH, trading_symbol=sym)
-            if not isinstance(q, dict):
-                return None
-            return {
-                "symbol": sym,
-                "upper_circuit": q.get("upper_circuit_limit"),
-                "lower_circuit": q.get("lower_circuit_limit"),
-                "total_buy_qty": q.get("total_buy_quantity"),
-                "total_sell_qty": q.get("total_sell_quantity"),
-                "volume": q.get("volume"),
-                "q_ltp": q.get("last_price"),
-                "q_high": q.get("ohlc", {}).get("high"),
-                "q_low": q.get("ohlc", {}).get("low"),
-            }
-        except Exception as exc:
-            print(f"  quote {sym}: {exc}")
-            return None
-    
+        for attempt in range(fetch.GROWW_RETRIES):
+            _quote_throttle.acquire()
+            try:
+                q = groww.get_quote(exchange=groww.EXCHANGE_NSE,
+                                    segment=groww.SEGMENT_CASH, trading_symbol=sym)
+                if not isinstance(q, dict):
+                    return None
+                return {
+                    "symbol": sym,
+                    "upper_circuit": q.get("upper_circuit_limit"),
+                    "lower_circuit": q.get("lower_circuit_limit"),
+                    "total_buy_qty": q.get("total_buy_quantity"),
+                    "total_sell_qty": q.get("total_sell_quantity"),
+                    "volume": q.get("volume"),
+                    "q_ltp": q.get("last_price"),
+                    "q_high": q.get("ohlc", {}).get("high"),
+                    "q_low": q.get("ohlc", {}).get("low"),
+                }
+            except Exception as exc:
+                if attempt == fetch.GROWW_RETRIES - 1:
+                    print(f"  quote {sym}: {exc}")
+                    return None
+                time.sleep(fetch.GROWW_PAUSE * (attempt + 1) * 2)
+            finally:
+                time.sleep(fetch.GROWW_PAUSE)
+                _quote_throttle.release()
+        return None
+
     with ThreadPoolExecutor(max_workers=fetch.GROWW_QUOTE_WORKERS) as pool:
         quotes = [q for q in pool.map(get_full_quote, m["symbol"]) if q]
     
