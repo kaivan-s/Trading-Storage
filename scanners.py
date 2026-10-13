@@ -42,8 +42,28 @@ def _sector_map() -> dict:
     return smap["basic_industry"].dropna().to_dict()
 
 
-def _liquid_eq(end: date, n_sessions: int = 25) -> pd.DataFrame:
-    """Quick liquid-universe builder for the scanners."""
+_liquid_cache: dict[tuple[str, int], tuple[pd.DataFrame, pd.DataFrame]] = {}
+
+
+def _liquid_eq(end: date, n_sessions: int = 25) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Quick liquid-universe builder for the scanners.
+
+    Memoised per (end, n_sessions): derived from settled bhavcopy, so the
+    30-min crons reuse one build instead of reloading history each time.
+    """
+    key = (end.isoformat(), n_sessions)
+    cached = _liquid_cache.get(key)
+    if cached is not None:
+        return cached
+    out = _build_liquid_eq(end, n_sessions)
+    if len(_liquid_cache) > 8:
+        _liquid_cache.clear()
+    _liquid_cache[key] = out
+    return out
+
+
+def _build_liquid_eq(end: date, n_sessions: int = 25) -> tuple[pd.DataFrame, pd.DataFrame]:
     raw = fetch.load_history(end, n_sessions, verbose=False)
     raw = raw[raw["series"].str.upper().isin(["EQ", "BE"])]
     on_eq = set(raw.loc[(raw["date"] == raw["date"].max())
@@ -74,16 +94,57 @@ def _liquid_eq(end: date, n_sessions: int = 25) -> pd.DataFrame:
 # 1. Unusual volume
 # --------------------------------------------------------------------------
 
+# The batch price endpoint does not carry traded volume (see fetch.py), so the
+# live `volume` column is empty. We fetch it per-symbol for a bounded set of
+# advancers only — enough to surface genuine volume spikes without quoting the
+# whole universe or tripping the Groww rate limiter.
+UNUSUAL_VOL_MAX_QUOTES = 60
+
+
+def augment_with_volume(live: pd.DataFrame, uni: pd.DataFrame) -> pd.DataFrame:
+    """
+    Fill `volume` for the top advancers by fetching per-symbol quotes.
+
+    Without this the batch snapshot has `volume = None`, which made
+    `unusual_volume` divide by NaN and silently return nothing. We only quote
+    advancers above the turnover floor, capped at UNUSUAL_VOL_MAX_QUOTES.
+    """
+    if live.empty or "pchange" not in live.columns:
+        return live
+    cand = live.merge(uni[["symbol", "med_turn20"]], on="symbol", how="left")
+    cand = cand[(cand["pchange"] > 0) & (cand["med_turn20"] >= MIN_TURN_LACS)]
+    if cand.empty:
+        return live
+    cand = cand.nlargest(UNUSUAL_VOL_MAX_QUOTES, "pchange")
+    try:
+        groww = fetch._get_groww_client()
+        vols = fetch.quote_batch_sequential(
+            groww, cand["symbol"].tolist(), {"volume": "volume"},
+            label="unusual-vol")
+    except Exception as exc:
+        print(f"  unusual-vol quote failed: {exc}")
+        return live
+    if not vols:
+        return live
+    vdf = pd.DataFrame(vols)
+    vdf["volume"] = pd.to_numeric(vdf["volume"], errors="coerce")
+    return live.drop(columns=["volume"], errors="ignore").merge(
+        vdf[["symbol", "volume"]], on="symbol", how="left")
+
+
 def unusual_volume(live: pd.DataFrame, uni: pd.DataFrame) -> list[dict]:
     """
-    Stocks with 2x+ normal turnover and positive price action.
+    Stocks with 2x+ normal volume and positive price action.
 
     Args:
-        live: DataFrame from fetch.live_quotes_groww() with ltp, pchange, volume, etc.
+        live: snapshot with ltp, pchange and (via augment_with_volume) volume.
         uni: Universe DataFrame with vol_avg20, med_turn20, sector.
     """
+    if "volume" not in live.columns:
+        return []
     m = live.merge(uni[["symbol", "vol_avg20", "med_turn20", "sector"]], on="symbol")
-    # Approximate turnover ratio from live volume
+    # Live volume is cumulative-so-far today vs the full-day 20-session average,
+    # so this is a conservative floor: a name already at 2x by now is a real spike.
     m["vol_ratio"] = np.where(
         m["vol_avg20"] > 0, m["volume"] / m["vol_avg20"], np.nan)
     m = m[(m["vol_ratio"] >= 2.0) & (m["pchange"] > 0)].copy()
@@ -253,7 +314,9 @@ def intraday_all(on_progress=None) -> dict:
     uni, _ = _liquid_eq(today - timedelta(days=1))
     print(f"[scanners] universe: {len(uni)} liquid names")
 
-    live = fetch.live_quotes_groww(uni["symbol"].tolist(), on_progress=on_progress)
+    # Shared snapshot — the circuit scan runs on the same schedule and reuses
+    # this fetch instead of pulling the whole universe a second time.
+    live = fetch.live_universe_snapshot(uni["symbol"].tolist(), on_progress=on_progress)
     if live.empty:
         return {
             "as_of": today.isoformat(),
@@ -263,10 +326,14 @@ def intraday_all(on_progress=None) -> dict:
             "sector_pulse": [],
         }
 
+    # Volume for unusual_volume comes from a bounded per-symbol fetch; the
+    # batch snapshot carries no volume. big_movers/sector_pulse use pchange.
+    live_vol = augment_with_volume(live, uni)
+
     return {
         "as_of": today.isoformat(),
         "scan_time": f"{now.hour:02d}:{now.minute:02d}",
-        "unusual_volume": unusual_volume(live, uni),
+        "unusual_volume": unusual_volume(live_vol, uni),
         "big_movers": big_movers(live, uni),
         "sector_pulse": sector_pulse(live, uni),
     }

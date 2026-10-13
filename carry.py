@@ -34,7 +34,6 @@ same source.
 
 from __future__ import annotations
 
-import time
 from datetime import date, timedelta
 
 import numpy as np
@@ -99,8 +98,29 @@ def _hist_files(end: date, n: int) -> pd.DataFrame:
     return fetch.load_history(end, n, verbose=False)
 
 
+_universe_cache: dict[str, pd.DataFrame] = {}
+
+
 def universe(end: date) -> pd.DataFrame:
-    """Liquid EQ companies as of the last session on or before `end`."""
+    """
+    Liquid EQ companies as of the last session on or before `end`.
+
+    Memoised per `end` date: the universe is derived from settled bhavcopy and
+    cannot change intraday, so the every-30-min crons reuse one build instead
+    of reloading ~65 parquet files each time.
+    """
+    key = end.isoformat()
+    cached = _universe_cache.get(key)
+    if cached is not None:
+        return cached
+    out = _build_universe(end)
+    if len(_universe_cache) > 8:
+        _universe_cache.clear()
+    _universe_cache[key] = out
+    return out
+
+
+def _build_universe(end: date) -> pd.DataFrame:
     raw = _hist_files(end, MIN_HIST + 5)
     # History counts BE sessions too: names move between EQ and trade-for-trade
     # often, and an EQ-only count drops them for weeks after they move back --
@@ -167,67 +187,8 @@ def _snap_band(ratio) -> float:
 # Live snapshot
 # --------------------------------------------------------------------------
 
-_QUOTE_PAUSE = 0.35      # seconds between per-symbol get_quote calls
-_QUOTE_MAX_RETRIES = 5   # waves of retries for the full list
-_QUOTE_WAVE_BACKOFF = 2  # seconds extra pause between retry waves
-
-
-def _quote_batch_sequential(groww, symbols: list[str], fields: dict[str, str],
-                            label: str = "quote") -> list[dict]:
-    """
-    Fetch per-symbol quotes sequentially with retry waves until every
-    symbol succeeds or a hard retry cap is reached.
-
-    Groww's get_quote rate-limits aggressively on concurrent calls, but
-    at ~0.35 s spacing a sequential run of 100 symbols takes ~35 s and
-    almost never trips the limiter. Any stragglers that do fail get
-    retried in progressively slower waves.
-
-    `fields` maps output-key -> Groww-response-key (dot-notation for nested),
-    e.g. {"upper_circuit": "upper_circuit_limit", "q_high": "ohlc.high"}.
-    """
-    if not symbols:
-        return []
-    pending = list(symbols)
-    results: dict[str, dict] = {}
-
-    for wave in range(_QUOTE_MAX_RETRIES):
-        still_pending = []
-        for sym in pending:
-            try:
-                q = groww.get_quote(
-                    exchange=groww.EXCHANGE_NSE,
-                    segment=groww.SEGMENT_CASH,
-                    trading_symbol=sym,
-                )
-                if not isinstance(q, dict):
-                    still_pending.append(sym)
-                    continue
-                row = {"symbol": sym}
-                for out_key, src_key in fields.items():
-                    parts = src_key.split(".")
-                    val = q
-                    for p in parts:
-                        val = (val or {}).get(p) if isinstance(val, dict) else None
-                    row[out_key] = val
-                results[sym] = row
-            except Exception:
-                still_pending.append(sym)
-            time.sleep(_QUOTE_PAUSE)
-
-        if not still_pending:
-            break
-        pause = _QUOTE_WAVE_BACKOFF * (wave + 1)
-        print(f"  {label}: wave {wave + 1} done, {len(still_pending)}/{len(symbols)} "
-              f"still pending — retrying in {pause}s")
-        time.sleep(pause)
-        pending = still_pending
-
-    if still_pending:
-        print(f"  {label}: gave up on {len(still_pending)} symbols after "
-              f"{_QUOTE_MAX_RETRIES} waves: {still_pending[:10]}")
-
-    return list(results.values())
+# Per-symbol quoting lives in fetch.quote_batch_sequential now, so carry and
+# the scanners share one rate-safe, globally-throttled implementation.
 
 
 # --------------------------------------------------------------------------
@@ -325,7 +286,7 @@ def snapshot(on_progress=None) -> pd.DataFrame:
         print(f"  snap: {len(quote_syms)}/{len(pre)} need quoting "
               f"(skipped {len(pre) - len(quote_syms)} with wrong band)")
 
-    depth = _quote_batch_sequential(groww, quote_syms, {
+    depth = fetch.quote_batch_sequential(groww, quote_syms, {
         "upper_circuit": "upper_circuit_limit",
         "total_buy_qty": "total_buy_quantity",
         "total_sell_qty": "total_sell_quantity",
@@ -435,8 +396,9 @@ def intraday_scan(scan_time: str | None = None, on_progress=None) -> pd.DataFram
     uni = universe(today - timedelta(days=1))
     print(f"  universe: {len(uni):,} liquid names")
     
-    # Fetch live prices
-    live = fetch.live_quotes_groww(uni["symbol"].tolist(), on_progress=on_progress)
+    # Fetch live prices (shared snapshot — reused by the movers/sector scanners
+    # that run on the same 30-min schedule, so the universe is pulled once).
+    live = fetch.live_universe_snapshot(uni["symbol"].tolist(), on_progress=on_progress)
     if live.empty:
         print("  no prices returned")
         return pd.DataFrame(columns=INTRADAY_COLUMNS)
@@ -503,7 +465,7 @@ def intraday_scan(scan_time: str | None = None, on_progress=None) -> pd.DataFram
     print(f"  triage: {len(need_quote)} to quote, {len(from_cache)} from cache, "
           f"{n_skipped} skipped (far from any band)")
 
-    fresh_quotes = _quote_batch_sequential(groww, need_quote, {
+    fresh_quotes = fetch.quote_batch_sequential(groww, need_quote, {
         "upper_circuit": "upper_circuit_limit",
         "lower_circuit": "lower_circuit_limit",
         "total_buy_qty": "total_buy_quantity",

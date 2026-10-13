@@ -1089,3 +1089,136 @@ def live_quotes_groww(symbols: list[str], on_progress=None) -> pd.DataFrame:
         if c in out.columns:
             out[c] = pd.to_numeric(out[c], errors="coerce")
     return out.reset_index(drop=True)
+
+
+# --------------------------------------------------------------------------
+# Per-symbol quote helper (shared by carry + scanners)
+#
+# Groww's get_quote rate-limits aggressively on concurrent calls. We fetch
+# sequentially at a fixed pace, with retry waves for stragglers, and bound
+# concurrency ACROSS all threads with a process-wide semaphore so two cron
+# jobs quoting at the same time cannot together trip the limiter.
+# --------------------------------------------------------------------------
+
+QUOTE_PAUSE = 0.35        # seconds between per-symbol get_quote calls
+QUOTE_MAX_RETRIES = 5     # waves of retries for the full list
+QUOTE_WAVE_BACKOFF = 2    # seconds extra pause between retry waves
+_quote_concurrency = threading.Semaphore(3)  # global cap across all threads
+
+
+def quote_batch_sequential(groww, symbols: list[str], fields: dict[str, str],
+                           label: str = "quote") -> list[dict]:
+    """
+    Fetch per-symbol quotes until every symbol succeeds or a retry cap is hit.
+
+    `fields` maps output-key -> Groww-response-key (dot-notation for nested),
+    e.g. {"upper_circuit": "upper_circuit_limit", "q_high": "ohlc.high"}.
+    Returns a list of row dicts (each carrying "symbol" plus the mapped keys).
+    """
+    if not symbols:
+        return []
+    pending = list(symbols)
+    results: dict[str, dict] = {}
+
+    still_pending: list[str] = []
+    for wave in range(QUOTE_MAX_RETRIES):
+        still_pending = []
+        for sym in pending:
+            try:
+                with _quote_concurrency:
+                    q = groww.get_quote(
+                        exchange=groww.EXCHANGE_NSE,
+                        segment=groww.SEGMENT_CASH,
+                        trading_symbol=sym,
+                    )
+                if not isinstance(q, dict):
+                    still_pending.append(sym)
+                    continue
+                row = {"symbol": sym}
+                for out_key, src_key in fields.items():
+                    val = q
+                    for p in src_key.split("."):
+                        val = (val or {}).get(p) if isinstance(val, dict) else None
+                    row[out_key] = val
+                results[sym] = row
+            except Exception:
+                still_pending.append(sym)
+            time.sleep(QUOTE_PAUSE)
+
+        if not still_pending:
+            break
+        pause = QUOTE_WAVE_BACKOFF * (wave + 1)
+        print(f"  {label}: wave {wave + 1} done, {len(still_pending)}/{len(symbols)} "
+              f"still pending — retrying in {pause}s")
+        time.sleep(pause)
+        pending = still_pending
+
+    if still_pending:
+        print(f"  {label}: gave up on {len(still_pending)} symbols after "
+              f"{QUOTE_MAX_RETRIES} waves: {still_pending[:10]}")
+
+    return list(results.values())
+
+
+# --------------------------------------------------------------------------
+# Shared live snapshot
+#
+# The two 30-minute intraday crons (circuit scan + movers/sector scanners)
+# both want current prices for the whole liquid universe. Rather than each
+# pulling ~1,400 names from Groww every half hour, they share one snapshot:
+# a per-symbol price cache with a short TTL. The second caller in a cycle
+# reuses the first caller's fetch instead of repeating it.
+# --------------------------------------------------------------------------
+
+_SNAPSHOT_COLUMNS = [
+    "symbol", "ltp", "open", "high", "low", "prev_close",
+    "volume", "turnover", "pchange", "time",
+]
+_live_snapshot_cache: dict[str, tuple[float, dict]] = {}
+_live_snapshot_lock = threading.Lock()
+
+
+def live_universe_snapshot(symbols: list[str], max_age: float = 180.0,
+                           on_progress=None) -> pd.DataFrame:
+    """
+    Batch Groww prices for `symbols`, reusing recently-fetched prices.
+
+    Only symbols whose cached price is missing or older than `max_age`
+    seconds are refetched. The fetch runs under a lock, so when both intraday
+    crons fire together the second one waits for the first's fetch and then
+    serves entirely from cache instead of hitting Groww again.
+    """
+    want = [str(s).strip().upper() for s in symbols if s]
+    want = list(dict.fromkeys(want))
+    if not want:
+        return pd.DataFrame(columns=_SNAPSHOT_COLUMNS)
+
+    with _live_snapshot_lock:
+        now = time.time()
+        stale = [s for s in want
+                 if s not in _live_snapshot_cache
+                 or now - _live_snapshot_cache[s][0] > max_age]
+        if stale:
+            fresh = live_quotes_groww(stale, on_progress=on_progress)
+            ts = time.time()
+            for row in fresh.to_dict("records"):
+                sym = str(row.get("symbol") or "").strip().upper()
+                if sym:
+                    _live_snapshot_cache[sym] = (ts, row)
+        else:
+            print(f"  live snapshot: {len(want)} names served from cache")
+        now = time.time()
+        rows = [dict(_live_snapshot_cache[s][1]) for s in want
+                if s in _live_snapshot_cache
+                and now - _live_snapshot_cache[s][0] <= max_age]
+
+    if not rows:
+        return pd.DataFrame(columns=_SNAPSHOT_COLUMNS)
+    out = pd.DataFrame(rows)
+    out["symbol"] = out["symbol"].astype(str).str.strip()
+    out = out.drop_duplicates("symbol", keep="last")
+    for c in ("ltp", "open", "high", "low", "prev_close", "volume",
+              "turnover", "pchange"):
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+    return out.reset_index(drop=True)
