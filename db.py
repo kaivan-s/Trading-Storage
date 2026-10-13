@@ -1373,6 +1373,35 @@ def _latest_date(table: str, col: str = "scan_date") -> str | None:
         return None
 
 
+def _enrich_earnings_trend(rows: list[dict]) -> None:
+    """
+    Stamp `earnings_trend` and `pe_ttm` onto each row from the
+    company_fundamentals cache. Mutates in place. No-op if the table
+    is empty or unreachable.
+    """
+    if not rows:
+        return
+    symbols = [r.get("symbol") for r in rows if r.get("symbol")]
+    if not symbols:
+        return
+    try:
+        client = get_client()
+        resp = (client.table("company_fundamentals")
+                .select("symbol,earnings_trend,pe_ttm,market_cap_cr,promoter_pct")
+                .in_("symbol", symbols)
+                .execute())
+        lookup = {r["symbol"]: r for r in (resp.data or [])}
+    except Exception:
+        return
+    for row in rows:
+        f = lookup.get(row.get("symbol"))
+        if f:
+            row["earnings_trend"] = f.get("earnings_trend")
+            row["pe_ttm"] = f.get("pe_ttm")
+            row["market_cap_cr"] = f.get("market_cap_cr")
+            row["promoter_pct"] = f.get("promoter_pct")
+
+
 def get_lists() -> dict:
     """
     Everything the dashboard shows, read straight out of Supabase.
@@ -1410,6 +1439,11 @@ def get_lists() -> dict:
         (r for r in coils if r.get("rest_rank") is not None),
         key=lambda r: r["rest_rank"],
     )
+
+    # Enrich with earnings trend from fundamentals cache
+    _enrich_earnings_trend(setups)
+    _enrich_earnings_trend(coils)
+    _enrich_earnings_trend(ranked)
 
     session = max([d for d in (coil_date, scan_date, setup_date) if d],
                   default=None)
