@@ -1854,6 +1854,68 @@ def get_results_calendar(from_date: str = None, to_date: str = None,
         return []
 
 
+# -------------------------------------------------------------------------
+# User watchlists
+# -------------------------------------------------------------------------
+#
+# CREATE TABLE user_watchlists (
+#     id          BIGSERIAL PRIMARY KEY,
+#     user_email  TEXT NOT NULL,
+#     symbol      TEXT NOT NULL,
+#     notes       TEXT,
+#     added_at    TIMESTAMPTZ DEFAULT NOW(),
+#     UNIQUE(user_email, symbol)
+# );
+# CREATE INDEX idx_watchlist_user ON user_watchlists(user_email);
+
+def get_watchlist(email: str) -> list[dict]:
+    """Get all watchlist entries for a user."""
+    client = get_client()
+    try:
+        r = (client.table("user_watchlists")
+             .select("*")
+             .eq("user_email", email)
+             .order("added_at", desc=True)
+             .limit(200)
+             .execute())
+        return r.data or []
+    except Exception as e:
+        print(f"get watchlist: {e}")
+        return []
+
+
+def add_to_watchlist(email: str, symbol: str, notes: str = None) -> dict | None:
+    """Add a symbol to user's watchlist. Returns the row."""
+    client = get_client()
+    row = {
+        "user_email": email,
+        "symbol": symbol.upper(),
+        "notes": notes,
+    }
+    try:
+        r = (client.table("user_watchlists")
+             .upsert(row, on_conflict="user_email,symbol")
+             .execute())
+        return (r.data or [None])[0]
+    except Exception as e:
+        print(f"add to watchlist: {e}")
+        return None
+
+
+def remove_from_watchlist(email: str, symbol: str) -> bool:
+    """Remove a symbol from user's watchlist."""
+    client = get_client()
+    try:
+        client.table("user_watchlists").delete().match({
+            "user_email": email,
+            "symbol": symbol.upper(),
+        }).execute()
+        return True
+    except Exception as e:
+        print(f"remove from watchlist: {e}")
+        return False
+
+
 def clear_results_calendar_future(from_date: str) -> int:
     """Delete future calendar entries before a refresh."""
     client = get_client()

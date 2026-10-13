@@ -1504,6 +1504,119 @@ def api_cron_fundamentals_refresh():
     }), 202
 
 
+# --------------------------------------------------------------------------
+# Watchlist
+# --------------------------------------------------------------------------
+
+@app.get("/api/watchlist")
+def api_watchlist_get():
+    """
+    Get user's watchlist, enriched with fundamentals and latest data.
+    """
+    user = request.environ.get("auth_user") or {}
+    email = user.get("email") or ""
+    if not email:
+        return jsonify({"error": "Sign in required"}), 401
+
+    rows = db.get_watchlist(email)
+    if not rows:
+        return jsonify({"count": 0, "rows": []})
+
+    # Enrich with fundamentals
+    symbols = [r["symbol"] for r in rows]
+    fund_lookup = {}
+    try:
+        client = db.get_client()
+        resp = (client.table("company_fundamentals")
+                .select("symbol,name,industry,earnings_trend,market_cap_cr,pe_ttm,"
+                        "promoter_pct,latest_pat_growth_yoy,latest_opm_pct")
+                .in_("symbol", symbols)
+                .execute())
+        fund_lookup = {r["symbol"]: r for r in (resp.data or [])}
+    except Exception:
+        pass
+
+    # Enrich with latest coil/setup data if available
+    coil_lookup = {}
+    try:
+        client = db.get_client()
+        coil_date = db._latest_date("coiled_bases")
+        if coil_date:
+            resp = (client.table("coiled_bases")
+                    .select("symbol,adj,coil,pos_hi,to_trigger,rsi,vol_ratio,cmf")
+                    .eq("scan_date", coil_date)
+                    .in_("symbol", symbols)
+                    .execute())
+            coil_lookup = {r["symbol"]: r for r in (resp.data or [])}
+    except Exception:
+        pass
+
+    enriched = []
+    for row in rows:
+        sym = row["symbol"]
+        f = fund_lookup.get(sym, {})
+        c = coil_lookup.get(sym, {})
+        enriched.append({
+            "symbol": sym,
+            "notes": row.get("notes"),
+            "added_at": row.get("added_at"),
+            "name": f.get("name"),
+            "industry": f.get("industry"),
+            "earnings_trend": f.get("earnings_trend"),
+            "market_cap_cr": f.get("market_cap_cr"),
+            "pe_ttm": f.get("pe_ttm"),
+            "promoter_pct": f.get("promoter_pct"),
+            "latest_pat_growth_yoy": f.get("latest_pat_growth_yoy"),
+            "latest_opm_pct": f.get("latest_opm_pct"),
+            "adj": c.get("adj"),
+            "coil": c.get("coil"),
+            "pos_hi": c.get("pos_hi"),
+            "to_trigger": c.get("to_trigger"),
+            "rsi": c.get("rsi"),
+            "vol_ratio": c.get("vol_ratio"),
+            "cmf": c.get("cmf"),
+            "is_coiled": bool(c),
+        })
+
+    return jsonify({"count": len(enriched), "rows": enriched})
+
+
+@app.post("/api/watchlist")
+def api_watchlist_add():
+    """Add a symbol to watchlist. Body: {symbol, notes?}"""
+    user = request.environ.get("auth_user") or {}
+    email = user.get("email") or ""
+    if not email:
+        return jsonify({"error": "Sign in required"}), 401
+
+    body = request.get_json(silent=True) or {}
+    symbol = (body.get("symbol") or "").strip().upper()
+    if not symbol:
+        return jsonify({"error": "symbol is required"}), 400
+
+    row = db.add_to_watchlist(email, symbol, body.get("notes"))
+    if row:
+        return jsonify({"ok": True, "symbol": symbol})
+    return jsonify({"error": "Failed to add"}), 500
+
+
+@app.delete("/api/watchlist")
+def api_watchlist_remove():
+    """Remove a symbol from watchlist. Body: {symbol}"""
+    user = request.environ.get("auth_user") or {}
+    email = user.get("email") or ""
+    if not email:
+        return jsonify({"error": "Sign in required"}), 401
+
+    body = request.get_json(silent=True) or {}
+    symbol = (body.get("symbol") or "").strip().upper()
+    if not symbol:
+        return jsonify({"error": "symbol is required"}), 400
+
+    ok = db.remove_from_watchlist(email, symbol)
+    return jsonify({"ok": ok, "symbol": symbol})
+
+
 @app.get("/api/results-calendar")
 def api_results_calendar():
     """
