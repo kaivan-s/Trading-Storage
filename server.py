@@ -1530,21 +1530,27 @@ def api_chart_data():
         if hist.empty:
             return jsonify({"symbol": symbol, "data": [], "volume": []})
 
+        import math
+
         candles = []
         volumes = []
         for idx, row in hist.iterrows():
+            o, h, l, c, v = row["Open"], row["High"], row["Low"], row["Close"], row["Volume"]
+            # Skip rows with NaN (Yahoo Finance gaps)
+            if any(math.isnan(x) for x in (o, h, l, c)):
+                continue
             t = idx.strftime("%Y-%m-%d")
-            o, c = round(row["Open"], 2), round(row["Close"], 2)
+            o, c = round(o, 2), round(c, 2)
             candles.append({
                 "time": t,
                 "open": o,
-                "high": round(row["High"], 2),
-                "low": round(row["Low"], 2),
+                "high": round(h, 2),
+                "low": round(l, 2),
                 "close": c,
             })
             volumes.append({
                 "time": t,
-                "value": int(row["Volume"]),
+                "value": int(v) if not math.isnan(v) else 0,
                 "color": "rgba(125,186,150,0.3)" if c >= o else "rgba(229,115,115,0.3)",
             })
 
