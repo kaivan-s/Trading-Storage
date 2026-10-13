@@ -20,7 +20,8 @@ import db
 
 # Public: the Vite app and the authorize redirect need these.
 # Cron endpoints use their own secret-based auth.
-PUBLIC_PATHS = {"/api/auth/config", "/api/quote", "/api/cron/post-market",
+PUBLIC_PATHS = {"/api/auth/config", "/api/quote", "/api/status", "/api/health",
+                "/api/cron/post-market",
                 "/api/cron/carry-snap", "/api/cron/carry-scan",
                 "/api/cron/scanner-scan", "/api/cron/scanner-eod",
                 "/api/cron/telegram-eod", "/api/cron/telegram-morning",

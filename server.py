@@ -554,6 +554,40 @@ def api_status():
     return jsonify(engine.snapshot())
 
 
+@app.get("/api/health")
+def api_health():
+    """Quick data-freshness check — public, no auth."""
+    snap = engine.snapshot()
+    try:
+        lists = db.get_lists()
+        db_as_of = lists.get("as_of")
+        db_dates = lists.get("dates", {})
+        db_counts = {
+            "sectors": len(lists.get("scan") or []),
+            "setups": len(lists.get("buys") or []),
+            "coils": len(lists.get("coil") or []),
+        }
+        stale = lists.get("stale", [])
+    except Exception as exc:
+        db_as_of = None
+        db_dates = {}
+        db_counts = {}
+        stale = [f"db error: {exc}"]
+
+    return jsonify({
+        "engine_status": snap.get("status"),
+        "engine_as_of": snap.get("as_of"),
+        "engine_loaded_at": snap.get("loaded_at"),
+        "engine_message": snap.get("message"),
+        "db_as_of": db_as_of,
+        "db_dates": db_dates,
+        "db_counts": db_counts,
+        "stale": stale,
+        "n_buys": snap.get("n_buys", 0),
+        "n_coil": snap.get("n_coil", 0),
+    })
+
+
 @app.get("/api/dashboard")
 def api_dashboard():
     """
@@ -592,6 +626,9 @@ def api_dashboard():
         "buys": lists["buys"],
         "n_coil": len(lists["coil"]),
         "n_buys": len(lists["buys"]),
+        "stale": lists.get("stale", []),
+        "dates": lists.get("dates", {}),
+        "session": lists.get("session"),
     })
 
 
