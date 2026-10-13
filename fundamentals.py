@@ -562,28 +562,38 @@ def refresh_results_calendar(
     except Exception:
         pass
 
-    entries = []
+    saved = 0
+    batch = []
     for i, sym in enumerate(symbols):
         try:
             entry = fetch_earnings_date(sym)
             if entry and entry.get("earnings_date") and entry["earnings_date"] >= today:
-                entries.append(entry)
+                batch.append(entry)
         except Exception as exc:
             print(f"  [{i+1}/{len(symbols)}] calendar {sym}: {exc}")
+
+        # Save in batches of 50
+        if len(batch) >= 50:
+            try:
+                saved += db.save_results_calendar(batch)
+            except Exception as exc:
+                print(f"  save calendar batch: {exc}")
+            batch = []
 
         if on_progress and (i + 1) % 50 == 0:
             on_progress(i + 1, len(symbols))
 
         if (i + 1) % 100 == 0:
-            print(f"  [calendar {i+1}/{len(symbols)}] {len(entries)} upcoming so far")
+            print(f"  [calendar {i+1}/{len(symbols)}] {saved} saved so far")
 
         time.sleep(0.2)
 
-    saved = 0
-    try:
-        saved = db.save_results_calendar(entries)
-    except Exception as exc:
-        print(f"  save calendar batch: {exc}")
+    # Save remaining
+    if batch:
+        try:
+            saved += db.save_results_calendar(batch)
+        except Exception as exc:
+            print(f"  save calendar batch: {exc}")
 
     print(f"[calendar] done: {saved} entries saved from {len(symbols)} symbols")
     return saved
