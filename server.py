@@ -1505,6 +1505,55 @@ def api_cron_fundamentals_refresh():
 
 
 # --------------------------------------------------------------------------
+# Chart data (OHLCV via yfinance)
+# --------------------------------------------------------------------------
+
+@app.get("/api/chart-data")
+def api_chart_data():
+    """
+    Historical OHLCV for a symbol. Used by the in-app candlestick chart.
+    Query params: symbol (required), period (default 1y: 6mo|1y|2y|5y)
+    """
+    symbol = (request.args.get("symbol") or "").strip().upper()
+    if not symbol:
+        return jsonify({"error": "symbol is required"}), 400
+
+    period = request.args.get("period", "1y")
+    if period not in ("6mo", "1y", "2y", "5y"):
+        period = "1y"
+
+    try:
+        import yfinance as yf
+        ticker = yf.Ticker(f"{symbol}.NS")
+        hist = ticker.history(period=period)
+
+        if hist.empty:
+            return jsonify({"symbol": symbol, "data": [], "volume": []})
+
+        candles = []
+        volumes = []
+        for idx, row in hist.iterrows():
+            t = idx.strftime("%Y-%m-%d")
+            o, c = round(row["Open"], 2), round(row["Close"], 2)
+            candles.append({
+                "time": t,
+                "open": o,
+                "high": round(row["High"], 2),
+                "low": round(row["Low"], 2),
+                "close": c,
+            })
+            volumes.append({
+                "time": t,
+                "value": int(row["Volume"]),
+                "color": "rgba(125,186,150,0.3)" if c >= o else "rgba(229,115,115,0.3)",
+            })
+
+        return jsonify({"symbol": symbol, "data": candles, "volume": volumes})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# --------------------------------------------------------------------------
 # Watchlist
 # --------------------------------------------------------------------------
 
