@@ -34,10 +34,8 @@ same source.
 
 from __future__ import annotations
 
-import threading
 import time
 from datetime import date, timedelta
-from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
@@ -169,34 +167,127 @@ def _snap_band(ratio) -> float:
 # Live snapshot
 # --------------------------------------------------------------------------
 
-_snap_throttle = threading.Semaphore(3)
+_QUOTE_PAUSE = 0.35      # seconds between per-symbol get_quote calls
+_QUOTE_MAX_RETRIES = 5   # waves of retries for the full list
+_QUOTE_WAVE_BACKOFF = 2  # seconds extra pause between retry waves
 
 
-def _depth_one(groww, symbol: str) -> dict | None:
-    for attempt in range(fetch.GROWW_RETRIES):
-        _snap_throttle.acquire()
-        try:
-            q = groww.get_quote(exchange=groww.EXCHANGE_NSE,
-                                segment=groww.SEGMENT_CASH, trading_symbol=symbol)
-            if not isinstance(q, dict):
-                return None
-            return {
-                "symbol": symbol,
-                "upper_circuit": q.get("upper_circuit_limit"),
-                "total_buy_qty": q.get("total_buy_quantity"),
-                "total_sell_qty": q.get("total_sell_quantity"),
-                "volume": q.get("volume"),
-                "q_ltp": q.get("last_price"),
+def _quote_batch_sequential(groww, symbols: list[str], fields: dict[str, str],
+                            label: str = "quote") -> list[dict]:
+    """
+    Fetch per-symbol quotes sequentially with retry waves until every
+    symbol succeeds or a hard retry cap is reached.
+
+    Groww's get_quote rate-limits aggressively on concurrent calls, but
+    at ~0.35 s spacing a sequential run of 100 symbols takes ~35 s and
+    almost never trips the limiter. Any stragglers that do fail get
+    retried in progressively slower waves.
+
+    `fields` maps output-key -> Groww-response-key (dot-notation for nested),
+    e.g. {"upper_circuit": "upper_circuit_limit", "q_high": "ohlc.high"}.
+    """
+    if not symbols:
+        return []
+    pending = list(symbols)
+    results: dict[str, dict] = {}
+
+    for wave in range(_QUOTE_MAX_RETRIES):
+        still_pending = []
+        for sym in pending:
+            try:
+                q = groww.get_quote(
+                    exchange=groww.EXCHANGE_NSE,
+                    segment=groww.SEGMENT_CASH,
+                    trading_symbol=sym,
+                )
+                if not isinstance(q, dict):
+                    still_pending.append(sym)
+                    continue
+                row = {"symbol": sym}
+                for out_key, src_key in fields.items():
+                    parts = src_key.split(".")
+                    val = q
+                    for p in parts:
+                        val = (val or {}).get(p) if isinstance(val, dict) else None
+                    row[out_key] = val
+                results[sym] = row
+            except Exception:
+                still_pending.append(sym)
+            time.sleep(_QUOTE_PAUSE)
+
+        if not still_pending:
+            break
+        pause = _QUOTE_WAVE_BACKOFF * (wave + 1)
+        print(f"  {label}: wave {wave + 1} done, {len(still_pending)}/{len(symbols)} "
+              f"still pending — retrying in {pause}s")
+        time.sleep(pause)
+        pending = still_pending
+
+    if still_pending:
+        print(f"  {label}: gave up on {len(still_pending)} symbols after "
+              f"{_QUOTE_MAX_RETRIES} waves: {still_pending[:10]}")
+
+    return list(results.values())
+
+
+# --------------------------------------------------------------------------
+# Day-level circuit cache
+#
+# A stock's upper circuit = prev_close × (1 + band), and the band (5/10/20%)
+# is fixed for the entire session. Once learned from one get_quote call, it
+# never needs to be asked again that day. This turns 12 scans × 99 API calls
+# into 1 scan × ~15 calls + 11 scans × ~5 calls each.
+# --------------------------------------------------------------------------
+
+_circuit_cache: dict[str, dict] = {}
+_circuit_cache_date: str = ""
+
+
+def _circuit_cache_for_today() -> dict[str, dict]:
+    """
+    {symbol: {upper_circuit, lower_circuit, band}} valid for today's session.
+    Auto-clears when the date rolls.
+    """
+    global _circuit_cache, _circuit_cache_date
+    today = db.now_ist().date().isoformat()
+    if _circuit_cache_date != today:
+        _circuit_cache = {}
+        _circuit_cache_date = today
+    return _circuit_cache
+
+
+def _update_circuit_cache(quotes: list[dict], prev_closes: dict[str, float]):
+    """Store circuit limits learned from fresh get_quote responses."""
+    cache = _circuit_cache_for_today()
+    for q in quotes:
+        sym = q.get("symbol")
+        uc = pd.to_numeric(q.get("upper_circuit"), errors="coerce")
+        lc = pd.to_numeric(q.get("lower_circuit"), errors="coerce")
+        pc = prev_closes.get(sym)
+        if pd.notna(uc) and pc and pc > 0:
+            band = _snap_band(float(uc) / float(pc) - 1)
+            cache[sym] = {
+                "upper_circuit": float(uc),
+                "lower_circuit": float(lc) if pd.notna(lc) else None,
+                "band": float(band) if not np.isnan(band) else None,
             }
-        except Exception as exc:
-            if attempt == fetch.GROWW_RETRIES - 1:
-                print(f"  quote {symbol}: {exc}")
-                return None
-            time.sleep(fetch.GROWW_PAUSE * (attempt + 1) * 2)
-        finally:
-            time.sleep(fetch.GROWW_PAUSE)
-            _snap_throttle.release()
-    return None
+
+
+def _could_be_near_circuit(ltp: float, prev_close: float,
+                           max_dist: float = 0.05) -> bool:
+    """
+    True when ltp is within `max_dist` of the upper circuit on ANY of the
+    three NSE price bands (5/10/20%). Used as a cheap pre-filter so we only
+    call get_quote for stocks that have a chance of being near circuit.
+    """
+    if not prev_close or prev_close <= 0 or not ltp or ltp <= 0:
+        return False
+    for band in BANDS:
+        uc = prev_close * (1 + band)
+        dist = uc / ltp - 1
+        if -0.01 <= dist <= max_dist:
+            return True
+    return False
 
 
 def snapshot(on_progress=None) -> pd.DataFrame:
@@ -214,8 +305,34 @@ def snapshot(on_progress=None) -> pd.DataFrame:
         return pd.DataFrame(columns=COLUMNS)
 
     groww = fetch._get_groww_client()
-    with ThreadPoolExecutor(max_workers=fetch.GROWW_QUOTE_WORKERS) as pool:
-        depth = [d for d in pool.map(lambda s: _depth_one(groww, s), pre["symbol"]) if d]
+    cache = _circuit_cache_for_today()
+    prev_closes = dict(zip(pre["symbol"], pre["prev_close"]))
+
+    # Snapshot needs order book for ALL candidates (to classify fillable),
+    # but skip stocks whose cached band shows they are NOT on a circuit band
+    # at this pchange level (e.g. up 5% on a 20% band → not at circuit).
+    quote_syms = []
+    for _, row in pre.iterrows():
+        sym = row["symbol"]
+        cached = cache.get(sym)
+        if cached and cached.get("band"):
+            min_pchange_for_band = (cached["band"] - BAND_TOL) * 100
+            if row["pchange"] < min_pchange_for_band:
+                continue
+        quote_syms.append(sym)
+
+    if len(quote_syms) < len(pre):
+        print(f"  snap: {len(quote_syms)}/{len(pre)} need quoting "
+              f"(skipped {len(pre) - len(quote_syms)} with wrong band)")
+
+    depth = _quote_batch_sequential(groww, quote_syms, {
+        "upper_circuit": "upper_circuit_limit",
+        "total_buy_qty": "total_buy_quantity",
+        "total_sell_qty": "total_sell_quantity",
+        "volume": "volume",
+        "q_ltp": "last_price",
+    }, label="snap")
+    _update_circuit_cache(depth, prev_closes)
     pre = pre.drop(columns=["volume", "turnover", "time"], errors="ignore")
     pre = pre.merge(pd.DataFrame(depth), on="symbol", how="left")
     for c in ("upper_circuit", "total_buy_qty", "total_sell_qty", "volume", "q_ltp"):
@@ -335,43 +452,71 @@ def intraday_scan(scan_time: str | None = None, on_progress=None) -> pd.DataFram
     if m.empty:
         return pd.DataFrame(columns=INTRADAY_COLUMNS)
     
-    # Get detailed quotes with circuit limits and order book.
-    # Groww rate-limits per-symbol get_quote calls aggressively, so we
-    # throttle concurrency and retry on failure with exponential backoff.
+    # ------------------------------------------------------------------
+    # Smart quoting: skip stocks that are obviously far from any circuit,
+    # reuse cached circuit limits from earlier scans, and only call
+    # get_quote for the handful that actually need it.
+    # ------------------------------------------------------------------
+    MAX_DISTANCE = 0.03
+    DEPTH_DISTANCE = 0.005   # within 0.5% of circuit → need fresh order book
+    PRE_FILTER_SLACK = 0.02  # extra margin for the conservative pre-filter
+
     groww = fetch._get_groww_client()
-    _quote_throttle = threading.Semaphore(3)
+    cache = _circuit_cache_for_today()
+    prev_closes = dict(zip(m["symbol"], m["prev_close"]))
 
-    def get_full_quote(sym):
-        for attempt in range(fetch.GROWW_RETRIES):
-            _quote_throttle.acquire()
-            try:
-                q = groww.get_quote(exchange=groww.EXCHANGE_NSE,
-                                    segment=groww.SEGMENT_CASH, trading_symbol=sym)
-                if not isinstance(q, dict):
-                    return None
-                return {
+    need_quote = []     # must call get_quote (new symbol, or near circuit for depth)
+    from_cache = []     # can build row from cached circuit limit
+    n_skipped = 0       # too far from circuit, no API call needed
+
+    for _, row in m.iterrows():
+        sym = row["symbol"]
+        cached = cache.get(sym)
+
+        if cached and cached.get("upper_circuit"):
+            uc = cached["upper_circuit"]
+            dist = uc / row["ltp"] - 1 if row["ltp"] else 1.0
+            if dist > MAX_DISTANCE:
+                n_skipped += 1
+                continue
+            if dist <= DEPTH_DISTANCE:
+                need_quote.append(sym)
+            else:
+                from_cache.append({
                     "symbol": sym,
-                    "upper_circuit": q.get("upper_circuit_limit"),
-                    "lower_circuit": q.get("lower_circuit_limit"),
-                    "total_buy_qty": q.get("total_buy_quantity"),
-                    "total_sell_qty": q.get("total_sell_quantity"),
-                    "volume": q.get("volume"),
-                    "q_ltp": q.get("last_price"),
-                    "q_high": q.get("ohlc", {}).get("high"),
-                    "q_low": q.get("ohlc", {}).get("low"),
-                }
-            except Exception as exc:
-                if attempt == fetch.GROWW_RETRIES - 1:
-                    print(f"  quote {sym}: {exc}")
-                    return None
-                time.sleep(fetch.GROWW_PAUSE * (attempt + 1) * 2)
-            finally:
-                time.sleep(fetch.GROWW_PAUSE)
-                _quote_throttle.release()
-        return None
+                    "upper_circuit": cached["upper_circuit"],
+                    "lower_circuit": cached.get("lower_circuit"),
+                    "total_buy_qty": None,
+                    "total_sell_qty": None,
+                    "volume": None,
+                    "q_ltp": None,
+                    "q_high": None,
+                    "q_low": None,
+                })
+        else:
+            if _could_be_near_circuit(row["ltp"], row["prev_close"],
+                                      MAX_DISTANCE + PRE_FILTER_SLACK):
+                need_quote.append(sym)
+            else:
+                n_skipped += 1
 
-    with ThreadPoolExecutor(max_workers=fetch.GROWW_QUOTE_WORKERS) as pool:
-        quotes = [q for q in pool.map(get_full_quote, m["symbol"]) if q]
+    print(f"  triage: {len(need_quote)} to quote, {len(from_cache)} from cache, "
+          f"{n_skipped} skipped (far from any band)")
+
+    fresh_quotes = _quote_batch_sequential(groww, need_quote, {
+        "upper_circuit": "upper_circuit_limit",
+        "lower_circuit": "lower_circuit_limit",
+        "total_buy_qty": "total_buy_quantity",
+        "total_sell_qty": "total_sell_quantity",
+        "volume": "volume",
+        "q_ltp": "last_price",
+        "q_high": "ohlc.high",
+        "q_low": "ohlc.low",
+    }, label="intraday")
+
+    _update_circuit_cache(fresh_quotes, prev_closes)
+
+    quotes = fresh_quotes + from_cache
     
     if not quotes:
         print("  no detailed quotes returned")
@@ -404,7 +549,6 @@ def intraday_scan(scan_time: str | None = None, on_progress=None) -> pd.DataFram
     m["distance_to_circuit"] = m["upper_circuit"] / m["ltp"] - 1
     
     # Filter to stocks reasonably close to circuit (within 3% of upper limit)
-    MAX_DISTANCE = 0.03
     m = m[m["distance_to_circuit"] <= MAX_DISTANCE].copy()
     print(f"  {len(m)} stocks within {MAX_DISTANCE:.0%} of their circuit")
     
