@@ -26,6 +26,8 @@ PUBLIC_PATHS = {"/api/auth/config", "/api/quote", "/api/status", "/api/health",
                 "/api/cron/scanner-scan", "/api/cron/scanner-eod",
                 "/api/cron/telegram-eod", "/api/cron/telegram-morning",
                 "/api/cron/telegram-midday", "/api/cron/telegram-weekly",
+                "/api/cron/fundamentals-refresh",
+                "/api/fundamentals", "/api/fundamentals/screen",
                 "/api/telegram/webhook", "/api/telegram/setup-webhook",
                 "/api/telegram/delete-webhook",
                 "/api/subscription/webhook"}

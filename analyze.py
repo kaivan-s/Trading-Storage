@@ -567,6 +567,32 @@ def build(query: str, *, stocks: pd.DataFrame, panel: pd.DataFrame,
     if "date" in tail.columns:
         tail["date"] = pd.to_datetime(tail["date"]).dt.strftime("%Y-%m-%d")
 
+    # Fundamentals (cache-first, no blocking fetch on miss)
+    fundamentals_data = None
+    try:
+        import fundamentals as fun
+        fundamentals_data = fun.get_fundamentals(symbol)
+    except Exception:
+        pass
+
+    fundamentals_summary = None
+    if fundamentals_data:
+        fundamentals_summary = {
+            "market_cap_cr": _f(fundamentals_data.get("market_cap_cr")),
+            "pe_ttm": _f(fundamentals_data.get("pe_ttm")),
+            "sector_pe": _f(fundamentals_data.get("sector_pe")),
+            "promoter_pct": _f(fundamentals_data.get("promoter_pct")),
+            "promoter_pledge_pct": _f(fundamentals_data.get("promoter_pledge_pct")),
+            "ttm_revenue_cr": _f(fundamentals_data.get("ttm_revenue_cr")),
+            "ttm_pat_cr": _f(fundamentals_data.get("ttm_pat_cr")),
+            "latest_revenue_growth_yoy": _f(fundamentals_data.get("latest_revenue_growth_yoy")),
+            "latest_pat_growth_yoy": _f(fundamentals_data.get("latest_pat_growth_yoy")),
+            "latest_opm_pct": _f(fundamentals_data.get("latest_opm_pct")),
+            "earnings_trend": fundamentals_data.get("earnings_trend"),
+            "quarters": fundamentals_data.get("quarters"),
+            "updated_at": fundamentals_data.get("updated_at"),
+        }
+
     report = {
         "found": True,
         "query": query,
@@ -581,6 +607,7 @@ def build(query: str, *, stocks: pd.DataFrame, panel: pd.DataFrame,
         "shape": shape,
         "filters": filters,
         "metrics": metrics,
+        "fundamentals": fundamentals_summary,
         "setup": ({"why": setup_row.get("why"), "coil": _f(setup_row.get("coil"))}
                   if setup_row else None),
         "breakout": ({k: _f(broke_row.get(k)) if k != "why" else broke_row.get("why")

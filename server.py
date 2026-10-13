@@ -1388,6 +1388,123 @@ def api_cron_telegram_weekly():
 
 
 # --------------------------------------------------------------------------
+# Fundamentals
+# --------------------------------------------------------------------------
+
+@app.get("/api/fundamentals")
+def api_fundamentals():
+    """
+    Fundamental data for one symbol. Cache-first; fetches from NSE on miss.
+
+    GET /api/fundamentals?symbol=RELIANCE
+    """
+    import fundamentals as fun
+    symbol = (request.args.get("symbol") or request.args.get("q") or "").strip().upper()
+    if not symbol:
+        return jsonify({"error": "symbol is required"}), 400
+
+    try:
+        data = fun.get_fundamentals_or_fetch(symbol)
+        if not data:
+            return jsonify({"found": False, "symbol": symbol}), 404
+        return jsonify({"found": True, **data})
+    except Exception as e:
+        return jsonify({"error": str(e), "symbol": symbol}), 500
+
+
+@app.get("/api/fundamentals/screen")
+def api_fundamentals_screen():
+    """
+    All cached fundamentals, with optional filters. For the Fundamentals view.
+
+    GET /api/fundamentals/screen?min_mcap=500&max_pe=40&sort=pe_ttm
+    """
+    import fundamentals as fun
+    try:
+        rows = fun.get_screen_data(
+            min_mcap_cr=_float_or_none(request.args.get("min_mcap")),
+            max_pe=_float_or_none(request.args.get("max_pe")),
+            min_growth=_float_or_none(request.args.get("min_growth")),
+            sector=request.args.get("sector"),
+            sort_by=request.args.get("sort", "market_cap_cr"),
+            sort_desc=request.args.get("order", "desc").lower() != "asc",
+            limit=min(int(request.args.get("limit", 500)), 2000),
+        )
+        return jsonify({"count": len(rows), "rows": rows})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+def _float_or_none(v) -> float | None:
+    if v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+_fundamentals_busy = threading.Lock()
+
+
+@app.post("/api/cron/fundamentals-refresh")
+def api_cron_fundamentals_refresh():
+    """
+    Bulk-refresh fundamentals from NSE. Run quarterly after results season.
+
+    POST /api/cron/fundamentals-refresh
+
+    Uses the symbol list from the loaded panel. Takes ~50 min for 2,000
+    stocks (3 NSE calls per symbol, 0.5s pause). Skips symbols already
+    refreshed within the staleness window. Returns 202 immediately.
+    """
+    import fundamentals as fun
+
+    if not _fundamentals_busy.acquire(blocking=False):
+        return jsonify({"status": "busy",
+                        "message": "Refresh already running."}), 409
+
+    # Get the symbol list from the engine or from the equity list
+    symbols = []
+    prices = {}
+    with engine._lock:
+        if engine.coil_stocks is not None and not engine.coil_stocks.empty:
+            last = engine.coil_stocks[
+                engine.coil_stocks["date"] == engine.coil_stocks["date"].max()
+            ]
+            symbols = list(last["symbol"].unique())
+            if "adj" in last.columns:
+                prices = dict(zip(last["symbol"], last["adj"]))
+    if not symbols:
+        try:
+            eq = fetch.fetch_equity_list()
+            symbols = list(eq["symbol"].unique())
+        except Exception:
+            pass
+    if not symbols:
+        _fundamentals_busy.release()
+        return jsonify({"error": "No symbols available"}), 400
+
+    def work():
+        try:
+            n = fun.refresh_bulk(symbols, prices=prices)
+            print(f"[cron] fundamentals: refreshed {n} symbols")
+        except Exception as exc:
+            print(f"[cron] fundamentals refresh failed: {exc}")
+        finally:
+            _fundamentals_busy.release()
+
+    threading.Thread(target=work, daemon=True).start()
+    return jsonify({
+        "status": "started",
+        "symbols": len(symbols),
+        "message": f"Refreshing fundamentals for {len(symbols)} symbols. "
+                   "This takes ~50 min. Poll /api/fundamentals/screen to "
+                   "see progress.",
+    }), 202
+
+
+# --------------------------------------------------------------------------
 # Interactive Telegram bot (webhook)
 # --------------------------------------------------------------------------
 

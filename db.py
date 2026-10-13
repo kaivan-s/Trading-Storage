@@ -1650,3 +1650,118 @@ def clear_carry_intraday(as_of: str) -> int:
     client = get_client()
     result = client.table("carry_intraday").delete().eq("as_of", as_of).execute()
     return len(result.data or [])
+
+
+# ---------------------------------------------------------------------------
+# Company Fundamentals
+# ---------------------------------------------------------------------------
+#
+# CREATE TABLE company_fundamentals (
+#     symbol              TEXT PRIMARY KEY,
+#     name                TEXT,
+#     industry            TEXT,
+#     face_value          NUMERIC,
+#     issued_shares       BIGINT,
+#     market_cap_cr       NUMERIC,
+#     pe_ttm              NUMERIC,
+#     sector_pe           NUMERIC,
+#     promoter_pct        NUMERIC,
+#     promoter_pledge_pct NUMERIC,
+#     ttm_revenue_cr      NUMERIC,
+#     ttm_pat_cr          NUMERIC,
+#     latest_revenue_growth_yoy NUMERIC,
+#     latest_pat_growth_yoy     NUMERIC,
+#     latest_opm_pct      NUMERIC,
+#     earnings_trend      TEXT,
+#     quarters            JSONB,
+#     updated_at          TIMESTAMPTZ DEFAULT NOW()
+# );
+# CREATE INDEX idx_fundamentals_mcap ON company_fundamentals(market_cap_cr);
+# CREATE INDEX idx_fundamentals_trend ON company_fundamentals(earnings_trend);
+
+
+def save_fundamentals(data: dict) -> bool:
+    """Upsert one symbol's fundamentals."""
+    symbol = data.get("symbol")
+    if not symbol:
+        return False
+
+    client = get_client()
+    rec = {
+        "symbol": symbol,
+        "name": data.get("name"),
+        "industry": data.get("industry"),
+        "face_value": _clean(data.get("face_value")),
+        "issued_shares": _int(data.get("issued_shares")),
+        "market_cap_cr": _clean(data.get("market_cap_cr")),
+        "pe_ttm": _clean(data.get("pe_ttm")),
+        "sector_pe": _clean(data.get("sector_pe")),
+        "promoter_pct": _clean(data.get("promoter_pct")),
+        "promoter_pledge_pct": _clean(data.get("promoter_pledge_pct")),
+        "ttm_revenue_cr": _clean(data.get("ttm_revenue_cr")),
+        "ttm_pat_cr": _clean(data.get("ttm_pat_cr")),
+        "latest_revenue_growth_yoy": _clean(data.get("latest_revenue_growth_yoy")),
+        "latest_pat_growth_yoy": _clean(data.get("latest_pat_growth_yoy")),
+        "latest_opm_pct": _clean(data.get("latest_opm_pct")),
+        "earnings_trend": data.get("earnings_trend"),
+        "quarters": data.get("quarters"),
+        "updated_at": data.get("updated_at") or datetime.now().isoformat(),
+    }
+
+    try:
+        result = client.table("company_fundamentals").upsert(
+            rec, on_conflict="symbol"
+        ).execute()
+        return bool(result.data)
+    except Exception as e:
+        print(f"save fundamentals {symbol}: {e}")
+        return False
+
+
+def get_fundamentals_row(symbol: str) -> dict | None:
+    """Read one symbol's cached fundamentals."""
+    client = get_client()
+    try:
+        result = (client.table("company_fundamentals")
+                  .select("*")
+                  .eq("symbol", symbol)
+                  .limit(1)
+                  .execute())
+        rows = result.data or []
+        return rows[0] if rows else None
+    except Exception as e:
+        print(f"get fundamentals {symbol}: {e}")
+        return None
+
+
+def get_all_fundamentals(limit: int = 5000) -> list[dict]:
+    """All cached fundamentals, for the screen. Paged past PostgREST cap."""
+    client = get_client()
+    out, start = [], 0
+    page = 1000
+    while True:
+        r = (client.table("company_fundamentals")
+             .select("*")
+             .order("market_cap_cr", desc=True)
+             .range(start, start + page - 1)
+             .execute())
+        batch = r.data or []
+        out.extend(batch)
+        if len(batch) < page or len(out) >= limit:
+            break
+        start += page
+    return out
+
+
+def get_fresh_fundamental_symbols(cutoff_iso: str) -> list[str]:
+    """Symbols whose fundamentals were updated after the cutoff."""
+    client = get_client()
+    try:
+        r = (client.table("company_fundamentals")
+             .select("symbol")
+             .gte("updated_at", cutoff_iso)
+             .limit(10000)
+             .execute())
+        return [row["symbol"] for row in (r.data or []) if row.get("symbol")]
+    except Exception:
+        return []
