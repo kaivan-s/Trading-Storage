@@ -1927,6 +1927,45 @@ def remove_from_watchlist(email: str, symbol: str) -> bool:
         return False
 
 
+# --------------------------------------------------------------------------
+# Stock page lookups (free-tier daily limit)
+# --------------------------------------------------------------------------
+# CREATE TABLE stock_lookups (
+#     user_email  TEXT NOT NULL,
+#     day         DATE NOT NULL,
+#     symbol      TEXT NOT NULL,
+#     looked_at   TIMESTAMPTZ DEFAULT NOW(),
+#     PRIMARY KEY (user_email, day, symbol)
+# );
+
+def get_stock_lookups(email: str, day: str) -> list[str] | None:
+    """Symbols the user opened on `day` (IST). None if the read failed."""
+    client = get_client()
+    try:
+        r = (client.table("stock_lookups")
+             .select("symbol")
+             .eq("user_email", email)
+             .eq("day", day)
+             .execute())
+        return [row["symbol"] for row in (r.data or [])]
+    except Exception as e:
+        print(f"get stock lookups: {e}")
+        return None
+
+
+def add_stock_lookup(email: str, day: str, symbol: str) -> bool:
+    client = get_client()
+    try:
+        (client.table("stock_lookups")
+         .upsert({"user_email": email, "day": day, "symbol": symbol.upper()},
+                 on_conflict="user_email,day,symbol")
+         .execute())
+        return True
+    except Exception as e:
+        print(f"add stock lookup: {e}")
+        return False
+
+
 def clear_results_calendar_future(from_date: str) -> int:
     """Delete future calendar entries before a refresh."""
     client = get_client()

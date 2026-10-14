@@ -718,6 +718,44 @@ def api_quote():
     })
 
 
+FREE_STOCK_LOOKUPS_PER_DAY = 1
+
+
+def _stock_lookup_gate(symbol: str) -> tuple[dict | None, dict | None]:
+    """(lookups_info, denial). Free users get N distinct stocks per IST day;
+    reopening one already counted today is free. Pro and local dev are
+    unlimited. If the lookups table can't be read the gate stays open, so a
+    Supabase hiccup never locks paying-tier pages for everyone."""
+    user = request.environ.get("auth_user") or {}
+    email = (user.get("email") or "").strip().lower()
+    if not email:
+        return None, None
+    try:
+        from subscription import check_subscription
+        if check_subscription(email).get("is_premium"):
+            return {"unlimited": True}, None
+    except Exception as exc:
+        print(f"stock gate subscription check: {exc}")
+
+    day = db.now_ist().date().isoformat()
+    used = db.get_stock_lookups(email, day)
+    if used is None:
+        return None, None
+    limit = FREE_STOCK_LOOKUPS_PER_DAY
+    if symbol in used:
+        return {"unlimited": False, "limit": limit, "used": used}, None
+    if len(used) >= limit:
+        return None, {
+            "error": "Daily free stock lookup used",
+            "limit_reached": True,
+            "limit": limit,
+            "used": used,
+            "symbol": symbol,
+        }
+    db.add_stock_lookup(email, day, symbol)
+    return {"unlimited": False, "limit": limit, "used": used + [symbol]}, None
+
+
 @app.get("/api/stock")
 def api_stock():
     q = (request.args.get("q") or request.args.get("symbol") or "").strip()
@@ -733,7 +771,14 @@ def api_stock():
             entry = float(raw_entry)
         except ValueError:
             return jsonify({"error": "entry must be a number"}), 400
-    return jsonify(engine.stock(q, entry=entry))
+    out = engine.stock(q, entry=entry)
+    if out.get("found") and out.get("symbol"):
+        info, denial = _stock_lookup_gate(str(out["symbol"]).upper())
+        if denial:
+            return jsonify(denial), 403
+        if info:
+            out["lookups"] = info
+    return jsonify(out)
 
 
 @app.get("/api/sector")
