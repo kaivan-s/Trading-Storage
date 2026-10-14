@@ -187,4 +187,6 @@ def me_payload() -> dict:
     if sub.get("trial"):
         result["trial"] = True
         result["trial_days_left"] = sub.get("trial_days_left", 0)
+    if sub.get("trial_used"):
+        result["trial_used"] = True
     return result
