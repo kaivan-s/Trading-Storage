@@ -38,6 +38,7 @@ import stocks as stk
 import position as posscan
 import technicals as tech
 import movers as mv
+import drivers as drv
 
 BACKEND = Path(__file__).resolve().parent
 REPO = BACKEND.parent
@@ -544,6 +545,57 @@ class Engine:
             print(f"technicals {symbol}: {exc}")
             return None
 
+    def event_drivers(self, symbol: str, filing_data: dict) -> dict:
+        """Likely driver for each notable session on the stock's chart,
+        keyed by date. Filings are only on hand for the news lookback, so
+        older sessions are read from price, volume and peers alone."""
+        with self._lock:
+            frame = self.coil_stocks if self.coil_stocks is not None else self.stocks
+            if self.status != "ready" or frame is None:
+                return {}
+            hist = frame[frame["symbol"] == symbol]
+        h = hist.sort_values("date").dropna(subset=["adj", "adj_high", "adj_low"]).reset_index(drop=True)
+        if len(h) < 30:
+            return {}
+        items = filing_data.get("filings") or []
+        have_filings = not filing_data.get("error")
+        oldest = (pd.Timestamp(db.now_ist().date())
+                  - pd.Timedelta(days=filing_data.get("lookback_days") or 0))
+        sector = h["sector"].iloc[-1] if "sector" in h.columns else None
+        try:
+            ttm = db.get_ttm_revenue([symbol]).get(symbol)
+        except Exception:
+            ttm = None
+        index = {pd.Timestamp(d).strftime("%Y-%m-%d"): i for i, d in enumerate(h["date"])}
+        out = {}
+        for ev in tech._events(h):
+            i = index.get(ev["time"])
+            if not i:
+                continue
+            f = drv.features(h, i)
+            if f is None or abs(f["ret"]) < 0.02:
+                continue
+            day = pd.Timestamp(h["date"].iloc[i])
+            prev = pd.Timestamp(h["date"].iloc[i - 1])
+            lo, hi = f"{prev:%Y-%m-%d} 15:30", f"{day:%Y-%m-%d} 15:30"
+            fl = []
+            for it in items:
+                stamp = f"{it['date']} {it['time']}"
+                if it["importance"] != "low" and lo < stamp <= hi:
+                    fl.append({**it, "after_close": it["date"] == f"{prev:%Y-%m-%d}"})
+            fl.sort(key=lambda x: 0 if x["importance"] == "high" else 1)
+            checked = "none" if not have_filings else ("filings" if day >= oldest else "older")
+            try:
+                facts = drv.research_filings(symbol, ev["time"], fl) if fl else {}
+                peers = drv.peer_context(frame, day, symbol, sector)
+                d = drv.classify(f, peers, fl, None, checked, facts, ttm)
+                d["filings"] = [{"category": x["category"], "fact": x.get("fact"), "url": x.get("url")}
+                                for x in fl[:2]]
+                out[ev["time"]] = d
+            except Exception as exc:
+                print(f"event driver {symbol} {ev['time']}: {exc}")
+        return _clean(out)
+
 
 def _clean(obj):
     if isinstance(obj, dict):
@@ -857,7 +909,13 @@ def api_stock_news():
     if not _stock_lookup_allowed(symbol):
         return jsonify({"error": "Open this stock first", "limit_reached": True}), 403
     import news
-    return jsonify(news.filings(symbol))
+    data = dict(news.filings(symbol))
+    try:
+        data["event_drivers"] = engine.event_drivers(symbol, data)
+    except Exception as exc:
+        print(f"event drivers {symbol}: {exc}")
+        data["event_drivers"] = {}
+    return jsonify(data)
 
 
 @app.get("/api/stock")

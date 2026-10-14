@@ -26,6 +26,9 @@ from datetime import datetime, time as dtime
 import numpy as np
 import pandas as pd
 
+import db
+import drivers
+import filing_facts
 import news
 from carry import _snap_band
 from fetch import BASE, NSESession
@@ -154,7 +157,8 @@ def _day_shape(r, up: bool) -> str:
     return s + "."
 
 
-def _read(r, up: bool, filings: list, deals: list, checked: str = "both") -> dict:
+def _read(r, up: bool, filings: list, deals: list, checked: str = "both",
+          driver: dict | None = None) -> dict:
     tags, detail = [], [_day_shape(r, up)]
 
     # Market / sector / stock decomposition.
@@ -194,6 +198,8 @@ def _read(r, up: bool, filings: list, deals: list, checked: str = "both") -> dic
     for f in filings[:3]:
         when = "after the previous close" if f.get("after_close") else "during the session"
         detail.append(f"Filed {when} ({f['date']} {f['time']}): {f['category']} — {f['text'] or f['title']}")
+        if f.get("fact"):
+            detail.append(f"From the filing: {f['fact']}.")
     if filings:
         tags.insert(0, filings[0]["category"])
     for d in deals[:3]:
@@ -226,6 +232,8 @@ def _read(r, up: bool, filings: list, deals: list, checked: str = "both") -> dic
                         f"(peer median {_pct(sec)}), but this moved far more. {record}")
         else:
             headline = f"Stock-specific move. {record}"
+    if driver:
+        headline = driver["why"]
 
     return {
         "symbol": r["symbol"],
@@ -247,11 +255,21 @@ def _read(r, up: bool, filings: list, deals: list, checked: str = "both") -> dic
         "sector_n": int(r["sec_n"]),
         "parts": parts,
         "headline": headline,
+        "driver": driver,
         "tags": tags,
         "detail": detail,
         "filings": filings[:3],
         "deals": deals[:3],
     }
+
+
+def _driver_counts(items: list[dict]) -> list[dict]:
+    seen: dict[str, int] = {}
+    for x in items:
+        label = (x.get("driver") or {}).get("label")
+        if label:
+            seen[label] = seen.get(label, 0) + 1
+    return [{"label": k, "n": v} for k, v in sorted(seen.items(), key=lambda kv: -kv[1])]
 
 
 # --------------------------------------------------------------------------
@@ -313,6 +331,13 @@ def build(frame: pd.DataFrame, day=None, threshold: float = THRESHOLD) -> dict:
     at_low = movers["close"] <= movers["low"] * 1.001
     snapped = movers["ret"].abs().map(_snap_band)
     movers["band"] = np.where((up & at_high) | (~up & at_low), snapped, np.nan)
+    try:
+        fno = filing_facts.fno_symbols()
+    except Exception:
+        fno = None
+    if fno:
+        # F&O stocks have no price band, so a close at +5% is not a circuit.
+        movers.loc[movers["symbol"].isin(fno), "band"] = np.nan
     movers["new_52w"] = np.where(
         up & (movers["adj"] > movers["prior_hi"]), "high",
         np.where(~up & (movers["adj"] < movers["prior_lo"]), "low", None),
@@ -328,13 +353,44 @@ def build(frame: pd.DataFrame, day=None, threshold: float = THRESHOLD) -> dict:
         filings = _filings_by_symbol(sess, prev_day, day)
         deals = _deals_by_symbol(sess, day)
 
+    hist_by = {s: g.reset_index(drop=True) for s, g in h.groupby("symbol", sort=False)}
+    try:
+        ttm = db.get_ttm_revenue(sorted(syms))
+    except Exception:
+        ttm = {}
+    day_str = day.strftime("%Y-%m-%d")
+    checked = "none" if filings is None else ("both" if deals is not None else "filings")
+
+    def driver_for(r, fl: list, dl: list) -> dict | None:
+        hs = hist_by.get(r["symbol"])
+        if hs is None or len(hs) < 2:
+            return None
+        f = drivers.features(hs, len(hs) - 1)
+        if f is None:
+            return None
+        peers = {
+            "mkt": mkt_med,
+            "sec": float(r["sec_med"]) if pd.notna(r["sec_med"]) else None,
+            "sec_n": int(r["sec_n"]),
+            "sec_up": int(r["sec_up"]) if pd.notna(r["sec_up"]) else 0,
+            "sector": r["sector"],
+        }
+        try:
+            facts = drivers.research_filings(r["symbol"], day_str, fl) if fl else {}
+        except Exception as exc:
+            print(f"movers: filing research failed for {r['symbol']}: {exc}")
+            facts = {}
+        return drivers.classify(f, peers, fl, dl if deals is not None else None, checked,
+                                facts, ttm.get(r["symbol"]))
+
     def rows(sub: pd.DataFrame, is_up: bool) -> list[dict]:
         sub = sub.sort_values("ret", ascending=not is_up)
-        checked = "none" if filings is None else ("both" if deals is not None else "filings")
-        return [
-            _read(r, is_up, (filings or {}).get(r["symbol"], []), (deals or {}).get(r["symbol"], []), checked)
-            for _, r in sub.iterrows()
-        ]
+        out = []
+        for _, r in sub.iterrows():
+            fl = (filings or {}).get(r["symbol"], [])
+            dl = (deals or {}).get(r["symbol"], [])
+            out.append(_read(r, is_up, fl, dl, checked, driver_for(r, fl, dl)))
+        return out
 
     gainers = rows(movers[up], True)
     losers = rows(movers[~up], False)
@@ -354,8 +410,10 @@ def build(frame: pd.DataFrame, day=None, threshold: float = THRESHOLD) -> dict:
             "losers": len(losers),
             "with_filing": share(gainers + losers, lambda x: bool(x["filings"])),
             "sector_wide": share(gainers + losers, lambda x: "Sector-wide move" in x["tags"]),
-            "unexplained": share(gainers + losers, lambda x: not x["filings"] and not x["deals"]
+            "unexplained": share(gainers + losers, lambda x: (x["driver"] or {}).get("key") == "unexplained"
+                                 if x["driver"] else not x["filings"] and not x["deals"]
                                  and "Sector-wide move" not in x["tags"]),
+            "drivers": _driver_counts(gainers + losers),
         },
         "gainers": gainers,
         "losers": losers,

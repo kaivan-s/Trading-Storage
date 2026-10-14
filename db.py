@@ -1779,6 +1779,21 @@ def get_fundamentals_row(symbol: str) -> dict | None:
         return None
 
 
+def get_ttm_revenue(symbols: list[str]) -> dict[str, float]:
+    """symbol -> trailing-twelve-month revenue (₹ cr) from the cache."""
+    if not symbols:
+        return {}
+    try:
+        r = (get_client().table("company_fundamentals")
+             .select("symbol,ttm_revenue_cr")
+             .in_("symbol", list(symbols))
+             .execute())
+        return {x["symbol"]: float(x["ttm_revenue_cr"]) for x in (r.data or [])
+                if x.get("ttm_revenue_cr")}
+    except Exception:
+        return {}
+
+
 def get_all_fundamentals(limit: int = 5000) -> list[dict]:
     """All cached fundamentals, for the screen. Paged past PostgREST cap."""
     client = get_client()
