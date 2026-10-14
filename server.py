@@ -36,6 +36,7 @@ import panel as pnl
 import scan as sc
 import stocks as stk
 import position as posscan
+import technicals as tech
 
 BACKEND = Path(__file__).resolve().parent
 REPO = BACKEND.parent
@@ -523,6 +524,18 @@ class Engine:
             )
             return _clean(raw)
 
+    def technicals(self, symbol: str) -> dict | None:
+        with self._lock:
+            frame = self.coil_stocks if self.coil_stocks is not None else self.stocks
+            if self.status != "ready" or frame is None:
+                return None
+            hist = frame[frame["symbol"] == symbol]
+        try:
+            return _clean(tech.build(hist))
+        except Exception as exc:
+            print(f"technicals {symbol}: {exc}")
+            return None
+
 
 def _clean(obj):
     if isinstance(obj, dict):
@@ -778,6 +791,7 @@ def api_stock():
             return jsonify(denial), 403
         if info:
             out["lookups"] = info
+        out["technicals"] = engine.technicals(str(out["symbol"]))
     return jsonify(out)
 
 
