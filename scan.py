@@ -99,8 +99,15 @@ def _is_crossing(row: pd.Series, th: Thresholds) -> bool:
     return _gate2(row, th) and _gate3(row, th)
 
 
-def _recent_crossing(hist: pd.DataFrame, th: Thresholds, window: int = 5):
-    """The most recent full crossing day in the trailing window, if there was one."""
+def _recent_crossing(hist: pd.DataFrame, th: Thresholds, window: int = 10):
+    """The most recent full crossing day in the trailing window, if there was one.
+
+    Window was 5 until Oct 2026.  A 5-session lookback expired valid
+    crossings before pullbacks had time to form — the pattern needs more
+    runway.  The orderly-pullback checks (lighter red days, breadth above
+    the floor, gate3) still do the quality control, so widening the window
+    does not lower the bar, it just gives the pattern more time to play out.
+    """
     tail = hist.iloc[-(window + 1):-1]
     if tail.empty:
         return None

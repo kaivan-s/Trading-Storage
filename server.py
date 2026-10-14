@@ -53,8 +53,14 @@ DEFAULT_LEVEL = "basic_industry"
 # because quiet accumulation is worth following. SETUP is the narrower set a
 # coil's sector must be in to reach the Setups list, and BASE is excluded
 # because there has been no expansion yet to pull back from.
+#
+# REGIME_KLASSES drives the market-regime flag and the Telegram headline:
+# only fully verified sectors. SETUP_KLASSES adds CROSSING_UNVERIFIED so
+# the Setups tab shows "Emerging" watchlist names when no verified sector
+# qualifies, without pretending the regime is bullish.
 WATCH_KLASSES = ("CROSSING", "PULLBACK", "BASE")
-SETUP_KLASSES = ("CROSSING", "PULLBACK")
+REGIME_KLASSES = ("CROSSING", "PULLBACK")
+SETUP_KLASSES = ("CROSSING", "PULLBACK", "CROSSING_UNVERIFIED")
 
 # Slack around the scorer's momentum zone when picking which symbols are
 # worth a live quote. Wider than tom.MOM_ZONE_* so an intraday move cannot
@@ -183,9 +189,11 @@ class Engine:
                 actionable = int(self.scan_rows["klass"].isin(WATCH_KLASSES).sum())
                 total_sectors = len(self.scan_rows)
                 bullish_sectors = int(
-                    self.scan_rows["klass"].isin(SETUP_KLASSES).sum()
+                    self.scan_rows["klass"].isin(REGIME_KLASSES).sum()
                 )
-            # Market regime: bullish if > 40% of sectors are in uptrend
+            # Market regime: bullish if > 40% of sectors are in uptrend.
+            # Uses REGIME_KLASSES (CROSSING + PULLBACK only), not the wider
+            # SETUP_KLASSES, so unverified expansions don't inflate the count.
             regime_ok = total_sectors == 0 or (bullish_sectors / total_sectors >= 0.4)
             return {
                 "status": self.status,
