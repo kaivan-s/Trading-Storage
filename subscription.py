@@ -99,18 +99,88 @@ def _save_subscription_to_db(email: str, is_premium: bool, plan: str | None,
         print(f"[subscription] DB write error: {e}")
 
 
+TRIAL_DAYS = 3  # free trial length for new sign-ups
+
+
+def _check_trial(customer_email: str) -> dict | None:
+    """If the user signed up within TRIAL_DAYS, return a trial result."""
+    try:
+        client = _get_supabase()
+        # auth.users isn't directly queryable via data API,
+        # so we read created_at from Supabase auth admin if available,
+        # otherwise fall back to subscriptions.created_at or None.
+        # Simplest: use the Supabase admin API via service role.
+        from supabase import Client
+        resp = client.auth.admin.get_user_by_id(
+            # We don't have the user id here — look up by email instead
+            None  # fall through to except
+        )
+    except Exception:
+        pass
+
+    # Lightweight approach: store first_seen in subscriptions table.
+    # If no subscription row exists, create one with first_seen = now.
+    try:
+        client = _get_supabase()
+        result = (client.table("subscriptions")
+                  .select("first_seen")
+                  .eq("email", customer_email.lower())
+                  .execute())
+        if result.data and result.data[0].get("first_seen"):
+            from datetime import date
+            first = str(result.data[0]["first_seen"])[:10]
+            first_date = date.fromisoformat(first)
+            today = date.today()
+            days_since = (today - first_date).days
+            if days_since < TRIAL_DAYS:
+                remaining = TRIAL_DAYS - days_since
+                trial_end = (first_date + timedelta(days=TRIAL_DAYS)).isoformat()
+                return {
+                    "is_premium": True,
+                    "plan": "trial",
+                    "expires_at": trial_end,
+                    "subscription_id": None,
+                    "trial": True,
+                    "trial_days_left": remaining,
+                }
+            return None  # trial expired
+        else:
+            # No first_seen yet — set it now (new user)
+            now_iso = datetime.now().isoformat()
+            trial_end = (datetime.now() + timedelta(days=TRIAL_DAYS)).date().isoformat()
+            client.table("subscriptions").upsert({
+                "email": customer_email.lower(),
+                "first_seen": now_iso,
+                "is_premium": False,
+                "updated_at": now_iso,
+            }, on_conflict="email").execute()
+            return {
+                "is_premium": True,
+                "plan": "trial",
+                "expires_at": trial_end,
+                "subscription_id": None,
+                "trial": True,
+                "trial_days_left": TRIAL_DAYS,
+            }
+    except Exception as e:
+        print(f"[subscription] trial check error: {e}")
+        return None
+
+
 def check_subscription(customer_email: str) -> dict:
     """
     Check if a customer has an active subscription.
     
-    Priority: 1. In-memory cache, 2. Supabase, 3. Dodo API
+    Priority: 1. In-memory cache, 2. Supabase, 3. Trial check, 4. Dodo API
     
     Returns:
         {
             "is_premium": bool,
-            "plan": "monthly" | "yearly" | None,
+            "plan": "monthly" | "yearly" | "trial" | None,
             "expires_at": ISO date string | None,
             "subscription_id": str | None,
+            "trial": bool (only when on trial),
+            "trial_days_left": int (only when on trial),
         }
     """
     default = {"is_premium": False, "plan": None, "expires_at": None, "subscription_id": None}
@@ -126,13 +196,24 @@ def check_subscription(customer_email: str) -> dict:
         if datetime.now() - cached_at < _cache_ttl:
             return cached
     
-    # 2. Check Supabase
+    # 2. Check Supabase for paid subscription
     db_result = _get_subscription_from_db(customer_email)
+    if db_result is not None and db_result.get("is_premium"):
+        _subscription_cache[cache_key] = (db_result, datetime.now())
+        return db_result
+    
+    # 3. Check trial eligibility (new users get TRIAL_DAYS free)
+    trial = _check_trial(customer_email)
+    if trial is not None and trial.get("is_premium"):
+        _subscription_cache[cache_key] = (trial, datetime.now())
+        return trial
+
+    # If we had a DB result but not premium and no trial, return it
     if db_result is not None:
         _subscription_cache[cache_key] = (db_result, datetime.now())
         return db_result
     
-    # 3. Fall back to Dodo API (first time user or DB miss)
+    # 4. Fall back to Dodo API (first time user or DB miss)
     if not DODO_API_KEY:
         return default
     

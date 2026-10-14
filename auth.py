@@ -171,7 +171,7 @@ def me_payload() -> dict:
     except Exception:
         pass
 
-    return {
+    result = {
         "id": user.get("id"),
         "email": email,
         "name": meta.get("full_name") or meta.get("name") or email,
@@ -184,3 +184,7 @@ def me_payload() -> dict:
         "telegram_linked": telegram_linked,
         "telegram_link_code": telegram_link_code,
     }
+    if sub.get("trial"):
+        result["trial"] = True
+        result["trial_days_left"] = sub.get("trial_days_left", 0)
+    return result
