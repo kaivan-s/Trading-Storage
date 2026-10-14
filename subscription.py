@@ -103,68 +103,74 @@ TRIAL_DAYS = 3  # free trial length for new sign-ups
 
 
 def _check_trial(customer_email: str) -> dict | None:
-    """If the user signed up within TRIAL_DAYS, return a trial result."""
-    try:
-        client = _get_supabase()
-        # auth.users isn't directly queryable via data API,
-        # so we read created_at from Supabase auth admin if available,
-        # otherwise fall back to subscriptions.created_at or None.
-        # Simplest: use the Supabase admin API via service role.
-        from supabase import Client
-        resp = client.auth.admin.get_user_by_id(
-            # We don't have the user id here — look up by email instead
-            None  # fall through to except
-        )
-    except Exception:
-        pass
-
-    # Lightweight approach: store first_seen in subscriptions table.
-    # If no subscription row exists, create one with first_seen = now.
+    """Return a trial result only if the user has explicitly started a trial
+    (i.e. `trial_started` is set in the subscriptions row)."""
     try:
         client = _get_supabase()
         result = (client.table("subscriptions")
-                  .select("first_seen")
+                  .select("trial_started")
                   .eq("email", customer_email.lower())
                   .execute())
-        if result.data and result.data[0].get("first_seen"):
-            from datetime import date
-            first = str(result.data[0]["first_seen"])[:10]
-            first_date = date.fromisoformat(first)
-            today = date.today()
-            days_since = (today - first_date).days
-            if days_since < TRIAL_DAYS:
-                remaining = TRIAL_DAYS - days_since
-                trial_end = (first_date + timedelta(days=TRIAL_DAYS)).isoformat()
-                return {
-                    "is_premium": True,
-                    "plan": "trial",
-                    "expires_at": trial_end,
-                    "subscription_id": None,
-                    "trial": True,
-                    "trial_days_left": remaining,
-                }
+        if not result.data or not result.data[0].get("trial_started"):
+            return None  # no trial claimed
+        from datetime import date
+        started = str(result.data[0]["trial_started"])[:10]
+        start_date = date.fromisoformat(started)
+        today = date.today()
+        days_since = (today - start_date).days
+        if days_since >= TRIAL_DAYS:
             return None  # trial expired
-        else:
-            # No first_seen yet — set it now (new user)
-            now_iso = datetime.now().isoformat()
-            trial_end = (datetime.now() + timedelta(days=TRIAL_DAYS)).date().isoformat()
-            client.table("subscriptions").upsert({
-                "email": customer_email.lower(),
-                "first_seen": now_iso,
-                "is_premium": False,
-                "updated_at": now_iso,
-            }, on_conflict="email").execute()
-            return {
-                "is_premium": True,
-                "plan": "trial",
-                "expires_at": trial_end,
-                "subscription_id": None,
-                "trial": True,
-                "trial_days_left": TRIAL_DAYS,
-            }
+        remaining = TRIAL_DAYS - days_since
+        trial_end = (start_date + timedelta(days=TRIAL_DAYS)).isoformat()
+        return {
+            "is_premium": True,
+            "plan": "trial",
+            "expires_at": trial_end,
+            "subscription_id": None,
+            "trial": True,
+            "trial_days_left": remaining,
+        }
     except Exception as e:
         print(f"[subscription] trial check error: {e}")
         return None
+
+
+def start_trial(customer_email: str) -> dict:
+    """Explicitly start a trial for the user. Returns trial info or error."""
+    if not customer_email:
+        return {"ok": False, "error": "Email required"}
+    email = customer_email.strip().lower()
+    try:
+        client = _get_supabase()
+        # Check if already used a trial
+        result = (client.table("subscriptions")
+                  .select("trial_started, is_premium")
+                  .eq("email", email)
+                  .execute())
+        if result.data and result.data[0].get("trial_started"):
+            return {"ok": False, "error": "Trial already used"}
+        # Check if already a paid subscriber
+        if result.data and result.data[0].get("is_premium"):
+            return {"ok": False, "error": "Already a premium subscriber"}
+        now_iso = datetime.now().isoformat()
+        trial_end = (datetime.now() + timedelta(days=TRIAL_DAYS)).date().isoformat()
+        client.table("subscriptions").upsert({
+            "email": email,
+            "trial_started": now_iso,
+            "updated_at": now_iso,
+        }, on_conflict="email").execute()
+        clear_cache(email)
+        return {
+            "ok": True,
+            "is_premium": True,
+            "plan": "trial",
+            "expires_at": trial_end,
+            "trial": True,
+            "trial_days_left": TRIAL_DAYS,
+        }
+    except Exception as e:
+        print(f"[subscription] start trial error: {e}")
+        return {"ok": False, "error": "Could not start trial"}
 
 
 def check_subscription(customer_email: str) -> dict:

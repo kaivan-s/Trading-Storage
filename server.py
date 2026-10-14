@@ -1835,6 +1835,20 @@ def api_feedback_submit():
     return jsonify({"ok": True})
 
 
+@app.post("/api/trial/start")
+def api_trial_start():
+    """Start a 3-day free trial for the current user."""
+    user = request.environ.get("auth_user") or {}
+    email = (user.get("email") or "").strip().lower()
+    if not email:
+        return jsonify({"error": "Sign in required"}), 401
+    from subscription import start_trial
+    result = start_trial(email)
+    if not result.get("ok"):
+        return jsonify({"error": result.get("error", "Could not start trial")}), 400
+    return jsonify(result)
+
+
 @app.get("/api/results-calendar")
 def api_results_calendar():
     """
