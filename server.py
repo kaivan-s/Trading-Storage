@@ -1814,6 +1814,27 @@ def api_watchlist_remove():
     return jsonify({"ok": ok, "symbol": symbol})
 
 
+@app.post("/api/feedback")
+def api_feedback_submit():
+    """Submit user feedback. Body: {message, category?, rating?}"""
+    user = request.environ.get("auth_user") or {}
+    email = user.get("email") or ""
+    if not email:
+        return jsonify({"error": "Sign in required"}), 401
+    body = request.get_json(silent=True) or {}
+    message = (body.get("message") or "").strip()
+    if not message:
+        return jsonify({"error": "message is required"}), 400
+    if len(message) > 5000:
+        return jsonify({"error": "Message too long (max 5,000 characters)"}), 400
+    category = (body.get("category") or "general").strip().lower()
+    rating = body.get("rating")
+    row = db.save_feedback(email, message, category, rating)
+    if row is None:
+        return jsonify({"error": "Could not save feedback"}), 500
+    return jsonify({"ok": True})
+
+
 @app.get("/api/results-calendar")
 def api_results_calendar():
     """

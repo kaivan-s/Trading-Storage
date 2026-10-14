@@ -2044,3 +2044,48 @@ def clear_results_calendar_future(from_date: str) -> int:
     except Exception as e:
         print(f"clear results_calendar: {e}")
         return 0
+
+
+# -------------------------------------------------------------------------
+# Feedback
+# -------------------------------------------------------------------------
+# CREATE TABLE feedback (
+#     id          BIGSERIAL PRIMARY KEY,
+#     user_email  TEXT NOT NULL,
+#     category    TEXT NOT NULL DEFAULT 'general',
+#     message     TEXT NOT NULL,
+#     rating      SMALLINT,
+#     created_at  TIMESTAMPTZ DEFAULT NOW()
+# );
+# CREATE INDEX idx_feedback_email ON feedback(user_email);
+
+def save_feedback(email: str, message: str, category: str = "general",
+                  rating: int | None = None) -> dict | None:
+    """Store one feedback entry. Returns the saved row or None on error."""
+    client = get_client()
+    rec = {
+        "user_email": email.strip().lower(),
+        "category": category,
+        "message": message.strip(),
+    }
+    if rating is not None:
+        rec["rating"] = max(1, min(5, int(rating)))
+    try:
+        r = client.table("feedback").insert(rec).execute()
+        return (r.data or [None])[0]
+    except Exception as e:
+        print(f"save feedback: {e}")
+        return None
+
+
+def get_feedback(email: str | None = None, limit: int = 100) -> list[dict]:
+    """Read feedback — optionally filtered to one user."""
+    client = get_client()
+    try:
+        q = client.table("feedback").select("*").order("created_at", desc=True).limit(limit)
+        if email:
+            q = q.eq("user_email", email.strip().lower())
+        return q.execute().data or []
+    except Exception as e:
+        print(f"get feedback: {e}")
+        return []
