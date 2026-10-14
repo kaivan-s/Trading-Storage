@@ -37,6 +37,7 @@ import scan as sc
 import stocks as stk
 import position as posscan
 import technicals as tech
+import movers as mv
 
 BACKEND = Path(__file__).resolve().parent
 REPO = BACKEND.parent
@@ -524,6 +525,13 @@ class Engine:
             )
             return _clean(raw)
 
+    def movers(self, day=None) -> dict | None:
+        with self._lock:
+            frame = self.coil_stocks if self.coil_stocks is not None else self.stocks
+            if self.status != "ready" or frame is None:
+                return None
+        return _clean(mv.build(frame, day))
+
     def technicals(self, symbol: str) -> dict | None:
         with self._lock:
             frame = self.coil_stocks if self.coil_stocks is not None else self.stocks
@@ -767,6 +775,89 @@ def _stock_lookup_gate(symbol: str) -> tuple[dict | None, dict | None]:
         }
     db.add_stock_lookup(email, day, symbol)
     return {"unlimited": False, "limit": limit, "used": used + [symbol]}, None
+
+
+def _stock_lookup_allowed(symbol: str) -> bool:
+    """Read-only twin of the gate, for the stock page's secondary calls:
+    a free user may load extras only for a stock already counted today."""
+    user = request.environ.get("auth_user") or {}
+    email = (user.get("email") or "").strip().lower()
+    if not email:
+        return True
+    try:
+        from subscription import check_subscription
+        if check_subscription(email).get("is_premium"):
+            return True
+    except Exception:
+        pass
+    used = db.get_stock_lookups(email, db.now_ist().date().isoformat())
+    return used is None or symbol in used
+
+
+FREE_MOVERS_PREVIEW = 5
+_movers_mem: dict[str, dict] = {}
+
+
+def _is_premium_request() -> bool:
+    user = request.environ.get("auth_user") or {}
+    email = (user.get("email") or "").strip().lower()
+    if not email:
+        return not auth.enabled()
+    try:
+        from subscription import check_subscription
+        return bool(check_subscription(email).get("is_premium"))
+    except Exception:
+        return False
+
+
+def _build_movers(day: str | None = None, save: bool = True) -> dict | None:
+    payload = engine.movers(day)
+    if payload is None:
+        return None
+    _movers_mem[payload["session_date"]] = payload
+    if save:
+        db.save_daily_movers(payload["session_date"], payload)
+    return payload
+
+
+@app.get("/api/insights/movers")
+def api_insights_movers():
+    """5%+ gainers and losers for a session, each with what coincided with
+    the move. Reads the saved payload; builds it from the panel if missing."""
+    day = (request.args.get("date") or "").strip() or None
+    key = day or (str(engine.as_of)[:10] if engine.as_of is not None else None)
+    payload = _movers_mem.get(key) if key else None
+    if payload is None:
+        payload = db.get_daily_movers(day)
+    if payload is None:
+        if engine.snapshot()["status"] != "ready":
+            return jsonify(engine.snapshot()), 202
+        try:
+            payload = _build_movers(day)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 404
+    if payload is None:
+        return jsonify({"error": "No movers data yet"}), 404
+
+    out = dict(payload)
+    out["dates"] = db.list_daily_movers_dates()
+    if not _is_premium_request():
+        for side in ("gainers", "losers"):
+            rows = payload.get(side) or []
+            out[side] = rows[:FREE_MOVERS_PREVIEW]
+            out[f"locked_{side}"] = max(0, len(rows) - FREE_MOVERS_PREVIEW)
+    return jsonify(out)
+
+
+@app.get("/api/stock/news")
+def api_stock_news():
+    symbol = (request.args.get("symbol") or "").strip().upper()
+    if not symbol:
+        return jsonify({"error": "symbol is required"}), 400
+    if not _stock_lookup_allowed(symbol):
+        return jsonify({"error": "Open this stock first", "limit_reached": True}), 403
+    import news
+    return jsonify(news.filings(symbol))
 
 
 @app.get("/api/stock")
@@ -1119,6 +1210,12 @@ def _save_post_market(force: bool = False) -> dict:
         attempt("episodes", lambda: db.save_episodes(episode_rows))
     else:
         out["episodes"] = 0
+
+    # Last: it calls NSE for filings and deals, and must not hold up the rest.
+    def movers_save():
+        p = _build_movers(str(as_of)[:10])
+        return p["counts"] if p else 0
+    attempt("movers", movers_save)
 
     print(f"[cron] post-market saved for {as_of}: {out}")
     return out

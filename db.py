@@ -1928,6 +1928,57 @@ def remove_from_watchlist(email: str, symbol: str) -> bool:
 
 
 # --------------------------------------------------------------------------
+# Daily movers (Insights): one JSON payload per session
+# --------------------------------------------------------------------------
+# CREATE TABLE daily_movers (
+#     session_date  DATE PRIMARY KEY,
+#     payload       JSONB NOT NULL,
+#     built_at      TIMESTAMPTZ DEFAULT NOW()
+# );
+
+def save_daily_movers(session_date: str, payload: dict) -> bool:
+    client = get_client()
+    try:
+        (client.table("daily_movers")
+         .upsert({"session_date": session_date, "payload": payload},
+                 on_conflict="session_date")
+         .execute())
+        return True
+    except Exception as e:
+        print(f"save daily movers: {e}")
+        return False
+
+
+def get_daily_movers(session_date: str | None = None) -> dict | None:
+    client = get_client()
+    try:
+        q = client.table("daily_movers").select("payload")
+        if session_date:
+            q = q.eq("session_date", session_date)
+        else:
+            q = q.order("session_date", desc=True).limit(1)
+        r = q.execute()
+        return (r.data or [{}])[0].get("payload")
+    except Exception as e:
+        print(f"get daily movers: {e}")
+        return None
+
+
+def list_daily_movers_dates(limit: int = 30) -> list[str]:
+    client = get_client()
+    try:
+        r = (client.table("daily_movers")
+             .select("session_date")
+             .order("session_date", desc=True)
+             .limit(limit)
+             .execute())
+        return [row["session_date"] for row in (r.data or [])]
+    except Exception as e:
+        print(f"list daily movers dates: {e}")
+        return []
+
+
+# --------------------------------------------------------------------------
 # Stock page lookups (free-tier daily limit)
 # --------------------------------------------------------------------------
 # CREATE TABLE stock_lookups (
