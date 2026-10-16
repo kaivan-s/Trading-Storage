@@ -918,6 +918,23 @@ def api_stock_news():
     return jsonify(data)
 
 
+@app.get("/api/commodities")
+def api_commodities():
+    """Commodity and macro drivers: price trend, measured stock links, news."""
+    import commodity_feed
+    return jsonify(commodity_feed.overview())
+
+
+@app.get("/api/stock/drivers")
+def api_stock_drivers():
+    """Drivers measured on this stock, plus ones its industry is expected to have."""
+    symbol = (request.args.get("symbol") or "").strip().upper()
+    if not symbol:
+        return jsonify({"error": "symbol is required"}), 400
+    import commodity_feed
+    return jsonify(commodity_feed.for_stock(symbol))
+
+
 @app.get("/api/stock")
 def api_stock():
     q = (request.args.get("q") or request.args.get("symbol") or "").strip()

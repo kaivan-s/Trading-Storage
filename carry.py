@@ -44,7 +44,7 @@ import fetch
 
 EVENT = 0.04
 BANDS = (0.05, 0.10, 0.20)
-MIN_PRICE = 20.0
+MIN_PRICE = 10.0
 MIN_TURN_LACS = 100.0
 MIN_HIST = 60
 PRE_PCHANGE = 4.5        # % -- below this no 5/10/20% band is reachable

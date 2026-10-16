@@ -26,7 +26,7 @@ import pandas as pd
 import db
 import fetch
 
-MIN_PRICE = 20.0
+MIN_PRICE = 10.0
 MIN_TURN_LACS = 100.0
 
 

@@ -1,0 +1,155 @@
+{
+  "_about": {
+    "keys": "Industry keys are NSE basic_industry names exactly as in cache/sector_map.json.",
+    "position": "input = what the industry buys; operating = policy, regulation, competition around the business itself; output = what it sells and where; customer = who buys it and what drives them; macro = economy-wide forces.",
+    "direction": "Effect on the industry when the driver RISES (or, for policy, tightens/expands as described in `why`): + helps, - hurts, mixed = depends on conditions explained in `why`.",
+    "kind": "measured = daily series, sensitivity can be estimated from prices; tracked = monthly/quarterly data, show trend only; watch = event or policy, no series.",
+    "series": "Key into `series` below, or null when no free feed exists.",
+    "customers": "industry = NSE basic_industry (drivers flow through when that industry has a profile); segment = external customer group with no NSE industry."
+  },
+
+  "series": {
+    "BRENT":   {"label": "Brent crude",                "source": "yfinance", "ticker": "BZ=F",     "freq": "daily", "unit": "USD/bbl"},
+    "RAWSUGAR":{"label": "Raw sugar (ICE No. 11)",     "source": "yfinance", "ticker": "SB=F",     "freq": "daily", "unit": "USc/lb"},
+    "USDINR":  {"label": "USD/INR",                    "source": "yfinance", "ticker": "USDINR=X", "freq": "daily", "unit": "INR"},
+    "EURINR":  {"label": "EUR/INR",                    "source": "yfinance", "ticker": "EURINR=X", "freq": "daily", "unit": "INR"},
+    "GBPINR":  {"label": "GBP/INR",                    "source": "yfinance", "ticker": "GBPINR=X", "freq": "daily", "unit": "INR"},
+    "COPPER":  {"label": "Copper (COMEX)",             "source": "yfinance", "ticker": "HG=F",     "freq": "daily", "unit": "USD/lb"},
+    "ALUM":    {"label": "Aluminium (COMEX)",          "source": "yfinance", "ticker": "ALI=F",    "freq": "daily", "unit": "USD/t"},
+    "HRC_US":  {"label": "Steel HRC (US Midwest)",     "source": "yfinance", "ticker": "HRC=F",    "freq": "daily", "unit": "USD/st",
+                "note": "Proxy only. Indian domestic HRC prices have no free daily feed."},
+    "US10Y":   {"label": "US 10-year Treasury yield",  "source": "yfinance", "ticker": "^TNX",     "freq": "daily", "unit": "%"},
+    "ACN":     {"label": "Accenture (global IT services bellwether)", "source": "yfinance", "ticker": "ACN", "freq": "daily", "unit": "USD"}
+  },
+
+  "industries": {
+
+    "Sugar": {
+      "summary": "Revenue and margins are set mostly by government policy (cane price, sugar floor price, export quotas, ethanol pricing) and the cane crop. Global sugar prices matter mainly in seasons when exports are allowed.",
+      "drivers": [
+        {"id": "cane_frp", "label": "Sugarcane price (FRP, and state-advised prices such as UP's SAP)", "position": "input", "direction": "-",
+         "why": "Cane is the bulk of production cost. Mills must pay the government-set price regardless of sugar prices, so a cane price hike without a matching sugar price increase squeezes margins.",
+         "kind": "watch", "series": null},
+        {"id": "monsoon_cane", "label": "Monsoon and rainfall in cane states (UP, Maharashtra, Karnataka)", "position": "input", "direction": "mixed",
+         "why": "Good rain means more cane and higher crushing volumes, but a bumper national crop also pushes domestic sugar prices down, partly offset if the government then allows exports.",
+         "kind": "tracked", "series": null},
+        {"id": "sugar_msp", "label": "Minimum selling price of sugar (government floor)", "position": "operating", "direction": "+",
+         "why": "Sets the floor on what mills can sell at domestically. Raising it lifts realisations across the industry.",
+         "kind": "watch", "series": null},
+        {"id": "export_policy", "label": "Sugar export quota / restrictions", "position": "operating", "direction": "+",
+         "why": "Exports clear surplus stock and support domestic prices. When exports are restricted, global prices stop mattering to Indian mills.",
+         "kind": "watch", "series": null},
+        {"id": "ethanol_policy", "label": "Ethanol blending programme and procurement price paid by oil marketing companies", "position": "operating", "direction": "+",
+         "why": "Diverting cane juice and molasses to ethanol gives mills a second, government-priced revenue stream and reduces sugar surplus. Changes to diversion limits or the ethanol price move earnings directly.",
+         "kind": "watch", "series": null},
+        {"id": "domestic_sugar", "label": "Domestic sugar price (ex-mill)", "position": "output", "direction": "+",
+         "why": "The main revenue driver for sugar sold in India.",
+         "kind": "tracked", "series": null},
+        {"id": "raw_sugar", "label": "Global raw sugar price", "position": "output", "direction": "+",
+         "why": "Sets export realisations. Relevant only when exports are allowed.",
+         "kind": "measured", "series": "RAWSUGAR"},
+        {"id": "brazil_crop", "label": "Brazil cane crush and sugar-vs-ethanol mix", "position": "output", "direction": "-",
+         "why": "Brazil is the largest exporter. A big Brazilian sugar output lowers global prices.",
+         "kind": "tracked", "series": null},
+        {"id": "crude", "label": "Crude oil", "position": "output", "direction": "+",
+         "why": "Indirect. High crude makes ethanol more attractive in Brazil, so Brazilian mills make less sugar, which supports global sugar prices. Also strengthens the case for higher ethanol procurement prices in India.",
+         "kind": "measured", "series": "BRENT"},
+        {"id": "usdinr", "label": "USD/INR", "position": "output", "direction": "+",
+         "why": "A weaker rupee raises rupee realisations on exports. Minor when exports are restricted.",
+         "kind": "measured", "series": "USDINR"}
+      ],
+      "customers": [
+        {"industry": "Refineries & Marketing", "why": "Oil marketing companies buy ethanol for blending; their procurement price and volume allocations are policy-driven."},
+        {"industry": "Packaged Foods", "why": "Bulk and industrial buyers take a large share of India's sugar."},
+        {"industry": "Other Beverages", "why": "Soft drinks and beverages are major bulk sugar buyers."},
+        {"industry": "Breweries & Distilleries", "why": "Buy molasses and alcohol from integrated sugar companies."},
+        {"segment": "Household consumers", "why": "Retail demand is stable and price-insensitive; it rarely drives the cycle."}
+      ]
+    },
+
+    "Computers - Software & Consulting": {
+      "summary": "No commodity exposure. Earnings depend on foreign clients' technology budgets (mostly US and Europe), the rupee, wage costs and visa rules, with AI-driven pricing pressure as a structural question.",
+      "drivers": [
+        {"id": "wages", "label": "Employee costs and wage hikes", "position": "input", "direction": "-",
+         "why": "People are by far the largest cost. Annual wage hikes and high attrition compress margins until offset by pricing or utilisation.",
+         "kind": "tracked", "series": null},
+        {"id": "visas", "label": "US work-visa policy (H-1B fees and caps)", "position": "input", "direction": "-",
+         "why": "Tighter or costlier visas raise onsite delivery costs, e.g. the September 2025 fee on new H-1B petitions.",
+         "kind": "watch", "series": null},
+        {"id": "ai_pricing", "label": "AI productivity passed on to clients", "position": "operating", "direction": "mixed",
+         "why": "Clients increasingly expect AI-driven savings in renewals, which shrinks revenue per contract; offset by new AI implementation work.",
+         "kind": "watch", "series": null},
+        {"id": "usdinr", "label": "USD/INR", "position": "output", "direction": "+",
+         "why": "Most revenue is billed in dollars while costs are in rupees, so a weaker rupee lifts rupee revenue and margins.",
+         "kind": "measured", "series": "USDINR"},
+        {"id": "eurinr", "label": "EUR/INR", "position": "output", "direction": "+",
+         "why": "Europe is the second-largest market for most large IT firms.",
+         "kind": "measured", "series": "EURINR"},
+        {"id": "gbpinr", "label": "GBP/INR", "position": "output", "direction": "+",
+         "why": "The UK is a significant market, particularly for banking clients.",
+         "kind": "measured", "series": "GBPINR"},
+        {"id": "global_peer", "label": "Global IT services sentiment (Accenture)", "position": "customer", "direction": "+",
+         "why": "Accenture's results and guidance are read as a signal for client technology budgets worldwide.",
+         "kind": "measured", "series": "ACN"},
+        {"id": "us_rates", "label": "US interest rates", "position": "macro", "direction": "-",
+         "why": "Higher rates squeeze clients' discretionary technology projects; cuts tend to revive them.",
+         "kind": "measured", "series": "US10Y"},
+        {"id": "us_trade_policy", "label": "US tariffs and recession risk", "position": "macro", "direction": "-",
+         "why": "Uncertainty makes clients defer new projects, especially in retail and manufacturing.",
+         "kind": "watch", "series": null}
+      ],
+      "customers": [
+        {"segment": "US and European banks and insurers (BFSI)", "why": "Usually the largest vertical; spending tracks their earnings and regulatory projects."},
+        {"segment": "Retail and consumer companies", "why": "Discretionary spenders; first to cut in a slowdown."},
+        {"segment": "Manufacturing and auto", "why": "Engineering services and ERP work; exposed to the global industrial cycle and tariffs."},
+        {"segment": "Technology and communications companies", "why": "Hi-tech clients cut vendor spend quickly when their own growth slows."}
+      ]
+    },
+
+    "Auto Components & Equipments": {
+      "summary": "Metals and rubber in, parts out to vehicle makers in India and abroad. Margins swing with raw-material costs (recovered from customers with a lag), volumes follow customers' production, and exporters carry currency and tariff exposure. Exposure varies a lot by company: per-company overrides will be needed for export share and product mix.",
+      "drivers": [
+        {"id": "steel", "label": "Steel", "position": "input", "direction": "-",
+         "why": "Main raw material for forgings, castings and structural parts. Contracts usually pass costs on with a one-quarter lag, so a spike hurts margins first and is recovered later.",
+         "kind": "measured", "series": "HRC_US"},
+        {"id": "aluminium", "label": "Aluminium", "position": "input", "direction": "-",
+         "why": "Used in die-castings and lightweight parts, increasingly so for EVs.",
+         "kind": "measured", "series": "ALUM"},
+        {"id": "copper", "label": "Copper", "position": "input", "direction": "-",
+         "why": "Wiring harnesses, motors and electrical parts; EV components use much more copper.",
+         "kind": "measured", "series": "COPPER"},
+        {"id": "rubber_crude", "label": "Natural rubber and crude-derived plastics", "position": "input", "direction": "-",
+         "why": "Seals, hoses, plastic parts. Natural rubber has no free daily feed; crude is the proxy for plastics and synthetic rubber.",
+         "kind": "measured", "series": "BRENT"},
+        {"id": "rare_earths", "label": "Rare-earth magnet supply (China export controls)", "position": "input", "direction": "-",
+         "why": "EV motors and some drivetrain parts depend on Chinese rare-earth magnets; China's 2025 export controls disrupted supply.",
+         "kind": "watch", "series": null},
+        {"id": "pli", "label": "Production-linked incentive (PLI) scheme for auto and components", "position": "operating", "direction": "+",
+         "why": "Incentives for advanced and EV components improve economics for eligible makers.",
+         "kind": "watch", "series": null},
+        {"id": "china_competition", "label": "Chinese competition and import duties", "position": "operating", "direction": "-",
+         "why": "Cheaper Chinese components pressure pricing, especially in EV parts; higher duties protect domestic makers.",
+         "kind": "watch", "series": null},
+        {"id": "eurinr", "label": "EUR/INR", "position": "output", "direction": "+",
+         "why": "Exporters to European carmakers earn more in rupees when the euro strengthens.",
+         "kind": "measured", "series": "EURINR"},
+        {"id": "usdinr", "label": "USD/INR", "position": "output", "direction": "+",
+         "why": "Exporters to North America benefit from a weaker rupee.",
+         "kind": "measured", "series": "USDINR"},
+        {"id": "us_tariffs", "label": "US tariffs on auto parts", "position": "output", "direction": "-",
+         "why": "US tariffs on imported auto parts (2025) raise costs for Indian exporters' US customers and threaten volumes.",
+         "kind": "watch", "series": null},
+        {"id": "replacement", "label": "Replacement/aftermarket demand", "position": "output", "direction": "+",
+         "why": "Steadier than new-vehicle demand; tracks the age and usage of vehicles on the road.",
+         "kind": "tracked", "series": null}
+      ],
+      "customers": [
+        {"industry": "Passenger Cars & Utility Vehicles", "why": "Largest domestic customer group for many component makers."},
+        {"industry": "2/3 Wheelers", "why": "Large volume customer; demand tracks rural income and the monsoon."},
+        {"industry": "Commercial Vehicles", "why": "Cyclical; tracks freight activity, infrastructure spending and interest rates."},
+        {"industry": "Tractors", "why": "Rural and monsoon-driven."},
+        {"segment": "Global carmakers and EV makers (Europe, North America)", "why": "Export customers; volumes follow their production schedules and EV adoption."}
+      ]
+    }
+  }
+}

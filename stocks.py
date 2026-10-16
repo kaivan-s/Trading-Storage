@@ -42,7 +42,7 @@ class CoilParams:
     vol_dryup_max: float = 1.00     # 5-day volume must be under the 20-day
     range_max: float = 0.14         # 20-day high/low spread under 14%
     min_median_turnover_lacs: float = 30.0
-    min_price: float = 20.0
+    min_price: float = 10.0
     # Sessions of the symbol's OWN history required before its gates mean
     # anything. The 200-EMA is an ewm, so it is defined on a stock's first day;
     # without this a recent listing clears the trend gate on a 40-day average

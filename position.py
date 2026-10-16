@@ -99,7 +99,7 @@ TRADING_DAYS = 252
 
 @dataclass(frozen=True)
 class PositionParams:
-    min_price: float = 20.0
+    min_price: float = 10.0
     min_median_turnover_lacs: float = 100.0
     liq_lookback: int = 60
     top_pct: float = 0.10        # keep the top decile of 12-1 momentum

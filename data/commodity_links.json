@@ -1,0 +1,225 @@
+{
+ "computed_at": "2026-10-17",
+ "window": {
+  "start": "2023-10-20",
+  "end": "2026-10-16",
+  "weeks": 157
+ },
+ "method": "Weekly returns, Nifty move removed; |t| >= 3 over the window and the same direction in both halves; confirmed by an industry peer or an expected industry exposure.",
+ "links": {
+  "BRENT": [
+   {
+    "symbol": "ONGC",
+    "industry": "Oil Exploration & Production",
+    "beta": 0.23,
+    "t": 4.9,
+    "basis": "peers"
+   },
+   {
+    "symbol": "OIL",
+    "industry": "Oil Exploration & Production",
+    "beta": 0.395,
+    "t": 4.4,
+    "basis": "peers"
+   },
+   {
+    "symbol": "BPCL",
+    "industry": "Refineries & Marketing",
+    "beta": -0.212,
+    "t": -4.3,
+    "basis": "peers"
+   },
+   {
+    "symbol": "HINDPETRO",
+    "industry": "Refineries & Marketing",
+    "beta": -0.3,
+    "t": -4.1,
+    "basis": "peers"
+   },
+   {
+    "symbol": "IOC",
+    "industry": "Refineries & Marketing",
+    "beta": -0.184,
+    "t": -3.7,
+    "basis": "peers"
+   },
+   {
+    "symbol": "INDIGO",
+    "industry": "Airline",
+    "beta": -0.173,
+    "t": -3.7,
+    "basis": "industry"
+   },
+   {
+    "symbol": "BALKRISIND",
+    "industry": "Tyres & Rubber Products",
+    "beta": -0.179,
+    "t": -3.2,
+    "basis": "industry"
+   },
+   {
+    "symbol": "PIDILITIND",
+    "industry": "Specialty Chemicals",
+    "beta": -0.097,
+    "t": -3.2,
+    "basis": "industry"
+   },
+   {
+    "symbol": "KANSAINER",
+    "industry": "Paints",
+    "beta": -0.145,
+    "t": -3.1,
+    "basis": "industry"
+   }
+  ],
+  "NATGAS": [],
+  "GOLD": [
+   {
+    "symbol": "MUTHOOTFIN",
+    "industry": "Non Banking Financial Company (NBFC)",
+    "beta": 0.363,
+    "t": 3.4,
+    "basis": "industry"
+   }
+  ],
+  "SILVER": [
+   {
+    "symbol": "HINDZINC",
+    "industry": "Zinc",
+    "beta": 0.404,
+    "t": 5.5,
+    "basis": "industry"
+   },
+   {
+    "symbol": "VEDL",
+    "industry": "Diversified Metals",
+    "beta": 0.319,
+    "t": 5.2,
+    "basis": "industry"
+   },
+   {
+    "symbol": "NATIONALUM",
+    "industry": "Aluminium",
+    "beta": 0.267,
+    "t": 3.6,
+    "basis": "peers"
+   },
+   {
+    "symbol": "HINDALCO",
+    "industry": "Aluminium",
+    "beta": 0.161,
+    "t": 3.4,
+    "basis": "peers"
+   }
+  ],
+  "COPPER": [
+   {
+    "symbol": "VEDL",
+    "industry": "Diversified Metals",
+    "beta": 0.344,
+    "t": 3.6,
+    "basis": "industry"
+   },
+   {
+    "symbol": "HINDALCO",
+    "industry": "Aluminium",
+    "beta": 0.248,
+    "t": 3.5,
+    "basis": "peers"
+   },
+   {
+    "symbol": "HINDCOPPER",
+    "industry": "Copper",
+    "beta": 0.406,
+    "t": 3.3,
+    "basis": "industry"
+   },
+   {
+    "symbol": "NATIONALUM",
+    "industry": "Aluminium",
+    "beta": 0.349,
+    "t": 3.1,
+    "basis": "peers"
+   }
+  ],
+  "ALUM": [
+   {
+    "symbol": "HINDALCO",
+    "industry": "Aluminium",
+    "beta": 0.536,
+    "t": 7.4,
+    "basis": "peers"
+   },
+   {
+    "symbol": "NATIONALUM",
+    "industry": "Aluminium",
+    "beta": 0.693,
+    "t": 5.8,
+    "basis": "peers"
+   },
+   {
+    "symbol": "VEDL",
+    "industry": "Diversified Metals",
+    "beta": 0.53,
+    "t": 5.1,
+    "basis": "industry"
+   }
+  ],
+  "SUGAR": [
+   {
+    "symbol": "UTTAMSUGAR",
+    "industry": "Sugar",
+    "beta": 0.468,
+    "t": 3.6,
+    "basis": "peers"
+   },
+   {
+    "symbol": "BALRAMCHIN",
+    "industry": "Sugar",
+    "beta": 0.303,
+    "t": 3.4,
+    "basis": "peers"
+   },
+   {
+    "symbol": "AVADHSUGAR",
+    "industry": "Sugar",
+    "beta": 0.439,
+    "t": 3.2,
+    "basis": "peers"
+   },
+   {
+    "symbol": "DALMIASUG",
+    "industry": "Sugar",
+    "beta": 0.32,
+    "t": 3.0,
+    "basis": "peers"
+   }
+  ],
+  "COTTON": [
+   {
+    "symbol": "ARVIND",
+    "industry": "Garments & Apparels",
+    "beta": -0.447,
+    "t": -3.6,
+    "basis": "industry"
+   },
+   {
+    "symbol": "AYMSYNTEX",
+    "industry": "Other Textile Products",
+    "beta": -0.625,
+    "t": -3.5,
+    "basis": "industry"
+   }
+  ],
+  "USDINR": [
+   {
+    "symbol": "BIOCON",
+    "industry": "Pharmaceuticals",
+    "beta": 1.96,
+    "t": 3.3,
+    "basis": "industry"
+   }
+  ],
+  "US10Y": []
+ }
+}
