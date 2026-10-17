@@ -1994,6 +1994,53 @@ def list_daily_movers_dates(limit: int = 30) -> list[str]:
 
 
 # --------------------------------------------------------------------------
+# Commodity/macro driver headlines: one row per article, kept as an archive
+# --------------------------------------------------------------------------
+# CREATE TABLE commodity_news (
+#     driver        TEXT NOT NULL,
+#     url           TEXT NOT NULL,
+#     title         TEXT NOT NULL,
+#     source        TEXT,
+#     published_at  TIMESTAMPTZ,
+#     fetched_at    TIMESTAMPTZ DEFAULT NOW(),
+#     PRIMARY KEY (driver, url)
+# );
+# CREATE INDEX commodity_news_recent ON commodity_news (published_at DESC);
+
+def save_commodity_news(rows: list[dict]) -> int | None:
+    """Insert new articles; ones already stored keep their first fetched_at.
+    Returns the number of rows sent, or None if the write failed."""
+    if not rows:
+        return 0
+    client = get_client()
+    try:
+        (client.table("commodity_news")
+         .upsert(rows, on_conflict="driver,url", ignore_duplicates=True)
+         .execute())
+        return len(rows)
+    except Exception as e:
+        print(f"save commodity news: {e}")
+        return None
+
+
+def get_commodity_news(days: int = 14, limit: int = 600) -> list[dict] | None:
+    """Recent articles for all drivers, newest first. None if the read failed."""
+    client = get_client()
+    since = (pd.Timestamp.utcnow() - pd.Timedelta(days=days)).isoformat()
+    try:
+        r = (client.table("commodity_news")
+             .select("driver,url,title,source,published_at,fetched_at")
+             .gte("published_at", since)
+             .order("published_at", desc=True)
+             .limit(limit)
+             .execute())
+        return r.data or []
+    except Exception as e:
+        print(f"get commodity news: {e}")
+        return None
+
+
+# --------------------------------------------------------------------------
 # Stock page lookups (free-tier daily limit)
 # --------------------------------------------------------------------------
 # CREATE TABLE stock_lookups (

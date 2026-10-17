@@ -4,16 +4,17 @@ Live side of the commodities view: prices, news, and per-stock drivers.
 Prices come from yfinance (cached 30 min). Stock links are read from
 data/commodity_links.json, which `commodities.py export` writes offline.
 
-News comes from GDELT, which allows commercial use but limits callers to one
-request every few seconds and often answers 429 regardless. So news is never
-fetched in the request path: a single background thread refreshes stale
-drivers one at a time, and requests serve whatever is cached. A driver with no
-news yet says so instead of blocking the page.
+News comes from Finlight (FINLIGHT_API_KEY). It is never fetched in the
+request path: POST /api/cron/commodity-news calls refresh_news(), which stores
+articles in the commodity_news table, and pages read the last 14 days from
+there. One cron run is 10 Finlight calls; every 3 hours that is ~2,400 a
+month, inside the free plan's 5,000.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 import time
@@ -28,18 +29,19 @@ import commodities as cm
 warnings.filterwarnings("ignore")
 
 PRICE_TTL = 30 * 60
-NEWS_TTL = 3 * 60 * 60
-NEWS_RETRY = 15 * 60
-NEWS_GAP = 7.0
+NEWS_CACHE = 5 * 60
+NEWS_GAP = 1.0
 NEWS_MAX = 6
-GDELT = "https://api.gdeltproject.org/api/v2/doc/doc"
+FINLIGHT = "https://api.finlight.me/v2/articles"
+# Press-release wires: company announcements, not market news.
+NEWS_EXCLUDE = " AND ".join(f"-source:{s}" for s in (
+    "www.prnewswire.com", "www.accessnewswire.com", "www.globenewswire.com", "www.businesswire.com"))
 
 _price_lock = threading.Lock()
 _prices: tuple[float, dict] | None = None
 
 _news_lock = threading.Lock()
-_news: dict[str, dict] = {}
-_worker: threading.Thread | None = None
+_news: tuple[float, dict] | None = None
 
 _links: dict | None = None
 
@@ -117,80 +119,75 @@ def _norm_title(t: str) -> str:
 
 
 def _fetch_news(query: str) -> tuple[list[dict] | None, str]:
+    key = os.environ.get("FINLIGHT_API_KEY", "").strip()
+    if not key:
+        return None, "FINLIGHT_API_KEY not set"
     try:
-        r = requests.get(GDELT, params={
-            "query": f"{query} sourcelang:english", "mode": "artlist", "format": "json",
-            "maxrecords": 40, "timespan": "3d", "sort": "hybridrel"}, timeout=20)
+        r = requests.post(FINLIGHT, json={
+            "query": f"({query}) AND {NEWS_EXCLUDE}", "language": "en", "pageSize": 20},
+            headers={"X-API-KEY": key}, timeout=20)
     except requests.RequestException as exc:
         return None, f"unreachable: {exc.__class__.__name__}"
-    if r.status_code == 429:
-        return None, "rate limited"
+    if r.status_code != 200:
+        return None, f"HTTP {r.status_code}"
     try:
         arts = r.json().get("articles", [])
     except ValueError:
-        return None, f"bad response ({r.status_code})"
-    seen, items = set(), []
-    for a in arts:
-        key = _norm_title(a.get("title", ""))[:80]
-        if not key or key in seen:
+        return None, "bad response"
+    return [{
+        "title": a["title"].strip(),
+        "url": a["link"],
+        "source": (a.get("source") or "").removeprefix("www."),
+        "published_at": a.get("publishDate"),
+    } for a in arts if a.get("title") and a.get("link")], "ok"
+
+
+def refresh_news() -> dict:
+    """Fetch every driver once and store new articles. Called by the cron."""
+    import db
+    out = {}
+    for key, _, _, query in cm.DISPLAY:
+        items, status = _fetch_news(query)
+        if items is None:
+            out[key] = status
+        else:
+            n = db.save_commodity_news([{**i, "driver": key} for i in items])
+            out[key] = "save failed" if n is None else n
+        time.sleep(NEWS_GAP)
+    global _news
+    _news = None
+    return out
+
+
+def _load_news() -> dict[str, dict]:
+    import db
+    rows = db.get_commodity_news()
+    if rows is None:
+        return {}
+    by: dict[str, dict] = {}
+    for r in rows:
+        n = by.setdefault(r["driver"], {"items": [], "seen": set(), "fetched": None})
+        n["fetched"] = max(filter(None, [n["fetched"], r.get("fetched_at")]), default=None)
+        # Syndicated stories run under several outlets with the same headline.
+        norm = _norm_title(r["title"])[:80]
+        if norm in n["seen"] or len(n["items"]) >= NEWS_MAX:
             continue
-        seen.add(key)
-        d = a.get("seendate", "")
-        items.append({
-            "title": a.get("title", "").strip(),
-            "url": a.get("url"),
-            "source": a.get("domain"),
-            "date": f"{d[:4]}-{d[4:6]}-{d[6:8]}" if len(d) >= 8 else None,
-        })
-        if len(items) >= NEWS_MAX:
-            break
-    return items, "ok"
-
-
-def _stale_keys() -> list[str]:
-    now = time.monotonic()
-    with _news_lock:
-        return [k for k, *_ in cm.DISPLAY
-                if _news.get(k, {}).get("next", 0) <= now]
-
-
-def _work() -> None:
-    queries = {k: q for k, _, _, q in cm.DISPLAY}
-    while True:
-        keys = _stale_keys()
-        if not keys:
-            time.sleep(60)
-            continue
-        for key in keys:
-            items, status = _fetch_news(queries[key])
-            now = time.monotonic()
-            with _news_lock:
-                prev = _news.get(key, {})
-                if items is not None:
-                    _news[key] = {"items": items, "status": "ok",
-                                  "fetched": time.time(), "next": now + NEWS_TTL}
-                else:
-                    # Keep serving older headlines when a refresh fails.
-                    _news[key] = {"items": prev.get("items", []), "status": status,
-                                  "fetched": prev.get("fetched"), "next": now + NEWS_RETRY}
-            # A 429 usually means GDELT wants a longer pause than its stated limit.
-            time.sleep(NEWS_GAP * (8 if status == "rate limited" else 1))
-
-
-def _ensure_worker() -> None:
-    global _worker
-    if _worker is None or not _worker.is_alive():
-        _worker = threading.Thread(target=_work, daemon=True, name="commodity-news")
-        _worker.start()
+        n["seen"].add(norm)
+        n["items"].append({"title": r["title"], "url": r["url"], "source": r["source"],
+                           "date": (r.get("published_at") or "")[:10] or None})
+    return by
 
 
 def news(key: str) -> dict:
-    _ensure_worker()
+    global _news
+    now = time.monotonic()
     with _news_lock:
-        n = _news.get(key)
+        if _news is None or _news[0] <= now:
+            _news = (now + NEWS_CACHE, _load_news())
+        n = _news[1].get(key)
     if not n:
-        return {"items": [], "status": "loading", "fetched": None}
-    return {"items": n["items"], "status": n["status"], "fetched": n["fetched"]}
+        return {"items": [], "status": "ok", "fetched": None}
+    return {"items": n["items"], "status": "ok", "fetched": n["fetched"]}
 
 
 # --------------------------------------------------------------------------

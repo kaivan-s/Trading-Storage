@@ -925,6 +925,28 @@ def api_commodities():
     return jsonify(commodity_feed.overview())
 
 
+_commodity_news_busy = threading.Lock()
+
+
+@app.post("/api/cron/commodity-news")
+def api_cron_commodity_news():
+    """
+    Fetch headlines for every commodity/macro driver and store new ones.
+
+    POST /api/cron/commodity-news
+
+    Run every 3 hours. Ten Finlight calls, ~15 s. Returns new-or-seen article
+    counts per driver, or the error for drivers whose fetch failed.
+    """
+    if not _commodity_news_busy.acquire(blocking=False):
+        return jsonify({"status": "busy"}), 409
+    try:
+        import commodity_feed
+        return jsonify({"status": "ok", "drivers": commodity_feed.refresh_news()})
+    finally:
+        _commodity_news_busy.release()
+
+
 @app.get("/api/stock/drivers")
 def api_stock_drivers():
     """Drivers measured on this stock, plus ones its industry is expected to have."""

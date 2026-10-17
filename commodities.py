@@ -69,17 +69,19 @@ TICKERS = {k: t for k, _, t, _ in DRIVERS}
 # Drivers shown in the product: (key, group, unit, news query). The rest of
 # DRIVERS stay in the research run but showed nothing stable, or matter little
 # to Indian listed companies.
+# Queries use Finlight's syntax. `category:commodities` keeps out same-word
+# noise (blood sugar, Senator Cotton, gold medals).
 DISPLAY = [
-    ("BRENT",  "Energy",          "USD/bbl", '("crude oil" OR "oil prices" OR OPEC OR Brent)'),
-    ("NATGAS", "Energy",          "USD/MMBtu", '("natural gas prices" OR "LNG prices" OR "gas supply")'),
-    ("GOLD",   "Precious metals", "USD/oz",  '("gold price" OR "gold prices")'),
-    ("SILVER", "Precious metals", "USD/oz",  '("silver price" OR "silver prices")'),
-    ("COPPER", "Base metals",     "USD/lb",  '("copper price" OR "copper prices" OR "copper supply")'),
-    ("ALUM",   "Base metals",     "USD/t",   '("aluminium prices" OR "aluminum prices" OR "aluminium price" OR "aluminum price")'),
-    ("SUGAR",  "Agri",            "USc/lb",  '("sugar prices" OR "sugar exports" OR "ethanol blending" OR "sugar production")'),
-    ("COTTON", "Agri",            "USc/lb",  '("cotton prices" OR "cotton crop" OR "cotton imports")'),
-    ("USDINR", "Currency & rates", "INR",    '(rupee (dollar OR forex OR RBI)) sourcecountry:IN'),
-    ("US10Y",  "Currency & rates", "%",      '("Treasury yields" OR "Federal Reserve" OR "Fed rate")'),
+    ("BRENT",  "Energy",          "USD/bbl", '(title:crude OR title:brent OR title:"oil prices" OR title:opec)'),
+    ("NATGAS", "Energy",          "USD/MMBtu", '(title:"natural gas" OR title:lng) AND category:commodities'),
+    ("GOLD",   "Precious metals", "USD/oz",  '(title:gold OR title:bullion) AND category:commodities'),
+    ("SILVER", "Precious metals", "USD/oz",  'title:silver AND category:commodities'),
+    ("COPPER", "Base metals",     "USD/lb",  'title:copper AND category:commodities'),
+    ("ALUM",   "Base metals",     "USD/t",   '(title:aluminium OR title:aluminum) AND category:commodities'),
+    ("SUGAR",  "Agri",            "USc/lb",  '(title:sugar OR title:ethanol) AND category:commodities'),
+    ("COTTON", "Agri",            "USc/lb",  'title:cotton AND category:commodities'),
+    ("USDINR", "Currency & rates", "INR",    'title:rupee'),
+    ("US10Y",  "Currency & rates", "%",      '(title:"treasury yields" OR title:"10-year yield" OR title:treasuries)'),
 ]
 
 # Industries with a known, argued-for exposure to a driver. A stable link from
