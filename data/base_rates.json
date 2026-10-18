@@ -1,0 +1,1264 @@
+{
+ "computed_at": "2026-10-18",
+ "window": {
+  "start": "2024-04-15",
+  "end": "2026-10-14"
+ },
+ "horizons": [
+  5,
+  20
+ ],
+ "method": "Every 5%+ move since the window start, labelled by the Insights classifier. Return from the next session's open; percentile ranks it among all stocks over the same days (50 = ordinary).",
+ "rates": {
+  "Agreement / MoU|up": {
+   "label": "Agreement / MoU",
+   "direction": "up",
+   "key": "filing",
+   "h5": {
+    "n": 51,
+    "median_ret": 0.17,
+    "worst10": -10.0,
+    "best10": 12.4,
+    "pctile": 47.2,
+    "bottom_half": 49.0,
+    "t": -0.6,
+    "verdict": "mixed"
+   },
+   "h20": {
+    "n": 50,
+    "median_ret": -2.08,
+    "worst10": -18.0,
+    "best10": 20.0,
+    "pctile": 39.9,
+    "bottom_half": 68.0,
+    "t": -2.2,
+    "verdict": "mixed"
+   }
+  },
+  "Board decision|down": {
+   "label": "Board decision",
+   "direction": "down",
+   "key": "filing",
+   "h5": {
+    "n": 190,
+    "median_ret": -1.3,
+    "worst10": -9.1,
+    "best10": 7.7,
+    "pctile": 43.5,
+    "bottom_half": 58.0,
+    "t": -2.5,
+    "verdict": "mixed"
+   },
+   "h20": {
+    "n": 188,
+    "median_ret": -0.68,
+    "worst10": -14.6,
+    "best10": 17.1,
+    "pctile": 45.3,
+    "bottom_half": 62.0,
+    "t": -1.8,
+    "verdict": "mixed"
+   }
+  },
+  "Board decision|up": {
+   "label": "Board decision",
+   "direction": "up",
+   "key": "filing",
+   "h5": {
+    "n": 329,
+    "median_ret": -0.74,
+    "worst10": -9.7,
+    "best10": 9.2,
+    "pctile": 44.7,
+    "bottom_half": 55.0,
+    "t": -2.4,
+    "verdict": "mixed"
+   },
+   "h20": {
+    "n": 320,
+    "median_ret": 0.44,
+    "worst10": -15.5,
+    "best10": 20.2,
+    "pctile": 44.8,
+    "bottom_half": 55.0,
+    "t": -2.4,
+    "verdict": "mixed"
+   }
+  },
+  "Breakdown from a range|down": {
+   "label": "Breakdown from a range",
+   "direction": "down",
+   "key": "breakdown",
+   "h5": {
+    "n": 993,
+    "median_ret": 0.14,
+    "worst10": -7.4,
+    "best10": 8.9,
+    "pctile": 50.5,
+    "bottom_half": 46.0,
+    "t": 0.4,
+    "verdict": "mixed"
+   },
+   "h20": {
+    "n": 947,
+    "median_ret": -0.34,
+    "worst10": -13.8,
+    "best10": 17.0,
+    "pctile": 48.4,
+    "bottom_half": 47.0,
+    "t": -1.3,
+    "verdict": "mixed"
+   }
+  },
+  "Breakout from a base|up": {
+   "label": "Breakout from a base",
+   "direction": "up",
+   "key": "breakout",
+   "h5": {
+    "n": 2466,
+    "median_ret": -1.03,
+    "worst10": -8.2,
+    "best10": 7.8,
+    "pctile": 47.8,
+    "bottom_half": 52.0,
+    "t": -2.4,
+    "verdict": "mixed"
+   },
+   "h20": {
+    "n": 2394,
+    "median_ret": -1.64,
+    "worst10": -13.5,
+    "best10": 15.5,
+    "pctile": 49.7,
+    "bottom_half": 50.0,
+    "t": -0.3,
+    "verdict": "mixed"
+   }
+  },
+  "Company update|down": {
+   "label": "Company update",
+   "direction": "down",
+   "key": "filing",
+   "h5": {
+    "n": 302,
+    "median_ret": -0.82,
+    "worst10": -8.0,
+    "best10": 10.9,
+    "pctile": 49.1,
+    "bottom_half": 50.0,
+    "t": -0.4,
+    "verdict": "mixed"
+   },
+   "h20": {
+    "n": 294,
+    "median_ret": -0.11,
+    "worst10": -15.1,
+    "best10": 20.1,
+    "pctile": 48.5,
+    "bottom_half": 49.0,
+    "t": -0.7,
+    "verdict": "mixed"
+   }
+  },
+  "Company update|up": {
+   "label": "Company update",
+   "direction": "up",
+   "key": "filing",
+   "h5": {
+    "n": 615,
+    "median_ret": -0.8,
+    "worst10": -8.7,
+    "best10": 9.2,
+    "pctile": 48.7,
+    "bottom_half": 52.0,
+    "t": -0.8,
+    "verdict": "mixed"
+   },
+   "h20": {
+    "n": 604,
+    "median_ret": -1.9,
+    "worst10": -14.5,
+    "best10": 18.3,
+    "pctile": 46.2,
+    "bottom_half": 57.0,
+    "t": -2.5,
+    "verdict": "mixed"
+   }
+  },
+  "Corporate action|up": {
+   "label": "Corporate action",
+   "direction": "up",
+   "key": "filing",
+   "h5": {
+    "n": 59,
+    "median_ret": -2.8,
+    "worst10": -13.2,
+    "best10": 4.9,
+    "pctile": 38.3,
+    "bottom_half": 59.0,
+    "t": -2.4,
+    "verdict": "mixed"
+   },
+   "h20": {
+    "n": 55,
+    "median_ret": -5.39,
+    "worst10": -25.3,
+    "best10": 19.0,
+    "pctile": 37.6,
+    "bottom_half": 62.0,
+    "t": -2.7,
+    "verdict": "mixed"
+   }
+  },
+  "Corporate deal|down": {
+   "label": "Corporate deal",
+   "direction": "down",
+   "key": "filing",
+   "h5": {
+    "n": 59,
+    "median_ret": -0.23,
+    "worst10": -7.0,
+    "best10": 13.9,
+    "pctile": 46.4,
+    "bottom_half": 53.0,
+    "t": -0.8,
+    "verdict": "mixed"
+   },
+   "h20": {
+    "n": 56,
+    "median_ret": 2.29,
+    "worst10": -8.4,
+    "best10": 27.2,
+    "pctile": 48.0,
+    "bottom_half": 50.0,
+    "t": -0.4,
+    "verdict": "mixed"
+   }
+  },
+  "Corporate deal|up": {
+   "label": "Corporate deal",
+   "direction": "up",
+   "key": "filing",
+   "h5": {
+    "n": 126,
+    "median_ret": -0.89,
+    "worst10": -8.8,
+    "best10": 8.4,
+    "pctile": 43.9,
+    "bottom_half": 56.0,
+    "t": -2.0,
+    "verdict": "mixed"
+   },
+   "h20": {
+    "n": 118,
+    "median_ret": -2.26,
+    "worst10": -15.2,
+    "best10": 16.2,
+    "pctile": 41.9,
+    "bottom_half": 60.0,
+    "t": -2.8,
+    "verdict": "mixed"
+   }
+  },
+  "Credit rating change|down": {
+   "label": "Credit rating change",
+   "direction": "down",
+   "key": "filing",
+   "h5": {
+    "n": 66,
+    "median_ret": 1.13,
+    "worst10": -8.4,
+    "best10": 11.9,
+    "pctile": 45.5,
+    "bottom_half": 47.0,
+    "t": -1.0,
+    "verdict": "mixed"
+   },
+   "h20": {
+    "n": 61,
+    "median_ret": 1.15,
+    "worst10": -12.1,
+    "best10": 21.5,
+    "pctile": 49.8,
+    "bottom_half": 54.0,
+    "t": -0.0,
+    "verdict": "mixed"
+   }
+  },
+  "Credit rating change|up": {
+   "label": "Credit rating change",
+   "direction": "up",
+   "key": "filing",
+   "h5": {
+    "n": 146,
+    "median_ret": -0.81,
+    "worst10": -8.8,
+    "best10": 11.0,
+    "pctile": 45.5,
+    "bottom_half": 53.0,
+    "t": -1.5,
+    "verdict": "mixed"
+   },
+   "h20": {
+    "n": 140,
+    "median_ret": 1.13,
+    "worst10": -12.2,
+    "best10": 20.9,
+    "pctile": 50.9,
+    "bottom_half": 51.0,
+    "t": 0.3,
+    "verdict": "mixed"
+   }
+  },
+  "Delivery-led buying|up": {
+   "label": "Delivery-led buying",
+   "direction": "up",
+   "key": "delivery",
+   "h5": {
+    "n": 738,
+    "median_ret": -1.88,
+    "worst10": -9.4,
+    "best10": 9.7,
+    "pctile": 44.8,
+    "bottom_half": 57.0,
+    "t": -3.5,
+    "verdict": "lagged"
+   },
+   "h20": {
+    "n": 707,
+    "median_ret": -2.63,
+    "worst10": -15.7,
+    "best10": 17.9,
+    "pctile": 47.5,
+    "bottom_half": 56.0,
+    "t": -1.8,
+    "verdict": "mixed"
+   }
+  },
+  "Delivery-led selling|down": {
+   "label": "Delivery-led selling",
+   "direction": "down",
+   "key": "delivery",
+   "h5": {
+    "n": 597,
+    "median_ret": -0.12,
+    "worst10": -7.7,
+    "best10": 11.6,
+    "pctile": 52.2,
+    "bottom_half": 46.0,
+    "t": 1.4,
+    "verdict": "mixed"
+   },
+   "h20": {
+    "n": 577,
+    "median_ret": 0.65,
+    "worst10": -15.7,
+    "best10": 23.7,
+    "pctile": 49.6,
+    "bottom_half": 49.0,
+    "t": -0.3,
+    "verdict": "mixed"
+   }
+  },
+  "Disclosure under SEBI Takeover Regulations|up": {
+   "label": "Disclosure under SEBI Takeover Regulations",
+   "direction": "up",
+   "key": "filing",
+   "h5": {
+    "n": 83,
+    "median_ret": -1.09,
+    "worst10": -9.7,
+    "best10": 6.3,
+    "pctile": 41.0,
+    "bottom_half": 55.0,
+    "t": -2.2,
+    "verdict": "mixed"
+   },
+   "h20": {
+    "n": 83,
+    "median_ret": 1.24,
+    "worst10": -15.4,
+    "best10": 19.3,
+    "pctile": 45.9,
+    "bottom_half": 52.0,
+    "t": -1.0,
+    "verdict": "mixed"
+   }
+  },
+  "Downtrend continuing|down": {
+   "label": "Downtrend continuing",
+   "direction": "down",
+   "key": "trend",
+   "h5": {
+    "n": 365,
+    "median_ret": 0.69,
+    "worst10": -7.9,
+    "best10": 12.7,
+    "pctile": 53.0,
+    "bottom_half": 48.0,
+    "t": 1.3,
+    "verdict": "mixed"
+   },
+   "h20": {
+    "n": 358,
+    "median_ret": 1.7,
+    "worst10": -17.9,
+    "best10": 24.5,
+    "pctile": 49.2,
+    "bottom_half": 46.0,
+    "t": -0.4,
+    "verdict": "mixed"
+   }
+  },
+  "Fell below the 200-day average|down": {
+   "label": "Fell below the 200-day average",
+   "direction": "down",
+   "key": "breakdown",
+   "h5": {
+    "n": 370,
+    "median_ret": -1.23,
+    "worst10": -10.4,
+    "best10": 7.6,
+    "pctile": 45.7,
+    "bottom_half": 55.0,
+    "t": -2.1,
+    "verdict": "mixed"
+   },
+   "h20": {
+    "n": 361,
+    "median_ret": -3.68,
+    "worst10": -16.7,
+    "best10": 13.5,
+    "pctile": 43.1,
+    "bottom_half": 59.0,
+    "t": -3.7,
+    "verdict": "lagged"
+   }
+  },
+  "Fresh 52-week high|up": {
+   "label": "Fresh 52-week high",
+   "direction": "up",
+   "key": "breakout",
+   "h5": {
+    "n": 1169,
+    "median_ret": -0.82,
+    "worst10": -9.4,
+    "best10": 9.5,
+    "pctile": 47.7,
+    "bottom_half": 52.0,
+    "t": -1.6,
+    "verdict": "mixed"
+   },
+   "h20": {
+    "n": 1136,
+    "median_ret": -0.42,
+    "worst10": -15.4,
+    "best10": 21.3,
+    "pctile": 51.6,
+    "bottom_half": 47.0,
+    "t": 1.2,
+    "verdict": "mixed"
+   }
+  },
+  "Gap down on outside news|down": {
+   "label": "Gap down on outside news",
+   "direction": "down",
+   "key": "gap",
+   "h5": {
+    "n": 331,
+    "median_ret": -1.85,
+    "worst10": -12.4,
+    "best10": 8.7,
+    "pctile": 39.3,
+    "bottom_half": 60.0,
+    "t": -5.0,
+    "verdict": "lagged"
+   },
+   "h20": {
+    "n": 320,
+    "median_ret": -3.21,
+    "worst10": -21.0,
+    "best10": 16.5,
+    "pctile": 41.8,
+    "bottom_half": 59.0,
+    "t": -3.8,
+    "verdict": "lagged"
+   }
+  },
+  "Gap up on outside news|up": {
+   "label": "Gap up on outside news",
+   "direction": "up",
+   "key": "gap",
+   "h5": {
+    "n": 781,
+    "median_ret": -0.33,
+    "worst10": -9.5,
+    "best10": 10.7,
+    "pctile": 44.1,
+    "bottom_half": 55.0,
+    "t": -3.3,
+    "verdict": "lagged"
+   },
+   "h20": {
+    "n": 762,
+    "median_ret": -1.41,
+    "worst10": -16.1,
+    "best10": 21.4,
+    "pctile": 45.1,
+    "bottom_half": 56.0,
+    "t": -2.8,
+    "verdict": "mixed"
+   }
+  },
+  "Heavy intraday trading|down": {
+   "label": "Heavy intraday trading",
+   "direction": "down",
+   "key": "churn",
+   "h5": {
+    "n": 324,
+    "median_ret": -2.41,
+    "worst10": -10.3,
+    "best10": 7.6,
+    "pctile": 40.1,
+    "bottom_half": 64.0,
+    "t": -4.7,
+    "verdict": "lagged"
+   },
+   "h20": {
+    "n": 314,
+    "median_ret": -3.27,
+    "worst10": -17.4,
+    "best10": 13.7,
+    "pctile": 44.0,
+    "bottom_half": 61.0,
+    "t": -3.0,
+    "verdict": "mixed"
+   }
+  },
+  "Heavy intraday trading|up": {
+   "label": "Heavy intraday trading",
+   "direction": "up",
+   "key": "churn",
+   "h5": {
+    "n": 3920,
+    "median_ret": -1.53,
+    "worst10": -9.0,
+    "best10": 8.8,
+    "pctile": 45.4,
+    "bottom_half": 56.0,
+    "t": -6.7,
+    "verdict": "lagged"
+   },
+   "h20": {
+    "n": 3772,
+    "median_ret": -2.67,
+    "worst10": -15.8,
+    "best10": 17.3,
+    "pctile": 45.8,
+    "bottom_half": 56.0,
+    "t": -6.1,
+    "verdict": "lagged"
+   }
+  },
+  "Investor presentation|down": {
+   "label": "Investor presentation",
+   "direction": "down",
+   "key": "filing",
+   "h5": {
+    "n": 48,
+    "median_ret": -0.22,
+    "worst10": -9.8,
+    "best10": 10.3,
+    "pctile": 50.7,
+    "bottom_half": 54.0,
+    "t": 0.2,
+    "verdict": "mixed"
+   },
+   "h20": {
+    "n": 48,
+    "median_ret": -2.26,
+    "worst10": -13.2,
+    "best10": 16.4,
+    "pctile": 47.4,
+    "bottom_half": 50.0,
+    "t": -0.6,
+    "verdict": "mixed"
+   }
+  },
+  "Investor presentation|up": {
+   "label": "Investor presentation",
+   "direction": "up",
+   "key": "filing",
+   "h5": {
+    "n": 43,
+    "median_ret": -1.14,
+    "worst10": -5.9,
+    "best10": 10.1,
+    "pctile": 53.2,
+    "bottom_half": 49.0,
+    "t": 0.6,
+    "verdict": "mixed"
+   },
+   "h20": {
+    "n": 42,
+    "median_ret": 3.45,
+    "worst10": -13.7,
+    "best10": 27.3,
+    "pctile": 55.6,
+    "bottom_half": 48.0,
+    "t": 1.0,
+    "verdict": "mixed"
+   }
+  },
+  "Legal / regulatory news|down": {
+   "label": "Legal / regulatory news",
+   "direction": "down",
+   "key": "filing",
+   "h5": {
+    "n": 60,
+    "median_ret": 0.0,
+    "worst10": -7.4,
+    "best10": 8.3,
+    "pctile": 47.0,
+    "bottom_half": 53.0,
+    "t": -0.7,
+    "verdict": "mixed"
+   },
+   "h20": {
+    "n": 55,
+    "median_ret": 1.12,
+    "worst10": -12.8,
+    "best10": 15.3,
+    "pctile": 50.9,
+    "bottom_half": 49.0,
+    "t": 0.2,
+    "verdict": "mixed"
+   }
+  },
+  "Legal / regulatory news|up": {
+   "label": "Legal / regulatory news",
+   "direction": "up",
+   "key": "filing",
+   "h5": {
+    "n": 79,
+    "median_ret": -2.51,
+    "worst10": -8.9,
+    "best10": 6.2,
+    "pctile": 36.5,
+    "bottom_half": 68.0,
+    "t": -4.0,
+    "verdict": "lagged"
+   },
+   "h20": {
+    "n": 75,
+    "median_ret": -2.37,
+    "worst10": -14.4,
+    "best10": 14.6,
+    "pctile": 41.2,
+    "bottom_half": 57.0,
+    "t": -2.4,
+    "verdict": "mixed"
+   }
+  },
+  "Management change|down": {
+   "label": "Management change",
+   "direction": "down",
+   "key": "filing",
+   "h5": {
+    "n": 135,
+    "median_ret": -0.37,
+    "worst10": -7.4,
+    "best10": 7.7,
+    "pctile": 46.4,
+    "bottom_half": 53.0,
+    "t": -1.4,
+    "verdict": "mixed"
+   },
+   "h20": {
+    "n": 131,
+    "median_ret": -0.96,
+    "worst10": -13.7,
+    "best10": 15.4,
+    "pctile": 46.4,
+    "bottom_half": 50.0,
+    "t": -1.3,
+    "verdict": "mixed"
+   }
+  },
+  "Management change|up": {
+   "label": "Management change",
+   "direction": "up",
+   "key": "filing",
+   "h5": {
+    "n": 264,
+    "median_ret": -1.04,
+    "worst10": -9.0,
+    "best10": 9.8,
+    "pctile": 43.7,
+    "bottom_half": 58.0,
+    "t": -2.7,
+    "verdict": "mixed"
+   },
+   "h20": {
+    "n": 261,
+    "median_ret": -1.18,
+    "worst10": -13.0,
+    "best10": 22.0,
+    "pctile": 45.4,
+    "bottom_half": 59.0,
+    "t": -2.1,
+    "verdict": "mixed"
+   }
+  },
+  "Market-wide rally|up": {
+   "label": "Market-wide rally",
+   "direction": "up",
+   "key": "market",
+   "h5": {
+    "n": 1309,
+    "median_ret": 4.1,
+    "worst10": -4.0,
+    "best10": 13.7,
+    "pctile": 48.7,
+    "bottom_half": 47.0,
+    "t": -1.1,
+    "verdict": "mixed"
+   },
+   "h20": {
+    "n": 1309,
+    "median_ret": 7.14,
+    "worst10": -10.1,
+    "best10": 28.3,
+    "pctile": 49.5,
+    "bottom_half": 48.0,
+    "t": -0.4,
+    "verdict": "mixed"
+   }
+  },
+  "Market-wide sell-off|down": {
+   "label": "Market-wide sell-off",
+   "direction": "down",
+   "key": "market",
+   "h5": {
+    "n": 2399,
+    "median_ret": 2.79,
+    "worst10": -6.5,
+    "best10": 14.5,
+    "pctile": 53.1,
+    "bottom_half": 43.0,
+    "t": 2.8,
+    "verdict": "mixed"
+   },
+   "h20": {
+    "n": 2399,
+    "median_ret": 3.48,
+    "worst10": -12.6,
+    "best10": 28.2,
+    "pctile": 51.4,
+    "bottom_half": 47.0,
+    "t": 1.2,
+    "verdict": "mixed"
+   }
+  },
+  "Media report|down": {
+   "label": "Media report",
+   "direction": "down",
+   "key": "filing",
+   "h5": {
+    "n": 69,
+    "median_ret": 1.81,
+    "worst10": -9.0,
+    "best10": 23.4,
+    "pctile": 57.9,
+    "bottom_half": 36.0,
+    "t": 1.7,
+    "verdict": "mixed"
+   },
+   "h20": {
+    "n": 67,
+    "median_ret": 4.07,
+    "worst10": -9.9,
+    "best10": 20.0,
+    "pctile": 56.3,
+    "bottom_half": 40.0,
+    "t": 1.5,
+    "verdict": "mixed"
+   }
+  },
+  "Media report|up": {
+   "label": "Media report",
+   "direction": "up",
+   "key": "filing",
+   "h5": {
+    "n": 92,
+    "median_ret": -1.57,
+    "worst10": -9.0,
+    "best10": 8.8,
+    "pctile": 48.5,
+    "bottom_half": 55.0,
+    "t": -0.4,
+    "verdict": "mixed"
+   },
+   "h20": {
+    "n": 88,
+    "median_ret": -4.9,
+    "worst10": -18.9,
+    "best10": 14.2,
+    "pctile": 47.6,
+    "bottom_half": 49.0,
+    "t": -0.7,
+    "verdict": "mixed"
+   }
+  },
+  "Move on ordinary volume|down": {
+   "label": "Move on ordinary volume",
+   "direction": "down",
+   "key": "quiet",
+   "h5": {
+    "n": 793,
+    "median_ret": -0.42,
+    "worst10": -8.3,
+    "best10": 10.0,
+    "pctile": 48.0,
+    "bottom_half": 53.0,
+    "t": -1.3,
+    "verdict": "mixed"
+   },
+   "h20": {
+    "n": 760,
+    "median_ret": -1.86,
+    "worst10": -17.3,
+    "best10": 17.2,
+    "pctile": 44.4,
+    "bottom_half": 56.0,
+    "t": -3.5,
+    "verdict": "lagged"
+   }
+  },
+  "Move on ordinary volume|up": {
+   "label": "Move on ordinary volume",
+   "direction": "up",
+   "key": "quiet",
+   "h5": {
+    "n": 1330,
+    "median_ret": -0.79,
+    "worst10": -9.0,
+    "best10": 8.9,
+    "pctile": 44.9,
+    "bottom_half": 55.0,
+    "t": -3.9,
+    "verdict": "lagged"
+   },
+   "h20": {
+    "n": 1279,
+    "median_ret": -1.93,
+    "worst10": -16.8,
+    "best10": 19.2,
+    "pctile": 44.9,
+    "bottom_half": 56.0,
+    "t": -4.1,
+    "verdict": "lagged"
+   }
+  },
+  "No clear driver on record|down": {
+   "label": "No clear driver on record",
+   "direction": "down",
+   "key": "unexplained",
+   "h5": {
+    "n": 1198,
+    "median_ret": -0.62,
+    "worst10": -8.3,
+    "best10": 10.3,
+    "pctile": 48.6,
+    "bottom_half": 52.0,
+    "t": -1.1,
+    "verdict": "mixed"
+   },
+   "h20": {
+    "n": 1147,
+    "median_ret": -1.34,
+    "worst10": -16.3,
+    "best10": 19.1,
+    "pctile": 47.6,
+    "bottom_half": 51.0,
+    "t": -2.0,
+    "verdict": "mixed"
+   }
+  },
+  "No clear driver on record|up": {
+   "label": "No clear driver on record",
+   "direction": "up",
+   "key": "unexplained",
+   "h5": {
+    "n": 4262,
+    "median_ret": -1.36,
+    "worst10": -8.6,
+    "best10": 8.5,
+    "pctile": 45.0,
+    "bottom_half": 57.0,
+    "t": -6.6,
+    "verdict": "lagged"
+   },
+   "h20": {
+    "n": 4139,
+    "median_ret": -1.45,
+    "worst10": -14.9,
+    "best10": 18.7,
+    "pctile": 47.6,
+    "bottom_half": 54.0,
+    "t": -3.3,
+    "verdict": "lagged"
+   }
+  },
+  "Order win|down": {
+   "label": "Order win",
+   "direction": "down",
+   "key": "filing",
+   "h5": {
+    "n": 34,
+    "median_ret": 0.96,
+    "worst10": -15.8,
+    "best10": 11.2,
+    "pctile": 41.2,
+    "bottom_half": 50.0,
+    "t": -1.4,
+    "verdict": "mixed"
+   },
+   "h20": {
+    "n": 33,
+    "median_ret": 1.59,
+    "worst10": -16.8,
+    "best10": 23.7,
+    "pctile": 43.7,
+    "bottom_half": 55.0,
+    "t": -1.0,
+    "verdict": "mixed"
+   }
+  },
+  "Order win|up": {
+   "label": "Order win",
+   "direction": "up",
+   "key": "filing",
+   "h5": {
+    "n": 182,
+    "median_ret": -2.29,
+    "worst10": -8.7,
+    "best10": 7.9,
+    "pctile": 39.4,
+    "bottom_half": 64.0,
+    "t": -4.3,
+    "verdict": "mixed"
+   },
+   "h20": {
+    "n": 171,
+    "median_ret": -4.28,
+    "worst10": -17.2,
+    "best10": 14.1,
+    "pctile": 40.3,
+    "bottom_half": 64.0,
+    "t": -3.9,
+    "verdict": "lagged"
+   }
+  },
+  "Press release|down": {
+   "label": "Press release",
+   "direction": "down",
+   "key": "filing",
+   "h5": {
+    "n": 66,
+    "median_ret": -1.64,
+    "worst10": -10.1,
+    "best10": 7.7,
+    "pctile": 43.9,
+    "bottom_half": 62.0,
+    "t": -1.5,
+    "verdict": "mixed"
+   },
+   "h20": {
+    "n": 66,
+    "median_ret": -1.03,
+    "worst10": -17.7,
+    "best10": 10.9,
+    "pctile": 44.2,
+    "bottom_half": 52.0,
+    "t": -1.5,
+    "verdict": "mixed"
+   }
+  },
+  "Press release|up": {
+   "label": "Press release",
+   "direction": "up",
+   "key": "filing",
+   "h5": {
+    "n": 147,
+    "median_ret": -1.32,
+    "worst10": -9.1,
+    "best10": 7.6,
+    "pctile": 46.2,
+    "bottom_half": 56.0,
+    "t": -1.4,
+    "verdict": "mixed"
+   },
+   "h20": {
+    "n": 140,
+    "median_ret": -2.23,
+    "worst10": -15.9,
+    "best10": 14.3,
+    "pctile": 44.5,
+    "bottom_half": 56.0,
+    "t": -2.0,
+    "verdict": "mixed"
+   }
+  },
+  "Profit-taking after a sharp run|down": {
+   "label": "Profit-taking after a sharp run",
+   "direction": "down",
+   "key": "profit_taking",
+   "h5": {
+    "n": 1481,
+    "median_ret": -0.65,
+    "worst10": -7.9,
+    "best10": 9.6,
+    "pctile": 49.2,
+    "bottom_half": 51.0,
+    "t": -0.7,
+    "verdict": "mixed"
+   },
+   "h20": {
+    "n": 1438,
+    "median_ret": -1.29,
+    "worst10": -15.4,
+    "best10": 19.2,
+    "pctile": 48.8,
+    "bottom_half": 51.0,
+    "t": -1.0,
+    "verdict": "mixed"
+   }
+  },
+  "Rebound after a steep fall|up": {
+   "label": "Rebound after a steep fall",
+   "direction": "up",
+   "key": "rebound",
+   "h5": {
+    "n": 2801,
+    "median_ret": -1.38,
+    "worst10": -8.6,
+    "best10": 9.3,
+    "pctile": 43.7,
+    "bottom_half": 57.0,
+    "t": -5.6,
+    "verdict": "lagged"
+   },
+   "h20": {
+    "n": 2712,
+    "median_ret": -1.04,
+    "worst10": -15.7,
+    "best10": 19.1,
+    "pctile": 46.2,
+    "bottom_half": 54.0,
+    "t": -3.3,
+    "verdict": "lagged"
+   }
+  },
+  "Results reaction|down": {
+   "label": "Results reaction",
+   "direction": "down",
+   "key": "filing",
+   "h5": {
+    "n": 2227,
+    "median_ret": -1.8,
+    "worst10": -9.4,
+    "best10": 5.9,
+    "pctile": 41.9,
+    "bottom_half": 61.0,
+    "t": -6.8,
+    "verdict": "lagged"
+   },
+   "h20": {
+    "n": 2227,
+    "median_ret": -2.45,
+    "worst10": -15.9,
+    "best10": 14.1,
+    "pctile": 45.8,
+    "bottom_half": 56.0,
+    "t": -3.7,
+    "verdict": "lagged"
+   }
+  },
+  "Results reaction|up": {
+   "label": "Results reaction",
+   "direction": "up",
+   "key": "filing",
+   "h5": {
+    "n": 1882,
+    "median_ret": -1.09,
+    "worst10": -8.7,
+    "best10": 8.6,
+    "pctile": 46.5,
+    "bottom_half": 53.0,
+    "t": -2.8,
+    "verdict": "mixed"
+   },
+   "h20": {
+    "n": 1872,
+    "median_ret": -1.17,
+    "worst10": -13.7,
+    "best10": 19.0,
+    "pctile": 49.5,
+    "bottom_half": 48.0,
+    "t": -0.4,
+    "verdict": "mixed"
+   }
+  },
+  "Sector-wide buying|up": {
+   "label": "Sector-wide buying",
+   "direction": "up",
+   "key": "sector",
+   "h5": {
+    "n": 5764,
+    "median_ret": 2.45,
+    "worst10": -6.4,
+    "best10": 12.7,
+    "pctile": 48.0,
+    "bottom_half": 49.0,
+    "t": -1.4,
+    "verdict": "mixed"
+   },
+   "h20": {
+    "n": 5720,
+    "median_ret": 5.14,
+    "worst10": -11.3,
+    "best10": 26.3,
+    "pctile": 49.6,
+    "bottom_half": 49.0,
+    "t": -0.3,
+    "verdict": "mixed"
+   }
+  },
+  "Sector-wide selling|down": {
+   "label": "Sector-wide selling",
+   "direction": "down",
+   "key": "sector",
+   "h5": {
+    "n": 7689,
+    "median_ret": 2.8,
+    "worst10": -6.8,
+    "best10": 14.2,
+    "pctile": 48.3,
+    "bottom_half": 45.0,
+    "t": -1.1,
+    "verdict": "mixed"
+   },
+   "h20": {
+    "n": 7662,
+    "median_ret": 3.91,
+    "worst10": -13.0,
+    "best10": 27.0,
+    "pctile": 48.4,
+    "bottom_half": 47.0,
+    "t": -0.9,
+    "verdict": "mixed"
+   }
+  },
+  "Short covering after a fall|up": {
+   "label": "Short covering after a fall",
+   "direction": "up",
+   "key": "rebound",
+   "h5": {
+    "n": 113,
+    "median_ret": -0.21,
+    "worst10": -7.2,
+    "best10": 6.8,
+    "pctile": 46.3,
+    "bottom_half": 55.0,
+    "t": -1.2,
+    "verdict": "mixed"
+   },
+   "h20": {
+    "n": 109,
+    "median_ret": -1.9,
+    "worst10": -12.4,
+    "best10": 14.7,
+    "pctile": 52.7,
+    "bottom_half": 47.0,
+    "t": 0.9,
+    "verdict": "mixed"
+   }
+  },
+  "Speculative spike|up": {
+   "label": "Speculative spike",
+   "direction": "up",
+   "key": "speculative",
+   "h5": {
+    "n": 6656,
+    "median_ret": -2.33,
+    "worst10": -10.1,
+    "best10": 10.0,
+    "pctile": 41.9,
+    "bottom_half": 60.0,
+    "t": -13.5,
+    "verdict": "lagged"
+   },
+   "h20": {
+    "n": 6436,
+    "median_ret": -3.15,
+    "worst10": -16.1,
+    "best10": 20.2,
+    "pctile": 45.3,
+    "bottom_half": 57.0,
+    "t": -8.4,
+    "verdict": "lagged"
+   }
+  },
+  "Speculative unwind|down": {
+   "label": "Speculative unwind",
+   "direction": "down",
+   "key": "speculative",
+   "h5": {
+    "n": 1378,
+    "median_ret": -0.5,
+    "worst10": -10.5,
+    "best10": 11.1,
+    "pctile": 48.2,
+    "bottom_half": 51.0,
+    "t": -1.5,
+    "verdict": "mixed"
+   },
+   "h20": {
+    "n": 1321,
+    "median_ret": -1.4,
+    "worst10": -16.7,
+    "best10": 23.9,
+    "pctile": 47.7,
+    "bottom_half": 52.0,
+    "t": -1.9,
+    "verdict": "mixed"
+   }
+  },
+  "Uptrend continuing|up": {
+   "label": "Uptrend continuing",
+   "direction": "up",
+   "key": "trend",
+   "h5": {
+    "n": 816,
+    "median_ret": -1.61,
+    "worst10": -9.0,
+    "best10": 8.8,
+    "pctile": 45.5,
+    "bottom_half": 56.0,
+    "t": -3.0,
+    "verdict": "lagged"
+   },
+   "h20": {
+    "n": 768,
+    "median_ret": -2.36,
+    "worst10": -16.9,
+    "best10": 17.8,
+    "pctile": 45.8,
+    "bottom_half": 53.0,
+    "t": -2.8,
+    "verdict": "mixed"
+   }
+  }
+ }
+}

@@ -589,6 +589,8 @@ class Engine:
                 facts = drv.research_filings(symbol, ev["time"], fl) if fl else {}
                 peers = drv.peer_context(frame, day, symbol, sector)
                 d = drv.classify(f, peers, fl, None, checked, facts, ttm)
+                if abs(f["ret"]) >= mv.THRESHOLD:
+                    d["base_rate"] = drv.base_rate(d["label"], f["ret"] > 0)
                 d["filings"] = [{"category": x["category"], "fact": x.get("fact"), "url": x.get("url")}
                                 for x in fl[:2]]
                 out[ev["time"]] = d
@@ -893,9 +895,11 @@ def api_insights_movers():
 
     out = dict(payload)
     out["dates"] = db.list_daily_movers_dates()
+    for side in ("gainers", "losers"):
+        out[side] = drv.attach_base_rates(out.get(side))
     if not _is_premium_request():
         for side in ("gainers", "losers"):
-            rows = payload.get(side) or []
+            rows = out.get(side) or []
             out[side] = rows[:FREE_MOVERS_PREVIEW]
             out[f"locked_{side}"] = max(0, len(rows) - FREE_MOVERS_PREVIEW)
     return jsonify(out)

@@ -17,6 +17,9 @@ labelled that way instead of being given a story.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
@@ -596,6 +599,44 @@ def classify(f: dict, peers: dict, filings: list | None = None, deals: list | No
         "against": against,
         "also": also,
     }
+
+
+# --------------------------------------------------------------------------
+# Base rates: what followed past moves with the same label
+# --------------------------------------------------------------------------
+
+_RATES_FILE = Path(__file__).resolve().parent / "data" / "base_rates.json"
+_rates: dict | None = None
+
+
+def _base_rates() -> dict:
+    global _rates
+    if _rates is None:
+        try:
+            _rates = json.loads(_RATES_FILE.read_text())
+        except (FileNotFoundError, ValueError):
+            _rates = {}
+    return _rates
+
+
+def base_rate(label: str | None, up: bool) -> dict | None:
+    """Outcome stats for past moves with this label and direction (from baserates.py)."""
+    data = _base_rates()
+    hit = (data.get("rates") or {}).get(f"{label}|{'up' if up else 'down'}")
+    if not hit:
+        return None
+    return {"h5": hit.get("h5"), "h20": hit.get("h20"), "since": (data.get("window") or {}).get("start")}
+
+
+def attach_base_rates(rows: list[dict]) -> list[dict]:
+    """Add `driver.base_rate` to mover rows; rows are copied, not mutated."""
+    out = []
+    for r in rows or []:
+        d = r.get("driver")
+        if d and r.get("ret") is not None:
+            r = {**r, "driver": {**d, "base_rate": base_rate(d.get("label"), r["ret"] > 0)}}
+        out.append(r)
+    return out
 
 
 # --------------------------------------------------------------------------
