@@ -1487,6 +1487,15 @@ def api_carry_intraday():
         return jsonify({"error": f"Could not read intraday scan: {exc}"}), 500
 
 
+@app.get("/api/gap-fade")
+def api_gap_fade():
+    """Gap-ups in downtrends: non-F&O stocks opening 2-9% up while below the
+    50-day average. Built from NSE pre-open data; cached for 30 seconds."""
+    import gapfade
+    out = gapfade.payload(engine.raw, force=request.args.get("force") == "1")
+    return jsonify(out), (503 if "error" in out else 200)
+
+
 # --------------------------------------------------------------------------
 # Broader market scanners
 # --------------------------------------------------------------------------
