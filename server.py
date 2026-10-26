@@ -1496,6 +1496,46 @@ def api_gap_fade():
     return jsonify(out), (503 if "error" in out else 200)
 
 
+_gap_fade_busy = threading.Lock()
+
+
+def _gap_fade_job(name: str, fn) -> tuple:
+    if not _gap_fade_busy.acquire(blocking=False):
+        return jsonify({"status": "busy"}), 409
+
+    def work():
+        try:
+            print(f"[cron] gap fade {name}: {fn()}")
+        except Exception as exc:
+            print(f"[cron] gap fade {name} failed: {exc}")
+        finally:
+            _gap_fade_busy.release()
+
+    threading.Thread(target=work, daemon=True).start()
+    return jsonify({"status": "started"}), 202
+
+
+@app.post("/api/cron/gap-fade-entry")
+def api_cron_gap_fade_entry():
+    """
+    Log today's gap-ups-in-downtrends list with the short entry price.
+    Schedule at 09:20 IST, weekdays. Holidays are detected from the pre-open
+    stamp and skipped. Returns 202 and runs in a thread.
+    """
+    import gapfade
+    return _gap_fade_job("entry", lambda: gapfade.log_entries(engine.raw))
+
+
+@app.post("/api/cron/gap-fade-exit")
+def api_cron_gap_fade_exit():
+    """
+    Price today's logged picks and store the short-side return.
+    Schedule at 15:15 IST, weekdays. Returns 202 and runs in a thread.
+    """
+    import gapfade
+    return _gap_fade_job("exit", gapfade.log_exits)
+
+
 # --------------------------------------------------------------------------
 # Broader market scanners
 # --------------------------------------------------------------------------

@@ -246,6 +246,119 @@ def scan(raw: pd.DataFrame) -> dict:
     }
 
 
+# --------------------------------------------------------------------------
+# Live track record: picks logged at ~09:20, priced again at ~15:15
+# --------------------------------------------------------------------------
+
+RECORD_TTL = 10 * 60
+_record_cache: dict = {"at": 0.0, "record": None}
+
+
+def _session_of(stamp: str | None) -> str | None:
+    """Date of NSE's pre-open stamp (e.g. '23-Oct-2026 09:07:59')."""
+    if not stamp:
+        return None
+    try:
+        return pd.to_datetime(stamp, format="%d-%b-%Y %H:%M:%S").date().isoformat()
+    except (TypeError, ValueError):
+        return None
+
+
+def log_entries(raw: pd.DataFrame) -> dict:
+    """Record today's list with the current price as the short entry."""
+    import db
+    today = _now_ist().date().isoformat()
+    out = payload(raw, force=True)
+    if "error" in out:
+        return {"status": "error", "error": out["error"]}
+    if _session_of(out.get("preopen_time")) not in (None, today):
+        return {"status": "skipped", "reason": f"no session today (pre-open is from {out['preopen_time']})"}
+    # The live table only quotes the first 25 names. The log prices every pick;
+    # if Groww/Yahoo miss one, the opening price is the fallback.
+    missing = [r["symbol"] for r in out["rows"] if not r.get("ltp")]
+    extra: dict[str, float] = {}
+    for i in range(0, len(missing), LIVE_CAP):
+        extra.update(_live_prices(missing[i:i + LIVE_CAP]))
+    now = _now_ist().isoformat()
+    keep = ("symbol", "rank", "top", "prev_close", "open", "gap_pct",
+            "below_sma50_pct", "band", "near_band")
+    rows = []
+    for r in out["rows"]:
+        px = r.get("ltp") or extra.get(r["symbol"]) or r.get("open")
+        rows.append({**{k: r[k] for k in keep}, "session_date": today,
+                     "entry_price": px, "entry_at": now if px else None})
+    sent = db.save_gap_fade_entries(rows)
+    _record_cache["at"] = 0.0
+    return {"status": "ok" if sent is not None else "save failed", "session": today,
+            "picks": len(rows), "priced": sum(1 for r in rows if r["entry_price"])}
+
+
+def log_exits() -> dict:
+    """Price today's logged picks and store the short-side return."""
+    import db
+    today = _now_ist().date().isoformat()
+    rows = db.get_gap_fade_log(session_date=today)
+    if rows is None:
+        return {"status": "error", "error": "could not read gap_fade_log"}
+    open_rows = [r for r in rows if r.get("entry_price") and r.get("exit_price") is None]
+    if not open_rows:
+        return {"status": "ok", "session": today, "closed": 0}
+    symbols = [r["symbol"] for r in open_rows]
+    prices: dict[str, float] = {}
+    for i in range(0, len(symbols), LIVE_CAP):
+        prices.update(_live_prices(symbols[i:i + LIVE_CAP]))
+    now, closed = _now_ist().isoformat(), 0
+    for r in open_rows:
+        px = prices.get(r["symbol"])
+        if not px:
+            continue
+        entry = float(r["entry_price"])
+        ret = (entry - px) / entry * 100
+        if db.set_gap_fade_exit(today, r["symbol"], {
+                "exit_price": round(px, 2), "exit_at": now, "short_ret_pct": round(ret, 3)}):
+            closed += 1
+    _record_cache["at"] = 0.0
+    return {"status": "ok", "session": today, "closed": closed, "unpriced": len(open_rows) - closed}
+
+
+def _summary(rets: list[float]) -> dict | None:
+    if not rets:
+        return None
+    a = np.array(rets)
+    return {"trades": len(a), "avg_pct": round(float(a.mean()), 2),
+            "median_pct": round(float(np.median(a)), 2),
+            "win_pct": round(float((a > 0).mean() * 100), 1)}
+
+
+def record() -> dict | None:
+    """Net-of-cost results of logged picks, overall and for the top five."""
+    if _record_cache["record"] is not None and time.time() - _record_cache["at"] < RECORD_TTL:
+        return _record_cache["record"]
+    import db
+    rows = db.get_gap_fade_log()
+    if rows is None:
+        return _record_cache["record"]
+    cost = BACKTEST["cost_bps"] / 100
+    done = [r for r in rows if r.get("short_ret_pct") is not None]
+    net = lambda rs: [float(r["short_ret_pct"]) - cost for r in rs]
+    sessions: dict[str, list] = {}
+    for r in done:
+        sessions.setdefault(r["session_date"], []).append({
+            "symbol": r["symbol"], "rank": r["rank"], "top": r["top"],
+            "gap_pct": r["gap_pct"], "entry": r["entry_price"], "exit": r["exit_price"],
+            "net_pct": round(float(r["short_ret_pct"]) - cost, 2)})
+    out = {
+        "since": min(sessions) if sessions else None,
+        "sessions": len(sessions),
+        "cost_bps": BACKTEST["cost_bps"],
+        "top": _summary(net([r for r in done if r.get("top")])),
+        "all": _summary(net(done)),
+        "recent": [{"date": d, "picks": sessions[d]} for d in sorted(sessions, reverse=True)[:10]],
+    }
+    _record_cache.update(at=time.time(), record=out)
+    return out
+
+
 def payload(raw: pd.DataFrame | None, force: bool = False) -> dict:
     if raw is None or raw.empty:
         return {"error": "Price history is still loading. Try again in a minute."}
@@ -255,6 +368,11 @@ def payload(raw: pd.DataFrame | None, force: bool = False) -> dict:
             return _cache["payload"]
         try:
             out = scan(raw)
+            if "error" not in out:
+                try:
+                    out["live_record"] = record()
+                except Exception as exc:
+                    print(f"gapfade record: {exc}")
         except Exception as exc:
             print(f"gapfade scan failed: {exc}")
             if _cache["payload"] is not None:

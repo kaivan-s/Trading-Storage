@@ -2041,6 +2041,71 @@ def get_commodity_news(days: int = 14, limit: int = 600) -> list[dict] | None:
 
 
 # --------------------------------------------------------------------------
+# Gap-ups in downtrends: live track record (entry ~09:20, exit ~15:15)
+# --------------------------------------------------------------------------
+# CREATE TABLE gap_fade_log (
+#     session_date     DATE NOT NULL,
+#     symbol           TEXT NOT NULL,
+#     rank             INT,
+#     top              BOOLEAN,
+#     prev_close       NUMERIC,
+#     open             NUMERIC,
+#     gap_pct          NUMERIC,
+#     below_sma50_pct  NUMERIC,
+#     band             TEXT,
+#     near_band        BOOLEAN,
+#     entry_price      NUMERIC,
+#     entry_at         TIMESTAMPTZ,
+#     exit_price       NUMERIC,
+#     exit_at          TIMESTAMPTZ,
+#     short_ret_pct    NUMERIC,
+#     PRIMARY KEY (session_date, symbol)
+# );
+
+def save_gap_fade_entries(rows: list[dict]) -> int | None:
+    """Insert the morning's picks; a repeat call the same day keeps the first entry."""
+    if not rows:
+        return 0
+    client = get_client()
+    try:
+        (client.table("gap_fade_log")
+         .upsert(rows, on_conflict="session_date,symbol", ignore_duplicates=True)
+         .execute())
+        return len(rows)
+    except Exception as e:
+        print(f"save gap fade entries: {e}")
+        return None
+
+
+def set_gap_fade_exit(session_date: str, symbol: str, fields: dict) -> bool:
+    client = get_client()
+    try:
+        (client.table("gap_fade_log").update(fields)
+         .eq("session_date", session_date).eq("symbol", symbol).execute())
+        return True
+    except Exception as e:
+        print(f"set gap fade exit {symbol}: {e}")
+        return False
+
+
+def get_gap_fade_log(days: int = 120, session_date: str | None = None) -> list[dict] | None:
+    """Logged picks, newest session first. None if the read failed."""
+    client = get_client()
+    try:
+        q = client.table("gap_fade_log").select("*")
+        if session_date:
+            q = q.eq("session_date", session_date)
+        else:
+            since = (pd.Timestamp.utcnow() - pd.Timedelta(days=days)).date().isoformat()
+            q = q.gte("session_date", since)
+        r = q.order("session_date", desc=True).order("rank").limit(2000).execute()
+        return r.data or []
+    except Exception as e:
+        print(f"get gap fade log: {e}")
+        return None
+
+
+# --------------------------------------------------------------------------
 # Stock page lookups (free-tier daily limit)
 # --------------------------------------------------------------------------
 # CREATE TABLE stock_lookups (
