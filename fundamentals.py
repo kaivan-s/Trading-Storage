@@ -599,40 +599,65 @@ def refresh_results_calendar(
     return saved
 
 
-def get_results_calendar(days_ahead: int = 45) -> list[dict]:
+def get_results_calendar(days_ahead: int = 45, past_days: int = 0, raw=None) -> list[dict]:
     """
     Read results calendar from DB, enriched with fundamentals data.
-    Returns entries from today to days_ahead days from now.
+    Returns entries from today to days_ahead days from now, plus (past_days > 0)
+    results declared on NSE over the last past_days with their price reaction.
     """
     from datetime import date as date_cls
     today = date_cls.today()
     end = (today + timedelta(days=days_ahead)).isoformat()
 
     rows = db.get_results_calendar(from_date=today.isoformat(), to_date=end)
+
+    declared = []
+    if past_days > 0:
+        import results_reactions
+        declared = results_reactions.declared_rows(raw, past_days)
+        # Yahoo's date for a company that has just reported is usually last
+        # quarter's estimate, not a second results day.
+        cutoff = (today - timedelta(days=30)).isoformat()
+        recent = {}
+        for r in declared:
+            if r["earnings_date"] >= cutoff:
+                recent[r["symbol"]] = max(recent.get(r["symbol"], ""), r["earnings_date"])
+
+        def stale(r):
+            d = recent.get(r["symbol"])
+            return d is not None and r["earnings_date"] <= (
+                date_cls.fromisoformat(d) + timedelta(days=45)).isoformat()
+
+        rows = [r for r in rows if not stale(r)] + declared
+
     if not rows:
         return []
 
     # Enrich with fundamentals (earnings trend, market cap, PE)
-    symbols = [r["symbol"] for r in rows]
+    symbols = list({r["symbol"] for r in rows})
     fund_lookup = {}
     try:
-        from supabase import Client
         client = db.get_client()
-        resp = (client.table("company_fundamentals")
-                .select("symbol,name,industry,earnings_trend,market_cap_cr,pe_ttm")
-                .in_("symbol", symbols)
-                .execute())
-        fund_lookup = {r["symbol"]: r for r in (resp.data or [])}
+        for i in range(0, len(symbols), 300):
+            resp = (client.table("company_fundamentals")
+                    .select("symbol,name,industry,earnings_trend,market_cap_cr,pe_ttm")
+                    .in_("symbol", symbols[i:i + 300])
+                    .execute())
+            fund_lookup.update({r["symbol"]: r for r in (resp.data or [])})
     except Exception:
         pass
 
     for row in rows:
         f = fund_lookup.get(row["symbol"], {})
-        row["name"] = f.get("name")
+        row["name"] = f.get("name") or row.get("name")
         row["industry"] = f.get("industry")
         row["earnings_trend"] = f.get("earnings_trend")
         row["market_cap_cr"] = f.get("market_cap_cr")
         row["pe_ttm"] = f.get("pe_ttm")
+
+    if declared:
+        import results_reactions
+        results_reactions.attach_numbers(declared)
 
     rows.sort(key=lambda r: (r.get("earnings_date") or "", r.get("symbol") or ""))
     return rows

@@ -1944,14 +1944,16 @@ def api_trial_start():
 @app.get("/api/results-calendar")
 def api_results_calendar():
     """
-    Upcoming quarterly results dates, enriched with fundamentals.
+    Upcoming quarterly results dates, enriched with fundamentals, plus results
+    already declared over the last `past` days with the price reaction.
 
-    GET /api/results-calendar?days=45
+    GET /api/results-calendar?days=45&past=60
     """
     import fundamentals as fun
     try:
         days = int(request.args.get("days", 45))
-        rows = fun.get_results_calendar(days_ahead=days)
+        past = min(max(int(request.args.get("past", 0)), 0), 90)
+        rows = fun.get_results_calendar(days_ahead=days, past_days=past, raw=engine.raw)
         return jsonify({"count": len(rows), "rows": rows})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
