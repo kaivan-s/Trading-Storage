@@ -658,6 +658,11 @@ def get_results_calendar(days_ahead: int = 45, past_days: int = 0, raw=None) -> 
     if declared:
         import results_reactions
         results_reactions.attach_numbers(declared)
+        try:
+            import flags
+            flags.mark_results_rows(declared, raw)
+        except Exception as exc:
+            print(f"results weak-reaction flags failed: {exc}")
 
     rows.sort(key=lambda r: (r.get("earnings_date") or "", r.get("symbol") or ""))
     return rows

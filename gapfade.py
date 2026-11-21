@@ -2,9 +2,8 @@
 Gap-ups in downtrends: the 09:00-09:30 screen.
 
 Lists non-F&O cash stocks that open 2-9% above yesterday's close while
-yesterday's close sat below the 50-day average. These are the conditions
-tested in attic/intraday_backtest.py and re-priced on 5-minute bars in
-attic/intraday_5m_check.py.
+yesterday's close sat below the 50-day average. The rule was re-priced on
+5-minute bars over three years in attic/gap_5m.py (see BACKTEST).
 
 Prices come from NSE's pre-open endpoint: the indicative equilibrium price
 (IEP) from 09:00, final once the order-entry window shuts at ~09:08. After
@@ -36,19 +35,24 @@ NEAR_BAND = 0.02          # flag when the open sits within 2% of the upper band
 CACHE_TTL = 30
 LIVE_CAP = 25             # current-price lookups per refresh
 
+# attic/gap_5m.py: every gap-up matching this screen, priced on Groww 5-minute bars.
+# Positive = the stock fell from the entry (a short gained), after costs.
 BACKTEST = {
-    "window": "29 Jul - 14 Oct 2026 (5-minute bars)",
-    "trades": 165,
-    "entry_0920_avg_pct": 0.44,
-    "entry_0925_avg_pct": 0.15,
-    "median_pct": 0.12,
-    "win_pct": 52.1,
+    "window": "Dec 2023 - Nov 2026 (5-minute bars)",
+    "trades": 5307,
+    "median_pct": -0.37,
+    "avg_pct": -0.53,
+    "win_pct": 41.0,
+    "entry_0925_median_pct": -0.38,
+    "open_to_0920_pct": -0.63,
     "cost_bps": 25,
     "notes": [
-        "Measured entering at 09:20 and exiting at 15:15, after 0.25% round-trip costs.",
-        "Entering five minutes later (09:25) removed most of the measured difference.",
-        "A 2% stop lowered the average to +0.11%: early spikes triggered it before any fade.",
-        "The average leans on a handful of large down days; the median trade was near zero.",
+        "Measured from 09:20 to 15:15 on every qualifying stock, after 0.25% round-trip costs.",
+        "Most of the fall happened before 09:20: the median stock was already 0.63% below its "
+        "opening price by then, and the remainder of the day tended to recover.",
+        "Stocks with a company filing between the previous close and the open did better "
+        "(median +0.06%, 912 instances) but were still roughly flat after costs.",
+        "The live record above is the running check on this list as it is published.",
     ],
 }
 

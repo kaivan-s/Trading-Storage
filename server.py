@@ -31,6 +31,7 @@ import breakouts as bo
 import db
 import episodes as eps
 import fetch
+import flags
 import flagslog
 import panel as pnl
 import scan as sc
@@ -984,6 +985,11 @@ def api_stock():
         if info:
             out["lookups"] = info
         out["technicals"] = engine.technicals(str(out["symbol"]))
+        try:
+            out["flags"] = flags.for_symbol(str(out["symbol"]), engine.raw)
+        except Exception as exc:
+            print(f"stock flags failed: {exc}")
+            out["flags"] = []
     return jsonify(out)
 
 
@@ -1840,6 +1846,12 @@ def api_watchlist_get():
     except Exception:
         pass
 
+    try:
+        active_flags = flags.active(engine.raw)
+    except Exception as exc:
+        print(f"watchlist flags failed: {exc}")
+        active_flags = {}
+
     enriched = []
     for row in rows:
         sym = row["symbol"]
@@ -1865,6 +1877,7 @@ def api_watchlist_get():
             "vol_ratio": c.get("vol_ratio"),
             "cmf": c.get("cmf"),
             "is_coiled": bool(c),
+            "flags": active_flags.get(sym, []),
         })
 
     return jsonify({"count": len(enriched), "rows": enriched})
