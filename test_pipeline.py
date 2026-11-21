@@ -466,41 +466,88 @@ def test_robustness():
     })
     check("watching explain reports no setup", "No structural setup here" in why_w)
 
-    pot = {
-        "phase": "potential", "sector_klass": "PULLBACK",
-        "metrics": {
-            "adj": 100.0, "trigger": 103.0, "atr": 2.0, "lo20": 94.0,
-            "hi_n": 110.0, "ema20": 99.0, "cmf": 0.08, "range20": 0.09,
-            "ext_ema20": 0.02,
-        },
-        "shape": {"verdict": "orderly"},
-    }
-    wait = analyze.trade_plan(pot, 100)
-    check("coil entry is wait, buy is at trigger",
-          wait["action"] == "wait" and wait["suggested_entry"] == 103.0,
-          f"(action={wait['action']}, sug={wait['suggested_entry']})")
-    buy = analyze.trade_plan(pot, 103)
-    check("entry at trigger is buy", buy["action"] == "buy")
-    check("stop sits under the base or 1.5 ATR",
-          buy["stop"] is not None and buy["stop"] < buy["entry"])
-    check("target is 2R above entry",
-          buy["target"] is not None and buy["target"] > buy["entry"])
+    dates = pd.bdate_range("2026-08-03", periods=25)
+    rows = []
+    for i, d in enumerate(dates):
+        vol = 1000.0 if i < 24 else 2000.0
+        adj = 100.0 if i < 24 else 104.0
+        rows.append({
+            "date": d, "symbol": "FOO", "sector": "Banks",
+            "adj": adj, "volume": vol, "cmf": 0.05,
+        })
+    hist = pd.DataFrame(rows)
+    flags = pd.DataFrame([{
+        "as_of": dates[23].strftime("%Y-%m-%d"),
+        "symbol": "FOO", "sector": "Banks",
+        "adj": 100.0, "to_trigger": 0.03, "trigger": 103.0,
+    }])
+    hit = bo.confirm_breakouts(flags, hist, dates[-1])
+    check("close through trigger on 2× volume is a breakout",
+          len(hit) == 1 and hit.iloc[0]["symbol"] == "FOO",
+          f"(n={len(hit)})")
+    if not hit.empty:
+        check("explain_breakout names the flag and the trigger",
+              "setup on" in hit.iloc[0]["why"] and "103" in hit.iloc[0]["why"])
 
-    live = {
-        "phase": "broke_out", "sector_klass": "PULLBACK",
-        "metrics": {
-            "adj": 104.0, "trigger": 103.0, "atr": 2.0, "lo20": 94.0,
-            "hi_n": 112.0, "ema20": 101.0, "cmf": 0.1, "vol_expand": 1.8,
-            "ext_ema20": 0.03,
-        },
-        "shape": {"verdict": "orderly"},
+    same = bo.confirm_breakouts(flags, hist, dates[23])
+    check("same-day flag does not confirm", same.empty)
+
+    quiet = hist.copy()
+    quiet.loc[quiet.index[-1], "volume"] = 1000.0
+    weak = bo.confirm_breakouts(flags, quiet, dates[-1])
+    check("close through without volume expansion is not a breakout", weak.empty)
+
+    late = hist.copy()
+    late.loc[late.index[-1], "adj"] = 102.0
+    miss = bo.confirm_breakouts(flags, late, dates[-1])
+    check("close still under trigger is not a breakout", miss.empty)
+
+    why_b = bo.explain_breakout({
+        "symbol": "FOO", "flagged": "2026-09-08", "broke": "2026-09-09",
+        "trigger": 103.0, "adj": 104.0, "vol_expand": 1.8, "ret_since_flag": 0.04,
+    })
+    check("explain_breakout is readable",
+          "FOO was a setup" in why_b and "1.8×" in why_b)
+
+    print("\n--- stock lookup ---")
+    import analyze
+    uni = pd.DataFrame({
+        "symbol": ["UNIONBANK", "TCS", "INFY"],
+        "sector": ["Public Sector Bank", "IT", "IT"],
+    })
+    check("exact match ignores case",
+          analyze.resolve("unionbank", uni)["symbol"] == "UNIONBANK")
+    check("spaces stripped",
+          analyze.resolve("union bank", uni)["symbol"] == "UNIONBANK")
+    check("unique prefix resolves",
+          analyze.resolve("UNION", uni)["symbol"] == "UNIONBANK")
+    miss = analyze.resolve("XYZNONE", uni)
+    check("unknown is not found", miss["found"] is False)
+    amb = analyze.resolve("I", pd.DataFrame({
+        "symbol": ["INFY", "ITC"], "sector": ["IT", "FMCG"],
+    }))
+    check("ambiguous prefix returns suggestions",
+          amb["found"] is False and len(amb["near"]) == 2)
+
+    clean = {
+        "adj": 100.0, "ema50": 90.0, "ema200": 80.0, "pos_hi": 0.96,
+        "rsi": 55.0, "ext_ema20": 0.02, "vol_ratio": 0.7, "range20": 0.08,
+        "cmf": 0.1, "deliv_quality_rel": 1.1, "base_days": 40.0, "contraction": 0.8,
     }
-    hold = analyze.trade_plan(live, 103)
-    check("working breakout from trigger is hold", hold["action"] == "hold")
-    stopped = analyze.trade_plan({
-        **live, "metrics": {**live["metrics"], "adj": 95.0},
-    }, 103)
-    check("close through the stop is sell", stopped["action"] == "sell")
+    fil = stk.evaluate_filters(clean)
+    check("clean row passes every coil filter", all(f["ok"] for f in fil))
+    loud = {**clean, "vol_ratio": 1.4}
+    fil2 = stk.evaluate_filters(loud)
+    check("volume expansion fails only the dry-up gate",
+          sum(1 for f in fil2 if not f["ok"]) == 1
+          and next(f["id"] for f in fil2 if not f["ok"]) == "vol")
+    why_w = analyze.explain({
+        "symbol": "FOO", "phase": "watching", "sector": "Banks",
+        "sector_klass": "NONE",
+        "metrics": {"pos_hi": 0.70, "to_trigger": 0.12},
+        "filters": [{"ok": False, "text": "Volume dry-up (5-day ≤ 20-day)"}],
+    })
+    check("watching explain reports no setup", "No structural setup here" in why_w)
 
     dates = pd.bdate_range("2026-08-03", periods=25)
     rows = []

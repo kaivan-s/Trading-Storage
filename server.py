@@ -59,12 +59,12 @@ DEFAULT_LEVEL = "basic_industry"
 # because there has been no expansion yet to pull back from.
 #
 # REGIME_KLASSES drives the market-regime flag and the Telegram headline:
-# only fully verified sectors. SETUP_KLASSES adds CROSSING_UNVERIFIED so
-# the Setups tab shows "Emerging" watchlist names when no verified sector
-# qualifies, without pretending the regime is bullish.
+# only fully verified sectors. SETUP_KLASSES is the same set: coils in
+# CROSSING_UNVERIFIED ("emerging") measured no better than ordinary coils
+# (algo_audit.py, Nov 2026), so they no longer join the "Sector agrees" list.
 WATCH_KLASSES = ("CROSSING", "PULLBACK", "BASE")
 REGIME_KLASSES = ("CROSSING", "PULLBACK")
-SETUP_KLASSES = ("CROSSING", "PULLBACK", "CROSSING_UNVERIFIED")
+SETUP_KLASSES = ("CROSSING", "PULLBACK")
 
 # Slack around the scorer's momentum zone when picking which symbols are
 # worth a live quote. Wider than tom.MOM_ZONE_* so an intraday move cannot
@@ -120,27 +120,26 @@ def records(df: pd.DataFrame | None) -> list[dict]:
     return [{k: _py(v) for k, v in row.items()} for row in x.to_dict(orient="records")]
 
 
-def _rank_at_rest(coil_rows: pd.DataFrame, coil_stocks: pd.DataFrame):
+def _other_coils(coil_rows: pd.DataFrame, coil_stocks: pd.DataFrame,
+                 buy_symbols) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    `(pool carrying mom12_1 and rest_rank, the cut-to-20 list)`.
+    `(full coil pool with mom12_1 stamped, every coil not in Sector agrees)`.
 
-    Ranked once and stamped back onto the pool, because both columns are
-    stored and the UI renders them as given. Doing it the other way round --
-    letting leaders_at_rest keep the reading on its own 20 rows -- leaves
-    mom12_1 null on every row of the saved pool, which is what made Leaders
-    at rest carry a rank with nothing behind it.
-
-    Annotated over the whole pool rather than the top 20, so the momentum
-    shown against a coil is present whether or not it made the cut.
+    The momentum cut ("Leaders at rest") was retired: it was unstable across
+    sample halves and no better than the coils it hid (algo_audit.py). The
+    12-1 reading stays as a column. Other coils are ordered by distance to
+    the breakout level — descriptive, not a quality claim.
     """
     if coil_rows is None or coil_rows.empty:
-        return coil_rows, pd.DataFrame()
+        empty = coil_rows if coil_rows is not None else pd.DataFrame()
+        return empty, pd.DataFrame()
 
     out = posscan.annotate_momentum(coil_rows, coil_stocks)
-    rest = posscan.leaders_at_rest(coil_rows, coil_stocks)
-    order = {s: i + 1 for i, s in enumerate(rest["symbol"])} if not rest.empty else {}
-    out["rest_rank"] = out["symbol"].map(order)
-    return out, rest
+    buy_set = set(buy_symbols) if buy_symbols is not None else set()
+    rest = out[~out["symbol"].isin(buy_set)].copy()
+    if not rest.empty and "to_trigger" in rest.columns:
+        rest = rest.sort_values("to_trigger", ascending=True, na_position="last")
+    return out, rest.reset_index(drop=True)
 
 
 class Engine:
@@ -312,13 +311,10 @@ class Engine:
                 scan_rows[scan_rows["klass"].isin(SETUP_KLASSES)]["sector"]
             )
             buys = coil_all[coil_all["sector"].isin(setup_sectors)].copy()
-        # No cap: the seven gates already did the filtering, and ranking by
-        # `coil` measured no relationship with forward returns, so cutting
-        # the list at 40 by that score was discarding names arbitrarily.
-        # The shown list: same pool, ordered by 12-1 momentum and cut to 20.
-        # See eval_listsize.py for why 20 rather than the full 63 or a
-        # single-digit shortlist.
-        coil_rows, rest_rows = _rank_at_rest(coil_all, coil_stocks)
+        # Sector-agrees (buys) on top; every other coil underneath, closest
+        # to breakout first. No momentum cut — see _other_coils.
+        buy_syms = list(buys["symbol"]) if not buys.empty else []
+        coil_rows, rest_rows = _other_coils(coil_all, coil_stocks, buy_syms)
 
         as_of = panel["date"].max()
         as_of_s = pd.Timestamp(as_of).strftime("%Y-%m-%d")
@@ -986,7 +982,8 @@ def api_stock():
             out["lookups"] = info
         out["technicals"] = engine.technicals(str(out["symbol"]))
         try:
-            out["flags"] = flags.for_symbol(str(out["symbol"]), engine.raw)
+            out["flags"] = flags.for_symbol(
+                str(out["symbol"]), engine.raw, stocks=engine.coil_stocks)
         except Exception as exc:
             print(f"stock flags failed: {exc}")
             out["flags"] = []
@@ -1847,7 +1844,7 @@ def api_watchlist_get():
         pass
 
     try:
-        active_flags = flags.active(engine.raw)
+        active_flags = flags.active(engine.raw, stocks=engine.coil_stocks)
     except Exception as exc:
         print(f"watchlist flags failed: {exc}")
         active_flags = {}

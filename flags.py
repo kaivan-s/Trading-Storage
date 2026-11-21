@@ -16,6 +16,13 @@ weak_bounce   Downtrend (close and EMA50 below EMA200), RSI(14) turns back
               Evidence: attic/rsi_ema_sr.py. Lagged the average stock by
               0.6-1.4% over 5-20 sessions, right 58-61% of the time, on F&O
               stocks (2009-26) and cash stocks (2024-26).
+
+broke_out     A coil within the prior 20 sessions closes above its prior
+              20-day high on 1.5x+ its 20-day average volume. Price >= 50,
+              20-day median turnover >= 5 cr. Active for 10 sessions.
+              Evidence: attic/algo_audit.py 6. Beat the average stock by
+              0.89% over 20 sessions, both halves (Aug 2024 - Oct 2026).
+              Breakouts without a coil before them showed no edge.
 """
 
 from __future__ import annotations
@@ -51,10 +58,16 @@ NOTES = {
         "(about 6 in 10 cases, F&O stocks 2009-26 and cash stocks 2024-26). It points to relative "
         "weakness, not necessarily a fall. Describes past behaviour; not a recommendation."
     ),
+    "broke_out": (
+        "Historically, coils that closed above their base on heavy volume like this kept beating "
+        "the market for about 4 weeks (about 1 in 2 cases, Aug 2024 - Oct 2026; +0.9% vs the "
+        "average stock). Breakouts without a coil before them showed no edge. Describes past "
+        "behaviour; not a recommendation."
+    ),
 }
 
 _lock = threading.Lock()
-_cache: dict = {"key": None, "bounce": {}}
+_cache: dict = {"key": None, "bounce": {}, "broke": {}}
 
 
 def _day(iso) -> str:
@@ -246,22 +259,102 @@ def _weak_results_all(raw: pd.DataFrame) -> dict[str, dict]:
 
 
 # --------------------------------------------------------------------------
+# broke_out
+# --------------------------------------------------------------------------
+
+def _broke_out_all(stocks: pd.DataFrame | None) -> dict[str, dict]:
+    """Coils that later closed through the prior 20-day high on 1.5x volume."""
+    import stocks as stk
+
+    if stocks is None or stocks.empty or "trigger" not in stocks.columns:
+        return {}
+    key = (len(stocks), str(stocks["date"].max()))
+    with _lock:
+        if _cache.get("broke_key") == key:
+            return _cache["broke"]
+
+    p = stk.CoilParams()
+    d = stocks.sort_values(["symbol", "date"]).copy()
+    g = d.groupby("symbol", sort=False)
+    if "prior_trigger" not in d.columns:
+        d["prior_trigger"] = g["trigger"].shift(1)
+    v20 = g["volume"].transform(lambda s: s.shift(1).rolling(20, min_periods=10).mean())
+    d["vol_x"] = d["volume"] / v20.replace(0, np.nan)
+
+    # Same seven gates the published coil list uses.
+    d["f_price"] = d["adj"] >= p.min_price
+    d["f_trend"] = (d["adj"] > d["ema50"]) & (d["ema50"] > d["ema200"])
+    d["f_pos"] = d["pos_hi"].between(p.near_high_min, p.near_high_max)
+    d["f_rsi"] = d["rsi"].between(p.rsi_low, p.rsi_high)
+    d["f_ext"] = d["ext_ema20"].abs() <= p.max_ext_ema20
+    d["f_vol"] = d["vol_ratio"] <= p.vol_dryup_max
+    d["f_range"] = d["range20"] <= p.range_max
+    d["coil_hit"] = d[stk.FLAG_COLS].all(axis=1)
+    if "med_turn60" in d.columns:
+        d["coil_hit"] &= (d["med_turn60"] >= p.min_median_turnover_lacs) & (d["own_sessions"] >= p.min_sessions)
+
+    recent_coil = g["coil_hit"].transform(
+        lambda s: s.astype(int).rolling(20, min_periods=1).max().shift(1)
+    ).fillna(0) > 0
+    brk = d[
+        recent_coil
+        & d["prior_trigger"].notna()
+        & (d["adj"] > d["prior_trigger"])
+        & (d["vol_x"] >= VOL_X)
+        & (d["adj"] >= MIN_PRICE)
+    ]
+    sessions = sorted(d["date"].unique())
+    sess_i = {t: i for i, t in enumerate(sessions)}
+    last_i = sess_i[sessions[-1]]
+    out: dict[str, dict] = {}
+    for sym, gg in brk.groupby("symbol", sort=False):
+        row = gg.iloc[-1]
+        bi = sess_i.get(row["date"])
+        if bi is None:
+            continue
+        after = last_i - bi
+        if after < 0 or after >= ACTIVE_SESSIONS:
+            continue
+        day = pd.Timestamp(row["date"]).strftime("%Y-%m-%d")
+        vx = float(row["vol_x"])
+        out[sym] = {
+            "kind": "broke_out",
+            "label": "Broke out",
+            "since": day,
+            "sessions_left": ACTIVE_SESSIONS - int(after),
+            "vol_x": round(vx, 1),
+            "detail": f"Closed above its base on {vx:.1f}x volume on {_day(day)}.",
+            "note": NOTES["broke_out"],
+        }
+
+    with _lock:
+        _cache["broke_key"] = key
+        _cache["broke"] = out
+    return out
+
+
+# --------------------------------------------------------------------------
 # Public
 # --------------------------------------------------------------------------
 
-def active(raw: pd.DataFrame | None) -> dict[str, list[dict]]:
+def active(raw: pd.DataFrame | None, stocks: pd.DataFrame | None = None) -> dict[str, list[dict]]:
     """Every symbol with an active flag -> its flags."""
     if raw is None or raw.empty:
         return {}
     out: dict[str, list[dict]] = {}
-    for src in (_weak_results_all, _bounce_all):
+    for src, arg in (
+        (_weak_results_all, raw),
+        (_bounce_all, raw),
+        (_broke_out_all, stocks),
+    ):
         try:
-            for sym, f in src(raw).items():
+            for sym, f in src(arg).items():
                 out.setdefault(sym, []).append(f)
         except Exception as exc:
             print(f"flags {src.__name__}: {exc}")
     return out
 
 
-def for_symbol(symbol: str, raw: pd.DataFrame | None) -> list[dict]:
-    return active(raw).get(symbol.upper(), [])
+def for_symbol(symbol: str, raw: pd.DataFrame | None,
+               stocks: pd.DataFrame | None = None) -> list[dict]:
+    return active(raw, stocks=stocks).get(symbol.upper(), [])

@@ -11,6 +11,9 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+CORP_FALL = 0.35      # beyond any price band, so not ordinary trading
+CORP_GAP = 0.30
+
 # --------------------------------------------------------------------------
 # Cleaning
 # --------------------------------------------------------------------------
@@ -75,7 +78,19 @@ def stock_metrics(df: pd.DataFrame, cmf_window: int = 20,
     # cumulative product of it gives an adjusted price series for free.
     # Without this a 1:10 split reads as a 90% crash and drops the stock — and
     # its whole sector — to the bottom of the RS ranking.
+    #
+    # Except when it doesn't: some ex-dates ship an unadjusted PREV_CLOSE, and
+    # a 1:2 split or 1:1 bonus then reads as a 50% crash that the 60% guard
+    # lets through. A fall that big which also OPENED that far down, on a day
+    # that isn't the listing day, is the corporate action; the open is the
+    # adjusted reference, so the day's return is measured from it. A genuine
+    # crash rarely gaps the whole way (POLICYBZR -36% opened only -10%).
     ret = (df["close"] / df["prev_close"]) - 1.0
+    gap = (df["open"] / df["prev_close"]) - 1.0
+    corp = ((ret <= -CORP_FALL) & (gap <= -CORP_GAP) & (df["open"] > 0)
+            & (g.cumcount() > 0))
+    ret = ret.where(~corp, df["close"] / df["open"] - 1.0)
+    df["dir"] = df["dir"].where(~corp, np.sign(ret))
     df["ret"] = ret.where(ret.abs() < 0.6)          # guard against bad prints
     df["tri"] = g["ret"].transform(lambda s: (1.0 + s.fillna(0)).cumprod())
     df["ret_lb"] = g["tri"].transform(
