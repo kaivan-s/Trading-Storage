@@ -15,17 +15,20 @@ from __future__ import annotations
 import io
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as dtime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
 
 import fetch
 import filing_facts
+import news
 
 PREOPEN_URL = fetch.BASE + "/api/market-data-pre-open?key=ALL"
 PREOPEN_REFERER = fetch.BASE + "/market-data/pre-open-market-cm-and-emerge-market"
 BAND_URL = fetch.ARCHIVES + "/content/equities/sec_list.csv"
+ANNOUNCEMENTS_ALL = (fetch.BASE + "/api/corporate-announcements?index=equities"
+                     "&from_date={frm}&to_date={to}")
 
 GAP_MIN, GAP_MAX = 0.02, 0.09
 MIN_PRICE = 50
@@ -34,6 +37,8 @@ TOP_N = 5
 NEAR_BAND = 0.02          # flag when the open sits within 2% of the upper band
 CACHE_TTL = 30
 LIVE_CAP = 25             # current-price lookups per refresh
+BROAD_OPEN = 0.0075       # median liquid stock opening this far up = a broad gap-up morning
+FILINGS_TTL = 5 * 60
 
 # attic/gap_5m.py: every gap-up matching this screen, priced on Groww 5-minute bars.
 # Positive = the stock fell from the entry (a short gained), after costs.
@@ -54,6 +59,14 @@ BACKTEST = {
         "(median +0.06%, 912 instances) but were still roughly flat after costs.",
         "The live record above is the running check on this list as it is published.",
     ],
+    # attic/gap_traits.py: the top 5 by gap, split by the median opening gap of all liquid stocks.
+    "broad_open": {
+        "threshold_pct": BROAD_OPEN * 100,
+        "trades": 173, "sessions": 36, "of_sessions": 602,
+        "median_pct": -0.96, "win_pct": 33.0,
+        "by_year": {"2024": -0.99, "2025": -0.66, "2026": -1.00},
+        "other_trades": 1734, "other_median_pct": 0.09, "other_win_pct": 51.0,
+    },
 }
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -61,7 +74,8 @@ IST = timezone(timedelta(hours=5, minutes=30))
 _lock = threading.Lock()
 _cache: dict = {"at": 0.0, "payload": None}
 _band_cache: dict = {"day": None, "bands": {}}
-_base_cache: dict = {"key": None, "frame": None}
+_base_cache: dict = {"key": None, "frame": None, "days": []}
+_filings_cache: dict = {"at": 0.0, "key": None, "by": {}}
 
 
 def _now_ist() -> datetime:
@@ -111,11 +125,52 @@ def _base(raw: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame({
         "sma50": g["close"].apply(lambda s: s.tail(50).mean() if len(s) >= 50 else np.nan),
         "med_turnover_cr": g["turnover"].apply(lambda s: s.tail(20).median() / 100),
+        "avg_vol20": g["volume"].apply(lambda s: s.tail(20).mean()),
         "hist_close": g["close"].last(),
         "hist_date": g["date"].last(),
     }).reset_index()
-    _base_cache.update(key=key, frame=out)
+    days = sorted(pd.to_datetime(pd.Series(d["date"].unique())).dt.date)[-5:]
+    _base_cache.update(key=key, frame=out, days=days)
     return out
+
+
+def _overnight_filings(sess) -> dict[str, dict]:
+    """Medium/high-importance filings after the previous session's close and before 09:15 today."""
+    today = _now_ist().date()
+    prior = [d for d in _base_cache["days"] if d < today]
+    if not prior:
+        return {}
+    prev_day = prior[-1]
+    key = (prev_day, today)
+    if _filings_cache["key"] == key and time.time() - _filings_cache["at"] < FILINGS_TTL:
+        return _filings_cache["by"]
+    url = ANNOUNCEMENTS_ALL.format(frm=prev_day.strftime("%d-%m-%Y"), to=today.strftime("%d-%m-%Y"))
+    try:
+        rows = sess.get_json(url, referer=news.REFERER)
+    except Exception as exc:
+        print(f"gapfade filings: {exc}")
+        return _filings_cache["by"] if _filings_cache["key"] == key else {}
+    if isinstance(rows, dict):
+        rows = rows.get("data") or []
+    lo = datetime.combine(prev_day, dtime(15, 30))
+    hi = datetime.combine(today, dtime(9, 15))
+    rank = {"high": 0, "normal": 1}
+    by: dict[str, dict] = {}
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        when = news._parse_dt(r.get("an_dt")) or news._parse_dt(r.get("sort_date"))
+        if when is None or not (lo < when <= hi):
+            continue
+        f = news._shape(r)
+        if f is None or f["importance"] == "low":
+            continue
+        sym = (r.get("symbol") or "").strip().upper()
+        cur = by.get(sym)
+        if cur is None or rank.get(f["importance"], 2) < rank.get(cur["importance"], 2):
+            by[sym] = {k: f[k] for k in ("date", "time", "category", "importance", "title", "url")}
+    _filings_cache.update(at=time.time(), key=key, by=by)
+    return by
 
 
 def _preopen(sess) -> tuple[pd.DataFrame, str | None]:
@@ -167,6 +222,32 @@ def _live_prices(symbols: list[str]) -> dict[str, float]:
         return {}
 
 
+def _first_bar_volumes(symbols: list[str]) -> dict[str, float]:
+    """Volume of today's 09:15 five-minute bar (Groww), the early-volume measure in attic/gap_rank.py."""
+    if not symbols:
+        return {}
+    try:
+        client = fetch._get_groww_client()
+    except Exception as exc:
+        print(f"gapfade first bar: {exc}")
+        return {}
+    day = _now_ist().strftime("%Y-%m-%d")
+    out = {}
+    for sym in symbols:
+        try:
+            c = client.get_historical_candles(
+                exchange="NSE", segment="CASH", groww_symbol=f"NSE-{sym}",
+                start_time=f"{day} 09:15:00", end_time=f"{day} 09:20:00",
+                candle_interval="5minute")
+            rows = (c.get("candles") if isinstance(c, dict) else c) or []
+            if rows and rows[0][5] is not None:
+                out[sym] = float(rows[0][5])
+        except Exception as exc:
+            print(f"gapfade first bar {sym}: {exc}")
+        time.sleep(0.2)
+    return out
+
+
 def _fno() -> set[str]:
     s = filing_facts.fno_symbols()
     if s:
@@ -192,6 +273,9 @@ def scan(raw: pd.DataFrame) -> dict:
     df["gap"] = df["open"] / df["prev_close"] - 1
     df["band"] = df["symbol"].map(bands)
 
+    liquid = df[(df["prev_close"] >= MIN_PRICE) & (df["med_turnover_cr"] >= MIN_TURNOVER_CR)]
+    market_gap = float(liquid["gap"].median()) if len(liquid) else None
+
     universe = df[(df["prev_close"] >= MIN_PRICE)
                   & (df["med_turnover_cr"] >= MIN_TURNOVER_CR)
                   & ~df["symbol"].isin(fno)
@@ -211,6 +295,7 @@ def scan(raw: pd.DataFrame) -> dict:
     live = _live_prices(list(hits["symbol"])) if ph in ("window", "after") else {}
     hits["ltp"] = hits["symbol"].map(live)
     hits["from_open_pct"] = (hits["ltp"] / hits["open"] - 1) * 100
+    filings = _overnight_filings(sess) if len(hits) else {}
 
     def num(v, nd=2):
         return None if v is None or pd.isna(v) else round(float(v), nd)
@@ -231,6 +316,7 @@ def scan(raw: pd.DataFrame) -> dict:
         "preopen_qty": None if pd.isna(r.preopen_qty) else int(r.preopen_qty),
         "ltp": num(r.ltp),
         "from_open_pct": num(r.from_open_pct),
+        "filing": filings.get(r.symbol),
     } for r in hits.itertuples()]
 
     return {
@@ -240,6 +326,11 @@ def scan(raw: pd.DataFrame) -> dict:
         "history_as_of": str(pd.to_datetime(base["hist_date"].max()).date()),
         "universe": int(len(universe)),
         "excluded_small_band": int(band5.sum()),
+        "market_open": None if market_gap is None else {
+            "median_gap_pct": num(market_gap * 100),
+            "stocks": int(len(liquid)),
+            "broad": bool(market_gap >= BROAD_OPEN),
+        },
         "rules": {
             "gap_min_pct": GAP_MIN * 100, "gap_max_pct": GAP_MAX * 100,
             "min_price": MIN_PRICE, "min_turnover_cr": MIN_TURNOVER_CR,
@@ -283,18 +374,28 @@ def log_entries(raw: pd.DataFrame) -> dict:
     extra: dict[str, float] = {}
     for i in range(0, len(missing), LIVE_CAP):
         extra.update(_live_prices(missing[i:i + LIVE_CAP]))
+    # Shadow ranking for the Feb 2027 checkpoint: 09:15-bar volume / 20-day average volume.
+    # Logged only; the published top five stays ranked by gap.
+    avg = _base_cache["frame"].set_index("symbol")["avg_vol20"] if _base_cache["frame"] is not None else pd.Series(dtype=float)
+    vols = _first_bar_volumes([r["symbol"] for r in out["rows"]])
+    early = {s: v / avg[s] for s, v in vols.items() if s in avg.index and avg[s] > 0}
+    vol_rank = {s: i + 1 for i, s in enumerate(sorted(early, key=early.get, reverse=True))}
     now = _now_ist().isoformat()
     keep = ("symbol", "rank", "top", "prev_close", "open", "gap_pct",
             "below_sma50_pct", "band", "near_band")
     rows = []
     for r in out["rows"]:
         px = r.get("ltp") or extra.get(r["symbol"]) or r.get("open")
+        ev = early.get(r["symbol"])
         rows.append({**{k: r[k] for k in keep}, "session_date": today,
-                     "entry_price": px, "entry_at": now if px else None})
+                     "entry_price": px, "entry_at": now if px else None,
+                     "early_vol": None if ev is None else round(float(ev), 4),
+                     "vol_rank": vol_rank.get(r["symbol"])})
     sent = db.save_gap_fade_entries(rows)
     _record_cache["at"] = 0.0
     return {"status": "ok" if sent is not None else "save failed", "session": today,
-            "picks": len(rows), "priced": sum(1 for r in rows if r["entry_price"])}
+            "picks": len(rows), "priced": sum(1 for r in rows if r["entry_price"]),
+            "early_vol": len(early)}
 
 
 def log_exits() -> dict:
@@ -356,6 +457,7 @@ def record() -> dict | None:
         "sessions": len(sessions),
         "cost_bps": BACKTEST["cost_bps"],
         "top": _summary(net([r for r in done if r.get("top")])),
+        "vol_top": _summary(net([r for r in done if (r.get("vol_rank") or 99) <= TOP_N])),
         "all": _summary(net(done)),
         "recent": [{"date": d, "picks": sessions[d]} for d in sorted(sessions, reverse=True)[:10]],
     }

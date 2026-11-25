@@ -2061,6 +2061,11 @@ def get_commodity_news(days: int = 14, limit: int = 600) -> list[dict] | None:
 #     short_ret_pct    NUMERIC,
 #     PRIMARY KEY (session_date, symbol)
 # );
+# ALTER TABLE gap_fade_log ADD COLUMN IF NOT EXISTS early_vol NUMERIC;
+# ALTER TABLE gap_fade_log ADD COLUMN IF NOT EXISTS vol_rank INT;
+
+GAP_FADE_NEW_COLS = ("early_vol", "vol_rank")
+
 
 def save_gap_fade_entries(rows: list[dict]) -> int | None:
     """Insert the morning's picks; a repeat call the same day keeps the first entry."""
@@ -2068,9 +2073,18 @@ def save_gap_fade_entries(rows: list[dict]) -> int | None:
         return 0
     client = get_client()
     try:
-        (client.table("gap_fade_log")
-         .upsert(rows, on_conflict="session_date,symbol", ignore_duplicates=True)
-         .execute())
+        try:
+            (client.table("gap_fade_log")
+             .upsert(rows, on_conflict="session_date,symbol", ignore_duplicates=True)
+             .execute())
+        except Exception as e:
+            if not any(c in str(e) for c in GAP_FADE_NEW_COLS):
+                raise
+            print("gap_fade_log: early_vol/vol_rank columns missing; saved without them")
+            rows = [{k: v for k, v in r.items() if k not in GAP_FADE_NEW_COLS} for r in rows]
+            (client.table("gap_fade_log")
+             .upsert(rows, on_conflict="session_date,symbol", ignore_duplicates=True)
+             .execute())
         return len(rows)
     except Exception as e:
         print(f"save gap fade entries: {e}")
