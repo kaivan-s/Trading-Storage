@@ -27,6 +27,8 @@ import news
 PREOPEN_URL = fetch.BASE + "/api/market-data-pre-open?key=ALL"
 PREOPEN_REFERER = fetch.BASE + "/market-data/pre-open-market-cm-and-emerge-market"
 BAND_URL = fetch.ARCHIVES + "/content/equities/sec_list.csv"
+ETF_URL = fetch.ARCHIVES + "/content/equities/eq_etfseclist.csv"
+ETF_NAME = r"ETF|BEES|^SETF|GOLD|SILVER|LIQUID|CASE$|NIFTY|SENSEX|IETF|MODEFENCE"  # attic/tab_audit.py
 ANNOUNCEMENTS_ALL = (fetch.BASE + "/api/corporate-announcements?index=equities"
                      "&from_date={frm}&to_date={to}")
 
@@ -39,6 +41,18 @@ CACHE_TTL = 30
 LIVE_CAP = 25             # current-price lookups per refresh
 BROAD_OPEN = 0.0075       # median liquid stock opening this far up = a broad gap-up morning
 FILINGS_TTL = 5 * 60
+GLOBAL_MIN = 0.01         # driver rise since the previous Indian close that earns the tag
+GLOBAL_TTL = 15 * 60
+# attic/gap_global.py: industry (sector_map basic_industry) -> overnight global driver.
+GLOBAL_DRIVERS = {
+    "Copper": ("HG=F", {"Aluminium", "Aluminium Copper & Zinc Products", "Copper", "Zinc",
+                        "Diversified Metals", "Trading - Metals", "Iron & Steel",
+                        "Iron & Steel Products", "Sponge Iron", "Pig Iron"}),
+    "Nasdaq": ("^IXIC", {"IT Enabled Services", "Computers - Software & Consulting",
+                         "Software Products", "Computers Hardware & Equipments"}),
+    "Crude": ("CL=F", {"Oil Exploration & Production", "Oil Equipment & Services"}),
+    "Gold": ("GC=F", {"Gems Jewellery And Watches", "Precious Metals"}),
+}
 
 # attic/gap_5m.py: every gap-up matching this screen, priced on Groww 5-minute bars.
 # Positive = the stock fell from the entry (a short gained), after costs.
@@ -67,6 +81,12 @@ BACKTEST = {
         "by_year": {"2024": -0.99, "2025": -0.66, "2026": -1.00},
         "other_trades": 1734, "other_median_pct": 0.09, "other_win_pct": 51.0,
     },
+    # attic/gap_global.py: every downtrend gap-up in a driver-linked industry.
+    "global_driver": {
+        "threshold_pct": GLOBAL_MIN * 100,
+        "trades": 233, "median_pct": -0.96, "win_pct": 33.0,
+        "other_trades": 414, "other_median_pct": -0.25, "other_win_pct": 44.0,
+    },
 }
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -74,8 +94,22 @@ IST = timezone(timedelta(hours=5, minutes=30))
 _lock = threading.Lock()
 _cache: dict = {"at": 0.0, "payload": None}
 _band_cache: dict = {"day": None, "bands": {}}
+_etf_cache: dict = {"day": None, "symbols": set()}
 _base_cache: dict = {"key": None, "frame": None, "days": []}
 _filings_cache: dict = {"at": 0.0, "key": None, "by": {}}
+_global_cache: dict = {"at": 0.0, "key": None, "moves": {}}
+_industry_map: dict | None = None
+
+
+def _industry(sym: str) -> str | None:
+    global _industry_map
+    if _industry_map is None:
+        try:
+            smap = pd.read_json(fetch.CACHE_DIR / "sector_map.json", orient="index")
+            _industry_map = smap["basic_industry"].dropna().to_dict()
+        except Exception:
+            _industry_map = {}
+    return _industry_map.get(sym)
 
 
 def _now_ist() -> datetime:
@@ -112,6 +146,22 @@ def _bands(sess) -> dict[str, str]:
     except Exception as exc:
         print(f"gapfade bands: {exc}")
     return _band_cache["bands"]
+
+
+def _etfs(sess) -> set[str]:
+    """NSE's listed ETFs. The rule was tested on company shares only; an ETF's gap is its underlying's overnight move."""
+    day = _now_ist().date().isoformat()
+    if _etf_cache["day"] == day and _etf_cache["symbols"]:
+        return _etf_cache["symbols"]
+    try:
+        r = sess.get(ETF_URL)
+        d = pd.read_csv(io.StringIO(r.text))
+        syms = set(d["Symbol"].astype(str).str.strip().str.upper())
+        if syms:
+            _etf_cache.update(day=day, symbols=syms)
+    except Exception as exc:
+        print(f"gapfade etf list: {exc}")
+    return _etf_cache["symbols"]
 
 
 def _base(raw: pd.DataFrame) -> pd.DataFrame:
@@ -222,6 +272,46 @@ def _live_prices(symbols: list[str]) -> dict[str, float]:
         return {}
 
 
+def _global_moves() -> dict[str, float]:
+    """Each driver's move from the previous Indian close (15:30 IST) to its latest price.
+    The reference is the last hourly bar at or before that close; the latest price comes from
+    the daily feed, because Yahoo's hourly futures bars can stall for a session or more."""
+    today = _now_ist().date()
+    prior = [d for d in _base_cache["days"] if d < today]
+    if not prior:
+        return {}
+    key = (prior[-1], today)
+    if _global_cache["key"] == key and time.time() - _global_cache["at"] < GLOBAL_TTL:
+        return _global_cache["moves"]
+    ref_at = pd.Timestamp(datetime.combine(prior[-1], dtime(15, 30)), tz=IST)
+    moves: dict[str, float] = {}
+    try:
+        import yfinance as yf
+        tickers = [t for t, _ in GLOBAL_DRIVERS.values()]
+        hourly = yf.download(tickers, period="7d", interval="60m", progress=False, auto_adjust=False)["Close"]
+        hourly.index = pd.to_datetime(hourly.index).tz_convert(IST)
+        daily = yf.download(tickers, period="10d", interval="1d", progress=False, auto_adjust=False)["Close"]
+        for name, (t, _) in GLOBAL_DRIVERS.items():
+            h = hourly[t].dropna() if t in hourly else pd.Series(dtype=float)
+            d = daily[t].dropna() if t in daily else pd.Series(dtype=float)
+            before = h[h.index <= ref_at]
+            if len(before) and len(d):
+                moves[name] = float(d.iloc[-1] / before.iloc[-1] - 1)
+    except Exception as exc:
+        print(f"gapfade global moves: {exc}")
+        return _global_cache["moves"] if _global_cache["key"] == key else {}
+    _global_cache.update(at=time.time(), key=key, moves=moves)
+    return moves
+
+
+def _global_tag(sym: str, moves: dict[str, float]) -> dict | None:
+    ind = _industry(sym)
+    for name, (_, industries) in GLOBAL_DRIVERS.items():
+        if ind in industries and moves.get(name, 0) >= GLOBAL_MIN:
+            return {"driver": name, "move_pct": round(moves[name] * 100, 2), "industry": ind}
+    return None
+
+
 def _first_bar_volumes(symbols: list[str]) -> dict[str, float]:
     """Volume of today's 09:15 five-minute bar (Groww), the early-volume measure in attic/gap_rank.py."""
     if not symbols:
@@ -270,6 +360,8 @@ def scan(raw: pd.DataFrame) -> dict:
 
     df = pre.merge(base, on="symbol", how="inner")
     df = df[(df["open"] > 0) & (df["prev_close"] > 0)]
+    etfs = _etfs(sess)
+    df = df[~df["symbol"].isin(etfs) & ~df["symbol"].str.contains(ETF_NAME, regex=True)]
     df["gap"] = df["open"] / df["prev_close"] - 1
     df["band"] = df["symbol"].map(bands)
 
@@ -296,6 +388,7 @@ def scan(raw: pd.DataFrame) -> dict:
     hits["ltp"] = hits["symbol"].map(live)
     hits["from_open_pct"] = (hits["ltp"] / hits["open"] - 1) * 100
     filings = _overnight_filings(sess) if len(hits) else {}
+    moves = _global_moves() if len(hits) else {}
 
     def num(v, nd=2):
         return None if v is None or pd.isna(v) else round(float(v), nd)
@@ -317,6 +410,7 @@ def scan(raw: pd.DataFrame) -> dict:
         "ltp": num(r.ltp),
         "from_open_pct": num(r.from_open_pct),
         "filing": filings.get(r.symbol),
+        "global_move": _global_tag(r.symbol, moves),
     } for r in hits.itertuples()]
 
     return {
